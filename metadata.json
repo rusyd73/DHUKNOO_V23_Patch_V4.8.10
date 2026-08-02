@@ -1,0 +1,6 @@
+{
+  "name": "OBAMA",
+  "description": "Ojek Batu-Malang Raya (OBAMA) - Aplikasi ride-hailing/delivery kompetitif berbasis kearifan lokal Malang-Batu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

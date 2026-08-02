@@ -1,0 +1,305 @@
+import { z } from 'zod';
+
+export const registerSchema = z
+  .object({
+    email: z.string().email('Format email tidak valid!'),
+    password: z.string().min(4, 'Sandi minimal harus 4 karakter!'),
+    fullName: z.string().min(3, 'Nama lengkap minimal harus 3 karakter!'),
+    phone: z.string().min(8, 'Nomor HP / WhatsApp minimal harus 8 digit!').optional(),
+    role: z.enum(['CUSTOMER', 'DRIVER', 'ADMIN', 'MERCHANT'], {
+      errorMap: () => ({ message: 'Role harus CUSTOMER, DRIVER, ADMIN, atau MERCHANT!' }),
+    }),
+    vehiclePlate: z.string().optional(),
+    vehicleModel: z.string().optional(),
+    driverServiceType: z.enum(['BIKE', 'CAR', 'SEND']).optional(),
+    // Wajib diisi hanya jika role === MERCHANT (didaftarkan sekaligus buka toko)
+    merchantName: z.string().min(3, 'Nama toko minimal 3 karakter!').optional(),
+    merchantCategory: z.string().min(1, 'Kategori toko wajib diisi!').optional(),
+    merchantAddress: z.string().min(3, 'Alamat toko minimal 3 karakter!').optional(),
+    merchantLatitude: z.number().min(-90).max(90).optional(),
+    merchantLongitude: z.number().min(-180).max(180).optional(),
+  })
+  .refine(
+    (data) =>
+      data.role !== 'MERCHANT' ||
+      (data.merchantName && data.merchantCategory && data.merchantAddress &&
+        data.merchantLatitude !== undefined && data.merchantLongitude !== undefined),
+    {
+      message:
+        'Registrasi role MERCHANT wajib menyertakan merchantName, merchantCategory, merchantAddress, merchantLatitude, dan merchantLongitude!',
+      path: ['merchantName'],
+    }
+  );
+
+export const loginSchema = z.object({
+  email: z.string().email('Format email tidak valid!'),
+  password: z.string().min(1, 'Password wajib diisi!'),
+});
+
+export const changePasswordSchema = z.object({
+  oldPassword: z.string().min(1, 'Password lama wajib diisi!'),
+  newPassword: z.string().min(4, 'Password baru minimal harus 4 karakter!'),
+});
+
+export const createOrderSchema = z.object({
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND'], {
+    errorMap: () => ({ message: 'Tipe layanan harus BIKE, CAR, atau SEND!' }),
+  }),
+  // CATATAN: harga TIDAK diterima dari client sama sekali (celah keamanan kalau diizinkan —
+  // client bisa kirim harga sembarangan). Harga SELALU dihitung server lewat Tariff Engine
+  // dari jarak & kondisi perjalanan di bawah ini.
+  distanceKm: z.number().min(0, 'Jarak tidak boleh negatif!').max(500, 'Jarak maksimal 500 km!'),
+  pickupAddress: z.string().min(3, 'Alamat penjemputan minimal 3 karakter!'),
+  pickupLat: z.number(),
+  pickupLng: z.number(),
+  dropoffAddress: z.string().min(3, 'Alamat tujuan minimal 3 karakter!'),
+  dropoffLat: z.number(),
+  dropoffLng: z.number(),
+  zoneName: z.string().optional(),
+  waitMinutes: z.number().min(0).optional(),
+  hasToll: z.boolean().optional(),
+  hasParking: z.boolean().optional(),
+  isBadWeather: z.boolean().optional(),
+  isHoliday: z.boolean().optional(),
+  promoCode: z.string().optional(),
+  paymentMethod: z.enum(['WALLET', 'CASH', 'QRIS', 'TRANSFER', 'EWALLET']).default('WALLET'),
+});
+
+export const updateOrderStatusSchema = z.object({
+  status: z.enum(['ON_THE_WAY', 'ARRIVED', 'COMPLETED', 'CANCELLED'], {
+    errorMap: () => ({ message: 'Status harus salah satu dari: ON_THE_WAY, ARRIVED, COMPLETED, CANCELLED!' }),
+  }),
+});
+
+// ── Wallet ──────────────────────────────────────────────────────────────
+export const topupSchema = z.object({
+  amount: z.number().min(5000, 'Nominal top-up minimal Rp 5.000!').max(10_000_000, 'Nominal top-up maksimal Rp10.000.000 per transaksi!'),
+  // PERBAIKAN: skema ini sebelumnya HANYA mendefinisikan `amount`. Karena
+  // Zod secara default membuang (strip) semua field yang tidak didefinisikan
+  // di shape, `method`/`proofImageUrl`/`note` yang dikirim frontend selalu
+  // hilang sebelum sampai ke controller -- akibatnya WalletController.topup()
+  // selalu jatuh ke default 'TRANSFER' apa pun metode yang sebenarnya dipilih
+  // user (CASH/QRIS/EWALLET/dst), sehingga keterangan di Dashboard Admin
+  // SELALU tertulis TRANSFER walau top-up-nya sebenarnya CASH.
+  method: z.enum(['QRIS', 'TRANSFER', 'EWALLET', 'CASH', 'PAYMENT_LINK']).optional(),
+  proofImageUrl: z.string().optional(),
+  note: z.string().optional(),
+});
+
+// ── Payment ─────────────────────────────────────────────────────────────
+export const chargeOrderSchema = z.object({
+  orderId: z.string().uuid('orderId harus berupa UUID yang valid!'),
+  idempotencyKey: z.string().min(8, 'idempotencyKey wajib disertakan agar pembayaran tidak diproses dua kali!'),
+});
+
+// ── Promo ───────────────────────────────────────────────────────────────
+export const validatePromoSchema = z.object({
+  code: z.string().min(1, 'Kode promo wajib diisi!'),
+  orderPrice: z.number().min(0, 'orderPrice tidak boleh negatif!'),
+});
+
+export const createPromoSchema = z.object({
+  code: z.string().min(3, 'Kode promo minimal 3 karakter!').toUpperCase(),
+  type: z.enum(['PERCENTAGE', 'FIXED']),
+  value: z.number().positive('Nilai promo harus lebih besar dari 0!'),
+  maxDiscount: z.number().positive().optional(),
+  minOrderPrice: z.number().min(0).optional(),
+  quota: z.number().int().min(0).optional(),
+  expiresAt: z.string().datetime().optional(),
+});
+
+// ── Review ──────────────────────────────────────────────────────────────
+export const createReviewSchema = z.object({
+  orderId: z.string().uuid('orderId harus berupa UUID yang valid!'),
+  rating: z.number().int().min(1, 'Rating minimal 1.').max(5, 'Rating maksimal 5.'),
+  comment: z.string().max(500, 'Komentar maksimal 500 karakter!').optional(),
+});
+
+// ── Location ────────────────────────────────────────────────────────────
+export const updateLocationSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  isOnline: z.boolean().optional(),
+});
+
+// ── Map Engine ───────────────────────────────────────────────────────────
+
+export const searchAddressSchema = z.object({
+  query: z.string().min(3),
+});
+
+export const reverseGeocodeSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+});
+
+const coordinateSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+});
+
+export const calculateDistanceSchema = z.object({
+  origin: coordinateSchema,
+  destination: coordinateSchema,
+});
+
+export const estimateEtaSchema = calculateDistanceSchema.extend({
+  vehicleType: z.enum(["BIKE", "CAR"]).default("BIKE"),
+});
+
+export const routePolylineSchema = calculateDistanceSchema;
+
+export const nearestDriverSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  radiusKm: z.number().min(1).max(50).default(5),
+  limit: z.number().min(1).max(20).default(10),
+});
+
+export const geofenceSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  polygon: z.array(
+    z.object({
+      latitude: z.number(),
+      longitude: z.number(),
+    })
+  ).min(3),
+});
+
+// ── Merchant ────────────────────────────────────────────────────────────
+export const createMerchantSchema = z.object({
+  name: z.string().min(3, 'Nama merchant minimal 3 karakter!'),
+  category: z.string().min(1, 'Kategori wajib diisi!'),
+  address: z.string().min(3, 'Alamat minimal 3 karakter!'),
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  phone: z.string().optional(),
+  imageUrl: z.string().url('imageUrl harus berupa URL yang valid!').optional(),
+});
+
+export const updateMerchantSchema = z.object({
+  name: z.string().min(3).optional(),
+  category: z.string().min(1).optional(),
+  address: z.string().min(3).optional(),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+  phone: z.string().optional(),
+  imageUrl: z.string().url().optional(),
+  isOpen: z.boolean().optional(),
+});
+
+export const addMenuItemSchema = z.object({
+  name: z.string().min(1, 'Nama menu wajib diisi!'),
+  description: z.string().optional(),
+  price: z.number().min(0, 'Harga tidak boleh negatif!'),
+  imageUrl: z.string().url('imageUrl harus berupa URL yang valid!').optional(),
+});
+
+export const updateMenuItemSchema = z.object({
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+  price: z.number().min(0).optional(),
+  imageUrl: z.string().url().optional(),
+  isAvailable: z.boolean().optional(),
+});
+
+// ── Tariff Engine (Admin) ──────────────────────────────────────────────
+export const createPricingZoneSchema = z.object({
+  name: z.string().min(2, 'Nama zona minimal 2 karakter!'),
+});
+
+export const createPricingRuleSchema = z.object({
+  zoneId: z.string().uuid().optional(),
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND']),
+  baseFare: z.number().min(0, 'Tarif dasar tidak boleh negatif!'),
+  pickupFee: z.number().min(0).optional(),
+  perKmFee: z.number().min(0, 'Biaya per-km tidak boleh negatif!'),
+  perMinuteWaitFee: z.number().min(0).optional(),
+});
+
+export const updatePricingRuleSchema = z.object({
+  baseFare: z.number().min(0).optional(),
+  pickupFee: z.number().min(0).optional(),
+  perKmFee: z.number().min(0).optional(),
+  perMinuteWaitFee: z.number().min(0).optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const createRegionalPolicySchema = z.object({
+  zoneId: z.string().uuid('zoneId harus UUID yang valid!'),
+  tollFee: z.number().min(0).optional(),
+  parkingFee: z.number().min(0).optional(),
+  weatherSurcharge: z.number().min(0).optional(),
+  holidaySurcharge: z.number().min(0).optional(),
+});
+
+export const updateRegionalPolicySchema = z.object({
+  tollFee: z.number().min(0).optional(),
+  parkingFee: z.number().min(0).optional(),
+  weatherSurcharge: z.number().min(0).optional(),
+  holidaySurcharge: z.number().min(0).optional(),
+  isActive: z.boolean().optional(),
+});
+
+const commissionTierSchema = z.object({
+  maxOrderValue: z.number().min(0).nullable(), // null = tier terakhir/tanpa batas atas
+  rate: z.number().min(0).max(1, 'Rate harus antara 0 dan 1 (mis. 0.08 untuk 8%)'),
+});
+
+export const createTariffVersionSchema = z.object({
+  versionName: z.string().min(3, 'Nama versi minimal 3 karakter!'),
+  description: z.string().optional(),
+  commissionTiers: z.array(commissionTierSchema).min(1, 'Minimal 1 tier komisi!'),
+});
+
+export const previewFareSchema = z.object({
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND']),
+  distanceKm: z.number().min(0),
+  zoneName: z.string().optional(),
+  waitMinutes: z.number().min(0).optional(),
+  hasToll: z.boolean().optional(),
+  hasParking: z.boolean().optional(),
+  isBadWeather: z.boolean().optional(),
+  isHoliday: z.boolean().optional(),
+});
+
+export const updateConfigSchema = z.object({
+  value: z.string().min(1, 'Value tidak boleh kosong!'),
+  description: z.string().optional(),
+});
+
+// ── Cash payment (driver confirms cash received) ──────────────────────────
+export const confirmCashSchema = z.object({
+  orderId: z.string().uuid('orderId harus berupa UUID yang valid!'),
+});
+
+// ── Manual payment proof (QRIS/Transfer/E-Wallet, sebelum ada gateway) ────
+export const submitPaymentProofSchema = z.object({
+  orderId: z.string().uuid('orderId harus berupa UUID yang valid!'),
+  method: z.enum(['QRIS', 'TRANSFER', 'EWALLET', 'CASH']),
+  proofImageUrl: z.string().min(1, 'Bukti pembayaran wajib diupload!'),
+  note: z.string().max(300).optional(),
+});
+
+export const reviewPaymentProofSchema = z.object({
+  status: z.enum(['APPROVED', 'REJECTED']),
+  reviewNote: z.string().max(300).optional(),
+});
+
+// ── Driver document verification (KTP+selfie, STNK, SIM) ───────────────────────
+export const uploadDriverDocumentSchema = z.object({
+  type: z.enum(['KTP_SELFIE', 'STNK', 'SIM']),
+  imageUrl: z.string().min(1, 'Foto dokumen wajib diupload!'),
+});
+
+export const reviewDriverDocumentSchema = z.object({
+  status: z.enum(['APPROVED', 'REJECTED']),
+  reviewNote: z.string().max(300).optional(),
+});
+
+// ── Async Report Generation (GET /api/report/:type?format=pdf|excel) ──────
+export const reportQuerySchema = z.object({
+  format: z.enum(['pdf', 'excel']).default('excel'),
+  timeframe: z.enum(['daily', 'weekly', 'monthly']).default('daily'),
+});

@@ -1,0 +1,43 @@
+# --- Node & Package Managers ---
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+packages/*/node_modules/
+bun.lock
+yarn.lock
+package-lock.json
+
+# --- Java / Gradle / Backend Build ---
+.gradle/
+build/
+out/
+backend/build/
+backend/out/
+*.class
+*.jar
+
+# --- Frontend Build (Vite) ---
+frontend/dist/
+dist/
+
+# --- Environment Variables (RAHASIA!) ---
+.env
+.env.local
+.env.*
+!.env.example
+
+# --- OS / System Files ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+
+# --- Git & Cache ---
+.vite/
+*.tsbuildinfo
+
+# Ignore large backup and zip files
+*.zip
+*.tar.gz
+backend/*.zip

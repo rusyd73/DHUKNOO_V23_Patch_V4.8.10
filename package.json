@@ -1,0 +1,40 @@
+{
+  "name": "obama-ride-platform",
+  "private": true,
+  "description": "Monorepo root — menyatukan frontend admin-web dan packages/shared-* lewat npm workspaces. Backend sengaja TIDAK dimasukkan sebagai workspace member agar instalasi Prisma-nya tetap independen dan tidak terganggu hoisting.",
+  "workspaces": [
+    "frontend",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --prefix backend run dev",
+    "build": "npm run build --workspaces --if-present && npm --prefix backend run prisma:generate && npm --prefix backend run build",
+    "start": "node backend/dist/server.js",
+    "install:all": "npm install && npm install --prefix backend",
+    "clean": "npm cache clean --force",
+    "reinstall": "npm run clean && npm run install:all",
+    "list": "npm Is --workspaces",
+    "doctor": "npm doctor"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.2",
+    "autoprefixer": "^10.5.4",
+    "browserslist": "^4.28.6",
+    "caniuse-lite": "^1.0.30001806",
+    "postcss": "^8.5.19",
+    "prisma": "^5.10.0",
+    "tailwindcss": "^4.3.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.10.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "recharts": "^3.10.0",
+    "socket.io": "^4.8.3",
+    "vite": "^5.4.21"
+  }
+}

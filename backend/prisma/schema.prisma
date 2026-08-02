@@ -1,0 +1,433 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  CUSTOMER
+  DRIVER
+  ADMIN
+  MERCHANT
+}
+
+enum OrderStatus {
+  PENDING
+  ACCEPTED
+  ON_THE_WAY
+  ARRIVED
+  COMPLETED
+  CANCELLED
+}
+
+enum ServiceType {
+  BIKE      // Ojek OBAMA
+  CAR       // Mobil OBAMA
+  SEND      // Kirim Barang
+}
+
+enum TransactionType {
+  TOPUP       // Isi saldo oleh user
+  PAYMENT     // Pembayaran order (keluar dari wallet customer)
+  EARNING     // Pendapatan order (masuk ke wallet driver)
+  PLATFORM_FEE // Potongan komisi platform
+  REFUND      // Pengembalian dana
+}
+
+enum PromoType {
+  PERCENTAGE
+  FIXED
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  passwordHash String
+  fullName     String
+  role         Role          @default(CUSTOMER)
+  refreshToken String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  // Role specific relations
+  customerProfile CustomerProfile?
+  driverProfile   DriverProfile?
+  merchant        Merchant?
+  wallet          Wallet?
+
+  // Logs / Activity
+  logs            ActivityLog[]
+  topupRequests   TopupRequest[]
+}
+
+model CustomerProfile {
+  id             String   @id @default(uuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phoneNumber    String?
+  avatarUrl      String?
+  isAppInstalled Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  orders         Order[]  @relation("CustomerOrders")
+}
+
+model DriverProfile {
+  id             String      @id @default(uuid())
+  userId         String      @unique
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phoneNumber    String?
+  vehiclePlate   String
+  vehicleModel   String
+  // BARU: jenis layanan yang didaftarkan driver ini (BIKE/CAR/SEND) — dasar
+  // penguncian klasifikasi penerima order. Sebelumnya TIDAK ADA field ini
+  // sama sekali, jadi driver motor bisa saja menerima order mobil dan
+  // sebaliknya, tidak ada yang mencegahnya di level manapun.
+  serviceType    ServiceType @default(BIKE)
+  isOnline       Boolean     @default(false)
+  latitude       Float?
+  longitude      Float?
+  isVerified     Boolean     @default(false)
+  companionInstalled Boolean @default(true)
+  // BARU: kalau true, driver otomatis menerima order pertama yang ditawarkan
+  // Dispatch Engine tanpa perlu tap manual — fitur opsional, default OFF
+  // supaya perilaku manual-accept yang sudah ada tidak berubah untuk driver
+  // yang tidak mengaktifkannya.
+  autoAcceptEnabled  Boolean @default(false)
+  createdAt      DateTime    @default(now())
+  orders         Order[]     @relation("DriverOrders")
+  reviews        Review[]
+  documents      DriverDocument[]
+}
+
+enum DriverDocumentType {
+  KTP_SELFIE   // Foto orang sambil memegang KTP
+  STNK
+  SIM
+}
+
+enum DriverDocumentStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+// Dokumen verifikasi driver (KTP+selfie, STNK) yang wajib diperiksa Admin
+// sebelum akun driver diaktifkan.
+model DriverDocument {
+  id            String                @id @default(uuid())
+  driverId      String
+  driver        DriverProfile         @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  type          DriverDocumentType
+  imageUrl      String
+  status        DriverDocumentStatus  @default(PENDING_REVIEW)
+  reviewNote    String?
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  createdAt     DateTime              @default(now())
+}
+
+model Wallet {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   Decimal  @default(0.00) @db.Decimal(12, 2)
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+}
+
+model Transaction {
+  id          String            @id @default(uuid())
+  walletId    String
+  wallet      Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type        TransactionType
+  amount      Decimal           @db.Decimal(12, 2)
+  description String
+  orderId     String?
+  order       Order?            @relation(fields: [orderId], references: [id])
+  // Mencegah pemrosesan pembayaran yang sama dua kali (mis. akibat retry dari client)
+  idempotencyKey String?        @unique
+  createdAt   DateTime          @default(now())
+}
+
+model Order {
+  id           String      @id @default(uuid())
+  serviceType  ServiceType @default(BIKE)
+  status       OrderStatus @default(PENDING)
+  price        Decimal     @db.Decimal(10, 2)
+  discount     Decimal     @default(0.00) @db.Decimal(10, 2)
+  isPaid       Boolean     @default(false)
+  paymentMethod PaymentMethod @default(WALLET)
+  // Waktu driver menerima order - dasar hitung window cancel gratis 60 detik
+  // untuk customer (lihat OrderService.updateStatus). Null selama masih PENDING.
+  acceptedAt   DateTime?
+
+  pickupAddress  String
+  pickupLat      Float
+  pickupLng      Float
+  dropoffAddress String
+  dropoffLat     Float
+  dropoffLng     Float
+  distanceKm     Float       @default(0)
+
+  customerId   String
+  customer     CustomerProfile @relation("CustomerOrders", fields: [customerId], references: [id])
+
+  driverId     String?
+  driver       DriverProfile?  @relation("DriverOrders", fields: [driverId], references: [id])
+
+  promoId      String?
+  promo        Promo?          @relation(fields: [promoId], references: [id])
+
+  review       Review?
+  transactions Transaction[]
+  pricingHistory PricingHistory?
+  paymentProof PaymentProof?
+  chatMessages   ChatMessage[]
+
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+}
+
+enum PaymentMethod {
+  WALLET    // Saldo OBAMA (otomatis, real-time)
+  CASH      // Tunai ke driver, driver konfirmasi diterima
+  QRIS      // Manual: upload bukti, admin konfirmasi (belum ada gateway otomatis)
+  TRANSFER  // Manual: upload bukti, admin konfirmasi
+  EWALLET   // OVO/GoPay/DANA - manual: upload bukti, admin konfirmasi
+}
+
+enum PaymentProofStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+// Bukti pembayaran manual (QRIS/Transfer/E-Wallet) sebelum ada integrasi gateway
+// otomatis (Xendit/Midtrans). Customer upload bukti, Admin meninjau & menyetujui.
+model PaymentProof {
+  id            String              @id @default(uuid())
+  orderId       String              @unique
+  order         Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  method        PaymentMethod
+  proofImageUrl String
+  note          String?
+  status        PaymentProofStatus  @default(PENDING_REVIEW)
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  reviewNote    String?
+  createdAt     DateTime            @default(now())
+}
+
+// BARU: penyimpanan riwayat chat customer<->driver per order. Sebelumnya
+// obrolan hanya diteruskan lewat Socket.IO (in-memory, tidak pernah disimpan) —
+// begitu salah satu pihak menutup/refresh layar, seluruh percakapan hilang.
+model ChatMessage {
+  id         String   @id @default(uuid())
+  orderId    String
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  senderId   String
+  senderRole Role
+  message    String
+  createdAt  DateTime @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+model Promo {
+  id           String    @id @default(uuid())
+  code         String    @unique
+  type         PromoType
+  value        Decimal   @db.Decimal(10, 2) // persen (0-100) jika PERCENTAGE, rupiah jika FIXED
+  maxDiscount  Decimal?  @db.Decimal(10, 2) // batas potongan maksimum untuk tipe PERCENTAGE
+  minOrderPrice Decimal  @default(0.00) @db.Decimal(10, 2)
+  quota        Int       @default(0) // 0 = tidak terbatas
+  usedCount    Int       @default(0)
+  isActive     Boolean   @default(true)
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  orders       Order[]
+}
+
+model Review {
+  id        String   @id @default(uuid())
+  orderId   String   @unique
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  driverId  String
+  driver    DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  rating    Int      // 1-5
+  comment   String?
+  createdAt DateTime @default(now())
+}
+
+model Merchant {
+  id        String    @id @default(uuid())
+  name      String
+  category  String    // mis. "Kuliner", "Belanja Harian", "Oleh-oleh"
+  address   String
+  latitude  Float
+  longitude Float
+  phone     String?
+  imageUrl  String?
+  isOpen    Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // Pemilik toko (role MERCHANT). Nullable karena merchant lama masih bisa
+  // dikelola terpusat oleh ADMIN tanpa akun login sendiri.
+  ownerId   String?   @unique
+  owner     User?     @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  products  Product[]
+}
+
+model Product {
+  id          String   @id @default(uuid())
+  merchantId  String
+  merchant    Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(10, 2)
+  imageUrl    String?
+  isAvailable Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Konfigurasi global platform berbentuk key-value, bisa diedit Admin tanpa
+// deploy ulang. Contoh key: "MINIMUM_DRIVER_DEPOSIT", "PLATFORM_NAME", dst.
+model PlatformConfig {
+  key         String   @id
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt
+}
+
+model ActivityLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    String
+  details   String?
+  createdAt DateTime @default(now())
+}
+
+// -----------------------------------------------------------------------
+// TARIFF ENGINE - seluruh tarif dikendalikan dari sini (database + admin
+// panel), bukan hardcode di kode program. Lihat TariffEngineService untuk
+// logic perhitungannya.
+// -----------------------------------------------------------------------
+
+// Zona geografis dengan kebijakan tarif berbeda (mis. "Kota Batu", "Malang Kota").
+model PricingZone {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rules            PricingRule[]
+  regionalPolicies RegionalPolicy[]
+}
+
+// Komponen tarif dasar per kombinasi zona + tipe layanan (BIKE/CAR/SEND).
+// zoneId nullable = berlaku sebagai default/fallback kalau zona tidak match yang spesifik.
+model PricingRule {
+  id                 String       @id @default(uuid())
+  zoneId             String?
+  zone               PricingZone? @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  serviceType        ServiceType
+
+  baseFare           Decimal      @db.Decimal(10, 2) // Tarif Dasar
+  pickupFee          Decimal      @db.Decimal(10, 2) @default(0) // Biaya Pickup
+  perKmFee           Decimal      @db.Decimal(10, 2) // Biaya Perjalanan (per km)
+  perMinuteWaitFee   Decimal      @db.Decimal(10, 2) @default(0) // Biaya Tunggu (per menit)
+
+  isActive           Boolean      @default(true)
+  effectiveFrom      DateTime     @default(now())
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  @@index([zoneId, serviceType, isActive])
+}
+
+// Kebijakan tambahan per zona: tol, cuaca, hari libur.
+model RegionalPolicy {
+  id               String      @id @default(uuid())
+  zoneId           String
+  zone             PricingZone @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+
+  tollFee          Decimal     @db.Decimal(10, 2) @default(0) // Tol (nominal tetap, 0 kalau rute tanpa tol)
+  parkingFee       Decimal     @db.Decimal(10, 2) @default(0) // Parkir
+  weatherSurcharge Decimal     @db.Decimal(10, 2) @default(0) // Cuaca (tambahan saat cuaca buruk)
+  holidaySurcharge Decimal     @db.Decimal(10, 2) @default(0) // Hari Libur (tambahan)
+
+  isActive         Boolean     @default(true)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+}
+
+// Versi kebijakan komisi platform (tiered berdasarkan nilai order) + histori
+// perubahan. Hanya SATU versi yang isActive=true pada satu waktu - itulah
+// yang dipakai TariffEngineService untuk menghitung komisi order baru.
+model TariffVersion {
+  id              String    @id @default(uuid())
+  versionName     String    @unique // mis. "v2026-07-15-tiered-komisi"
+  description     String?
+
+  // Contoh isi JSON commissionTiers:
+  // [{"maxOrderValue": 20000, "rate": 0.08}, {"maxOrderValue": 50000, "rate": 0.07},
+  //  {"maxOrderValue": 100000, "rate": 0.06}, {"maxOrderValue": null, "rate": 0.05}]
+  // maxOrderValue: null berarti "ke atas" (tier terakhir/tanpa batas atas).
+  commissionTiers Json
+
+  isActive        Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  activatedAt     DateTime?
+
+  pricingHistories PricingHistory[]
+}
+
+// Jejak audit: breakdown tarif LENGKAP yang benar-benar dipakai untuk tiap
+// order, disimpan permanen supaya histori tarif tidak berubah retroaktif
+// walau PricingRule/TariffVersion diedit admin di kemudian hari.
+model PricingHistory {
+  id              String         @id @default(uuid())
+  orderId         String         @unique
+  order           Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  tariffVersionId String?
+  tariffVersion   TariffVersion? @relation(fields: [tariffVersionId], references: [id])
+
+  // Breakdown lengkap semua komponen: baseFare, pickupFee, distanceFee,
+  // waitFee, tollFee, parkingFee, weatherSurcharge, holidaySurcharge,
+  // promoDiscount, finalFare, commissionRate, commissionAmount, dst.
+  breakdown       Json
+
+  createdAt       DateTime       @default(now())
+}
+
+enum TopupStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+model TopupRequest {
+  id            String       @id @default(uuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount        Decimal      @db.Decimal(12, 2)
+  method        PaymentMethod
+  proofImageUrl String?
+  note          String?
+  status        TopupStatus  @default(PENDING_REVIEW)
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  reviewNote    String?
+  createdAt     DateTime     @default(now())
+}
