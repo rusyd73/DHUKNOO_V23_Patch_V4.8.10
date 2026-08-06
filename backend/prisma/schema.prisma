@@ -52,6 +52,22 @@ model User {
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
 
+  // BARU (Perbaikan #1 - Lupa/Reset Password): kode OTP reset password
+  // di-hash sebelum disimpan (sama seperti passwordHash) — TIDAK PERNAH
+  // simpan token mentah di DB. resetPasswordExpires membatasi kode hanya
+  // berlaku 15 menit sejak diminta.
+  resetPasswordTokenHash String?
+  resetPasswordExpires   DateTime?
+
+  // BARU (Perbaikan #3 - Otorisasi Admin nonaktifkan/aktifkan user): akun
+  // yang isActive=false ditolak saat login DAN request selanjutnya dengan
+  // access token lama (lihat authenticateToken middleware). deactivatedAt/
+  // deactivatedBy/deactivationReason dicatat untuk audit trail.
+  isActive            Boolean   @default(true)
+  deactivatedAt       DateTime?
+  deactivatedBy       String?
+  deactivationReason  String?
+
   // Role specific relations
   customerProfile CustomerProfile?
   driverProfile   DriverProfile?

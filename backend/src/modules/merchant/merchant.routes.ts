@@ -1,50 +1,71 @@
-import { Router } from 'express';
+// backend/src/modules/merchant/merchant.routes.ts
+import express from 'express';
 import { MerchantController } from './merchant.controller';
+// ✅ IMPORT YANG BENAR - auth.middleware.ts
 import { authenticateToken, authorizeRoles } from '../../core/middleware/auth.middleware';
-import { validateBody } from '../../core/middleware/validation.middleware';
-import {
-  createMerchantSchema,
-  updateMerchantSchema,
-  addMenuItemSchema,
-  updateMenuItemSchema,
-} from '../../core/validation/schemas';
+import { logger } from '../../config/logger';
 
-const router = Router();
+const router = express.Router();
 const merchantController = new MerchantController();
 
-// Publik (untuk user yang login): jelajahi merchant kuliner/belanja sekitar Malang-Batu
-router.get('/', authenticateToken as any, merchantController.list as any);
+// ============================================================
+// 🔥 HEALTH CHECK
+// ============================================================
+router.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Merchant routes are working!',
+    timestamp: new Date().toISOString(),
+  });
+});
 
-// Khusus MERCHANT: lihat data toko miliknya sendiri (dibuat otomatis saat registrasi role MERCHANT)
-router.get('/me', authenticateToken as any, authorizeRoles('MERCHANT') as any, merchantController.getMine as any);
+// ============================================================
+// 🔥 PUBLIC ROUTES
+// ============================================================
+router.get('/', merchantController.list);
+router.get('/search', merchantController.search);
+router.get('/popular', merchantController.getPopular);
+router.get('/:id', merchantController.getDetail);
+router.get('/:id/products', merchantController.listProducts);
+router.post('/register', merchantController.register);
+router.get('/products/search', merchantController.searchProducts);
 
-router.get('/:id', authenticateToken as any, merchantController.getDetail as any);
+// ============================================================
+// 🔥 AUTHENTICATED ROUTES
+// ============================================================
+router.use(authenticateToken);
 
-// ADMIN bisa membuat merchant baru secara manual (mis. untuk toko yang belum onboarding sendiri)
-router.post('/', authenticateToken as any, authorizeRoles('ADMIN') as any, validateBody(createMerchantSchema), merchantController.create as any);
+// Merchant Owner
+router.get('/my/merchant', authorizeRoles('MERCHANT'), merchantController.getMine);
+// ✅ PERBAIKAN #2: sebelumnya route '/my/...' ini memakai method yang
+// mewajibkan `:id` di URL (update/toggleStatus/getStats) — padahal route
+// ini tidak punya `:id` sama sekali, jadi SELALU gagal "Merchant tidak
+// ditemukan!" untuk pemilik toko manapun. Sekarang pakai varian "My*" yang
+// menyelesaikan merchant lewat token login (req.user.id), bukan URL param.
+router.put('/my/merchant', authorizeRoles('MERCHANT'), merchantController.updateMyMerchant);
+router.patch('/my/merchant/toggle', authorizeRoles('MERCHANT'), merchantController.toggleMyMerchantStatus);
+router.get('/my/stats', authorizeRoles('MERCHANT'), merchantController.getMyStats);
+router.post('/my/products', authorizeRoles('MERCHANT'), merchantController.addMenuItem);
+router.post('/my/products/bulk', authorizeRoles('MERCHANT'), merchantController.bulkAddProducts);
+router.put('/my/products/:itemId', authorizeRoles('MERCHANT'), merchantController.updateMenuItem);
+router.delete('/my/products/:itemId', authorizeRoles('MERCHANT'), merchantController.deleteMenuItem);
 
-// ADMIN bisa mengelola semua toko; MERCHANT hanya bisa mengelola tokonya sendiri
-// (dicek di service layer lewat assertCanManage — bukan cuma role check di sini).
-router.patch(
-  '/:id',
-  authenticateToken as any,
-  authorizeRoles('ADMIN', 'MERCHANT') as any,
-  validateBody(updateMerchantSchema),
-  merchantController.update as any
-);
-router.post(
-  '/:id/menu',
-  authenticateToken as any,
-  authorizeRoles('ADMIN', 'MERCHANT') as any,
-  validateBody(addMenuItemSchema),
-  merchantController.addMenuItem as any
-);
-router.patch(
-  '/menu/:itemId',
-  authenticateToken as any,
-  authorizeRoles('ADMIN', 'MERCHANT') as any,
-  validateBody(updateMenuItemSchema),
-  merchantController.updateMenuItem as any
-);
+// Admin
+router.post('/', authorizeRoles('ADMIN'), merchantController.create);
+router.put('/:id', authorizeRoles('ADMIN'), merchantController.update);
+// ✅ Ganti 'delete' menjadi 'removeMerchant'
+router.delete('/:id', authorizeRoles('ADMIN'), merchantController.removeMerchant);
+router.patch('/:id/toggle', authorizeRoles('ADMIN'), merchantController.toggleStatus);
+router.get('/:id/stats', authorizeRoles('ADMIN'), merchantController.getStats);
 
-export const merchantRouter = router;
+// ============================================================
+// 🔥 404 HANDLER
+// ============================================================
+router.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `Route ${req.originalUrl} tidak ditemukan di merchant routes.`,
+  });
+});
+
+export default router;

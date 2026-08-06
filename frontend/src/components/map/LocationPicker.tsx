@@ -31,11 +31,26 @@ interface LocationPickerProps {
   markerColor?: 'green' | 'red';
 }
 
+// ✅ PERBAIKAN 1: Fallback coordinates
+const FALLBACK_COORDS: LatLng = { lat: -7.9666, lng: 112.6326 };
+
+// ✅ PERBAIKAN 2: Fungsi validasi koordinat
+const isValidCoords = (coords: any): coords is LatLng => {
+  return coords && 
+         typeof coords.lat === 'number' && 
+         typeof coords.lng === 'number' &&
+         !isNaN(coords.lat) && 
+         !isNaN(coords.lng) &&
+         coords.lat >= -90 && coords.lat <= 90 &&
+         coords.lng >= -180 && coords.lng <= 180;
+};
+
 // Sub-component to handle map view updates (panning) when coordinates change
 function ChangeView({ center }: { center: LatLng | null }) {
   const map = useMap();
   useEffect(() => {
-    if (center) {
+    // ✅ PERBAIKAN 3: Validasi sebelum pakai
+    if (center && isValidCoords(center)) {
       map.setView([center.lat, center.lng], map.getZoom());
     }
   }, [center, map]);
@@ -65,36 +80,23 @@ export default function LocationPicker({
   const [isSearching, setIsSearching] = useState(false);
   const [isReverseGeocoding, setIsReverseGeocoding] = useState(false);
 
-  // PERBAIKAN: sebelumnya SEMUA perubahan searchQuery (termasuk yang di-set
-  // PROGRAMATIS oleh hasil geocode/reverse-geocode sendiri) memicu ulang efek
-  // auto-geocode di bawah — menciptakan feedback loop: klik peta -> reverse-
-  // geocode -> teks berubah -> auto-geocode teks itu lagi -> hasil pencarian
-  // bisa mendarat di koordinat SEDIKIT BEDA dari titik yang baru saja diklik
-  // -> marker "pindah sendiri". Untuk destinasi, roundtrip yang sama membuat
-  // field kelihatan "tidak merespon" karena teks hasil geocode di-geocode
-  // ulang dan kadang tidak balik ketemu. Flag ini membedakan perubahan dari
-  // KETIKAN USER SUNGGUHAN vs perubahan programatis (geocode/reverse-geocode/
-  // sinkronisasi dari prop address) — auto-geocode HANYA boleh jalan untuk
-  // yang pertama.
   const skipNextAutoGeocodeRef = useRef(false);
 
-  // Sync searchQuery with the parent address prop (when it changes externally)
+  // Sync searchQuery with the parent address prop
   useEffect(() => {
     skipNextAutoGeocodeRef.current = true;
     setSearchQuery(address);
   }, [address]);
 
-  // Ref to track if the last action was map click to prevent search loops
   const isMapActionRef = useRef(false);
 
-  // Perform Geocoding (Address text -> Lat/Lng)
+  // Perform Geocoding
   const handleGeocode = async (queryToSearch: string) => {
     if (!queryToSearch || !queryToSearch.trim()) return;
     setIsSearching(true);
-    isMapActionRef.current = false; // Reset map action since it's typing/searching
+    isMapActionRef.current = false;
 
     try {
-      // Append " Malang" or " Batu" if not present to prioritize Malang Raya area
       let formattedQuery = queryToSearch;
       if (!formattedQuery.toLowerCase().includes('malang') && !formattedQuery.toLowerCase().includes('batu')) {
         formattedQuery += ', Malang Raya';
@@ -120,10 +122,10 @@ export default function LocationPicker({
     }
   };
 
-  // Perform Reverse Geocoding (Lat/Lng -> Address text)
+  // Perform Reverse Geocoding
   const handleReverseGeocode = async (coords: LatLng) => {
     setIsReverseGeocoding(true);
-    isMapActionRef.current = true; // Mark as map-initiated action
+    isMapActionRef.current = true;
 
     try {
       const response = await fetch(
@@ -153,11 +155,9 @@ export default function LocationPicker({
     handleReverseGeocode(coords);
   };
 
-  // Debounced auto-geocode when customer types address
+  // Debounced auto-geocode
   useEffect(() => {
     if (skipNextAutoGeocodeRef.current) {
-      // Perubahan ini datang dari geocode/reverse-geocode/prop sync kita sendiri,
-      // BUKAN ketikan user — jangan geocode ulang (itulah sumber feedback loop-nya).
       skipNextAutoGeocodeRef.current = false;
       return;
     }
@@ -201,7 +201,6 @@ export default function LocationPicker({
     );
   };
 
-
   const customIcon = L.divIcon({
     className: '',
     html: `<div style="width:20px;height:20px;border-radius:50%;background:${
@@ -213,7 +212,12 @@ export default function LocationPicker({
     iconAnchor: [10, 10],
   });
 
-  const mapCenter = value || initialCenter;
+  // ✅ PERBAIKAN 4: Pastikan mapCenter selalu valid
+  const mapCenter = (value && isValidCoords(value)) ? value : 
+                    (isValidCoords(initialCenter) ? initialCenter : FALLBACK_COORDS);
+
+  // ✅ PERBAIKAN 5: Pastikan marker position valid
+  const markerPosition = (value && isValidCoords(value)) ? value : null;
 
   return (
     <div id={`location-picker-${label.toLowerCase().replace(/\s+/g, '-')}`} className="flex flex-col gap-2 bg-[#06170E] p-4 rounded-2xl border border-[#23583E]">
@@ -270,9 +274,9 @@ export default function LocationPicker({
         🎯 Gunakan Lokasi Saya Saat Ini (GPS)
       </button>
 
-
       {/* Leaflet Map Box */}
       <div className="rounded-xl overflow-hidden border border-[#23583E] relative" style={{ height: 200 }}>
+        {/* ✅ PERBAIKAN 6: MapContainer selalu pakai koordinat valid */}
         <MapContainer
           center={[mapCenter.lat, mapCenter.lng]}
           zoom={14}
@@ -284,11 +288,15 @@ export default function LocationPicker({
           />
           <ClickHandler onMapClick={handleMapClick} />
           <ChangeView center={value} />
-          {value && <Marker position={[value.lat, value.lng]} icon={customIcon} />}
+          
+          {/* ✅ PERBAIKAN 7: Marker hanya render jika position valid */}
+          {markerPosition && (
+            <Marker position={[markerPosition.lat, markerPosition.lng]} icon={customIcon} />
+          )}
         </MapContainer>
       </div>
 
-      {value && (
+      {value && isValidCoords(value) && (
         <div className="flex justify-between items-center text-[9px] text-gray-500 font-mono">
           <span>Lat: {value.lat.toFixed(5)}</span>
           <span>Lng: {value.lng.toFixed(5)}</span>

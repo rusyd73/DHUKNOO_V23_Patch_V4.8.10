@@ -61,4 +61,26 @@ export class MailerService {
       return false;
     }
   }
+
+  static get enabled(): boolean {
+    return this.isEnabled;
+  }
+
+  // 🆕 PERBAIKAN #1 (Lupa/Reset Password): kirim kode OTP reset password ke
+  // email pendaftar. Kalau SMTP belum dikonfigurasi, panggilan ini balik
+  // `false` dengan aman — pemanggil (AuthService) sudah punya fallback untuk
+  // situasi ini (lihat auth.service.ts).
+  static async sendPasswordResetEmail(to: string, fullName: string, otpCode: string): Promise<boolean> {
+    const html = `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+        <h2 style="color:#00A85A;">DHUKNOO Platform — Reset Kata Sandi</h2>
+        <p>Halo ${fullName || 'Pengguna'},</p>
+        <p>Kami menerima permintaan untuk mereset kata sandi akun Anda. Gunakan kode berikut untuk melanjutkan:</p>
+        <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; background:#f2f2f2; padding: 12px 16px; border-radius: 8px; text-align:center;">${otpCode}</p>
+        <p>Kode ini berlaku selama <b>15 menit</b>. Jika Anda tidak meminta reset kata sandi, abaikan email ini.</p>
+        <p style="color:#888; font-size:12px;">DHUKNOO Ride — Ojek Batu-Malang Raya</p>
+      </div>
+    `;
+    return this.sendReceiptEmail(to, 'Kode Reset Kata Sandi DHUKNOO', html);
+  }
 }

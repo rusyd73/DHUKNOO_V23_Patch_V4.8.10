@@ -15,12 +15,17 @@ interface DriverDashboardMapProps {
   onLocationUpdate: (coords: LatLng) => void;
 }
 
-// Re-center the map whenever the driver's live position changes, without
-// forcing the user to re-drag/re-zoom every single update.
-function RecenterOnMove({ position }: { position: LatLng }) {
+// ✅ PERBAIKAN 1: Tambahkan guard clause di RecenterOnMove
+function RecenterOnMove({ position }: { position: LatLng | null }) {
   const map = useMap();
   const hasCenteredOnce = useRef(false);
+  
   useEffect(() => {
+    // ✅ Cegah error: hanya jalankan jika position valid
+    if (!position || position.lat === undefined || position.lng === undefined) {
+      return;
+    }
+
     if (!hasCenteredOnce.current) {
       map.setView([position.lat, position.lng], 15);
       hasCenteredOnce.current = true;
@@ -28,29 +33,15 @@ function RecenterOnMove({ position }: { position: LatLng }) {
       map.panTo([position.lat, position.lng], { animate: true });
     }
   }, [position, map]);
+  
   return null;
 }
 
-/**
- * PERBAIKAN AKAR MASALAH: sebelumnya TIDAK ADA mekanisme sama sekali yang
- * mengirim update lokasi GPS driver ke backend di luar sesi trip aktif.
- * Akibatnya driver yang baru toggle ONLINE (apalagi setelah sebelumnya
- * OFFLINE) punya latitude/longitude NULL atau basi di database -- dan
- * SEMUA jalur dispatch/auto-accept mensyaratkan koordinat valid, jadi
- * driver itu otomatis tidak pernah muncul sebagai kandidat sama sekali.
- * Ini kemungkinan besar juga akar dari laporan "auto accept gagal"
- * sebelumnya.
- *
- * Komponen ini tampil di dashboard utama driver (bukan cuma saat trip
- * aktif), sebagai panduan visual DAN sekaligus mesin auto-update lokasi:
- * - Begitu driver ONLINE (termasuk transisi OFFLINE -> ONLINE), langsung
- *   kirim 1 update lokasi SEKETIKA (bukan menunggu interval berikutnya).
- * - Selama ONLINE, browser terus memantau posisi (watchPosition) dan
- *   mengirim update berkala ke backend (PATCH /api/location/driver).
- * - Begitu OFFLINE, watcher dihentikan (hemat baterai) dan peta
- *   menampilkan status "tidak memantau lokasi".
- */
-export default function DriverDashboardMap({ isOnline, initialCoords, onLocationUpdate }: DriverDashboardMapProps) {
+export default function DriverDashboardMap({ 
+  isOnline, 
+  initialCoords, 
+  onLocationUpdate 
+}: DriverDashboardMapProps) {
   const [coords, setCoords] = useState<LatLng | null>(initialCoords || null);
   const [accuracy, setAccuracy] = useState<number | null>(null);
   const [permissionError, setPermissionError] = useState<string | null>(null);
@@ -73,20 +64,18 @@ export default function DriverDashboardMap({ isOnline, initialCoords, onLocation
         ? 'Izin lokasi ditolak. Aktifkan izin GPS di browser/HP Anda supaya bisa menerima order.'
         : 'Gagal mengambil lokasi GPS. Pastikan GPS aktif dan sinyal cukup baik.'
     );
+    // ✅ PERBAIKAN 2: Set coords ke fallback jika error
+    setCoords({ lat: -7.9666, lng: 112.6326 });
   };
 
   useEffect(() => {
     if (!navigator.geolocation) {
       setPermissionError('Perangkat/browser ini tidak mendukung GPS (Geolocation API).');
+      setCoords({ lat: -7.9666, lng: 112.6326 }); // Fallback
       return;
     }
 
     if (isOnline) {
-      // PENTING: transisi OFFLINE -> ONLINE (termasuk saat pertama kali
-      // dashboard dibuka dalam keadaan sudah online) WAJIB langsung minta
-      // posisi terbaru SEKETIKA -- jangan tunggu watchPosition dapat fix
-      // pertamanya sendiri, supaya driver tidak "menggantung" tanpa
-      // koordinat valid tepat di momen mereka baru online.
       if (!wasOnlineRef.current) {
         navigator.geolocation.getCurrentPosition(pushUpdate, handleError, {
           enableHighAccuracy: true,
@@ -103,8 +92,6 @@ export default function DriverDashboardMap({ isOnline, initialCoords, onLocation
         });
       }
     } else if (watchIdRef.current !== null) {
-      // OFFLINE -- hentikan pemantauan lokasi supaya tidak menguras baterai
-      // driver percuma selagi mereka sedang tidak menerima order.
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
@@ -117,7 +104,6 @@ export default function DriverDashboardMap({ isOnline, initialCoords, onLocation
         watchIdRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOnline]);
 
   const driverIcon = L.divIcon({
@@ -134,7 +120,8 @@ export default function DriverDashboardMap({ isOnline, initialCoords, onLocation
     iconAnchor: [18, 18],
   });
 
-  const displayCoords = coords || { lat: -7.9666, lng: 112.6326 }; // Fallback: Malang, sesuai lokasi default
+  // ✅ PERBAIKAN 3: Pastikan selalu ada koordinat valid untuk MapContainer
+  const displayCoords = coords || { lat: -7.9666, lng: 112.6326 };
 
   return (
     <div className="bg-[#0D2E1F] border border-[#23583E] p-4 rounded-3xl flex flex-col gap-3">
@@ -156,13 +143,29 @@ export default function DriverDashboardMap({ isOnline, initialCoords, onLocation
       </div>
 
       <div className="rounded-2xl overflow-hidden border border-[#23583E]" style={{ height: 220 }}>
-        <MapContainer center={[displayCoords.lat, displayCoords.lng]} zoom={15} style={{ height: '100%', width: '100%' }}>
+        <MapContainer 
+          center={[displayCoords.lat, displayCoords.lng]} 
+          zoom={15} 
+          style={{ height: '100%', width: '100%' }}
+        >
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+          
+          {/* ✅ PERBAIKAN 4: Conditional rendering untuk RecenterOnMove */}
           {coords && <RecenterOnMove position={coords} />}
-          {coords && accuracy && <Circle center={[coords.lat, coords.lng]} radius={accuracy} pathOptions={{ color: '#00E575', fillOpacity: 0.08, weight: 1 }} />}
+          
+          {/* ✅ PERBAIKAN 5: Conditional rendering untuk Circle */}
+          {coords && accuracy && (
+            <Circle 
+              center={[coords.lat, coords.lng]} 
+              radius={accuracy} 
+              pathOptions={{ color: '#00E575', fillOpacity: 0.08, weight: 1 }} 
+            />
+          )}
+          
+          {/* ✅ PERBAIKAN 6: Marker selalu pakai displayCoords yang valid */}
           <Marker position={[displayCoords.lat, displayCoords.lng]} icon={driverIcon} />
         </MapContainer>
       </div>

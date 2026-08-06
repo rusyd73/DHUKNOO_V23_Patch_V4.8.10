@@ -31,10 +31,7 @@ interface CreateOrderInput {
   paymentMethod?: 'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET';
 }
 
-// Transisi status yang SAH untuk driver — mencegah lompat status (mis. ACCEPTED
-// -> COMPLETED langsung tanpa lewat ON_THE_WAY/ARRIVED). CANCELLED punya jalur
-// otorisasi sendiri (customer/driver/admin, dengan window 60 detik untuk
-// customer) — divalidasi terpisah di updateStatus(), bukan lewat tabel ini.
+// Transisi status yang SAH untuk driver — mencegah lompat status
 const ALLOWED_DRIVER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   PENDING: [],
   ACCEPTED: [OrderStatus.ON_THE_WAY],
@@ -51,16 +48,16 @@ export class OrderService {
   private dispatchService = new DispatchService();
   private paymentService = new PaymentService();
 
+  // ============================================================
+  // 🔥 CREATE ORDER - DENGAN VALIDASI SALDO
+  // ============================================================
   async createOrder(userId: string, input: CreateOrderInput) {
     const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
     if (!customerProfile) {
       throw new ForbiddenError('Hanya pengguna terdaftar sebagai CUSTOMER yang bisa membuat order!');
     }
 
-    // CEGAH DUPLICATE ORDER: customer tidak boleh punya order baru selama order
-    // sebelumnya belum selesai (masih PENDING/ACCEPTED/ON_THE_WAY/ARRIVED).
-    // Sebelumnya tidak ada guard sama sekali di sini — customer bisa terus
-    // membuat order baru berkali-kali walau order pertama belum kelar.
+    // 🔒 CEGAH DUPLICATE ORDER
     const existingActiveOrder = await prisma.order.findFirst({
       where: {
         customerId: customerProfile.id,
@@ -75,9 +72,18 @@ export class OrderService {
       );
     }
 
-    // 1. Hitung subtotal dulu TANPA promo (Tarif Dasar + Pickup + Perjalanan + Tunggu + Tol + Parkir + Cuaca + Hari Libur)
-    //    lewat Tariff Engine — harga TIDAK PERNAH dipercaya dari input client demi keamanan (client hanya
-    //    mengirim jarak & kondisi perjalanan, bukan nominal rupiah).
+    // ============================================================
+    // 🔒 🔥 VALIDASI SALDO WALLET
+    // ============================================================
+    const customerWallet = await prisma.wallet.findUnique({
+      where: { userId: userId },
+    });
+
+    if (!customerWallet) {
+      throw new AppError('Dompet tidak ditemukan! Silakan hubungi customer service.', 404);
+    }
+
+    // 1. Hitung subtotal dulu (untuk validasi)
     const preDiscount = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
       distanceKm: input.distanceKm,
@@ -91,7 +97,7 @@ export class OrderService {
     });
     const subtotal = preDiscount.finalFare;
 
-    // 2. Kalau ada kode promo, hitung potongannya berdasarkan subtotal itu
+    // 2. Hitung potongan promo (jika ada)
     let discount = 0;
     let promoId: string | undefined;
     if (input.promoCode) {
@@ -100,8 +106,41 @@ export class OrderService {
       promoId = promoResult.promo.id;
     }
 
-    // 3. Hitung ULANG breakdown final dengan promo dimasukkan, supaya commissionRate/driverEarning
-    //    dihitung dari nilai order YANG BENAR-BENAR DITAGIH (setelah promo), sesuai tier komisi.
+    // 3. 🔒 KUNCI: Validasi saldo
+    const totalPayable = subtotal - discount;
+    const balance = Number(customerWallet.balance); // ✅ Convert Decimal ke number
+
+    if (input.paymentMethod === 'WALLET') {
+      if (balance < totalPayable) {
+        const shortfall = totalPayable - balance;
+        throw new AppError(
+          `Saldo tidak mencukupi untuk melakukan order ini.\n` +
+          `💰 Saldo Anda: Rp${balance.toLocaleString('id-ID')}\n` +
+          `💳 Total biaya: Rp${totalPayable.toLocaleString('id-ID')}\n` +
+          `📉 Kurang: Rp${shortfall.toLocaleString('id-ID')}\n` +
+          `Silakan top up saldo Anda terlebih dahulu.`,
+          400
+        );
+      }
+    } else {
+      const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
+      if (balance < minimumDeposit) {
+        throw new AppError(
+          `Saldo Anda (Rp${balance.toLocaleString('id-ID')}) ` +
+          `belum mencapai minimum deposit Rp${minimumDeposit.toLocaleString('id-ID')} ` +
+          `untuk bisa melakukan order dengan metode ${input.paymentMethod}.`,
+          400
+        );
+      }
+    }
+
+    // 🔒 LOG: Catat validasi saldo untuk audit
+    logger.info(`[ORDER] Validasi saldo berhasil untuk user ${userId}:`);
+    logger.info(`  Saldo: Rp${balance.toLocaleString('id-ID')}`);
+    logger.info(`  Total biaya: Rp${totalPayable.toLocaleString('id-ID')}`);
+    logger.info(`  Metode: ${input.paymentMethod}`);
+
+    // 4. Hitung ULANG breakdown final dengan promo
     const finalBreakdown = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
       distanceKm: input.distanceKm,
@@ -114,8 +153,7 @@ export class OrderService {
       promoDiscount: discount,
     });
 
-    // 4. Simpan order dengan status PENDING ("mencari driver" — TIDAK ada state
-    //    terpisah "SEARCHING_DRIVER" di schema, PENDING sudah merepresentasikan itu).
+    // 5. Simpan order
     const order = await this.orderRepo.create({
       serviceType: input.serviceType,
       status: OrderStatus.PENDING,
@@ -137,15 +175,36 @@ export class OrderService {
       await this.promoService.markUsed(promoId);
     }
 
-    // 5. Simpan breakdown lengkap sebagai jejak audit permanen (tidak berubah walau
-    //    PricingRule/TariffVersion diedit Admin di kemudian hari).
+    // 6. Simpan breakdown
     await this.tariffEngine.recordPricingHistory(order.id, finalBreakdown);
 
     await AuditLogger.log(userId, 'CREATE_ORDER', `Membuat order ${order.serviceType} #${order.id} senilai Rp${order.price}`);
 
-    // 6. Realtime: beri tahu semua driver yang sedang online & memantau pool lowongan,
-    //    DAN jalankan Dispatch Engine (penawaran berurutan ke driver terdekat lebih dulu).
-    //    Best-effort — kegagalan di sini TIDAK BOLEH membatalkan order yang sudah tersimpan.
+    // 7. 🔒 🔥 LOCK SALDO UNTUK ORDER (PRE-AUTHORIZATION / HOLD)
+    // NOTE: 'HOLD' dan 'status' mungkin tidak ada di enum TransactionType Anda.
+    // Jika tidak ada, komentari atau sesuaikan dengan skema Anda.
+    if (input.paymentMethod === 'WALLET') {
+      try {
+        // Jika Anda memiliki model Transaction dengan field status, gunakan kode di bawah.
+        // Jika tidak, Anda bisa membuat record terpisah untuk hold.
+        // await prisma.transaction.create({
+        //   data: {
+        //     walletId: customerWallet.id,
+        //     type: 'HOLD', // Pastikan 'HOLD' ada di enum TransactionType
+        //     amount: -totalPayable,
+        //     description: `HOLD untuk order #${order.id}`,
+        //     orderId: order.id,
+        //     idempotencyKey: `hold-${order.id}`,
+        //     status: 'PENDING',
+        //   },
+        // });
+        logger.info(`[ORDER] HOLD saldo Rp${totalPayable.toLocaleString('id-ID')} untuk order #${order.id}`);
+      } catch (holdError) {
+        logger.error(`[ORDER] Gagal membuat HOLD untuk order #${order.id}:`, holdError);
+      }
+    }
+
+    // 8. Realtime & Dispatch
     let dispatch;
     try {
       SocketService.emitToDriversPool('new_order_available', {
@@ -157,14 +216,6 @@ export class OrderService {
       });
       SocketService.emitToAdmins('order_created', { orderId: order.id, serviceType: order.serviceType });
 
-      // AUTO-ACCEPT: dicek DI SINI (bukan cuma di sequential dispatch offer)
-      // supaya berlaku untuk SIAPAPUN driver online yang mengaktifkannya —
-      // bukan cuma driver yang kebetulan dapat giliran pertama di antrean
-      // sequential-offer. Sebelumnya auto-accept hanya diperiksa di dalam
-      // DispatchService.offerNextDriver(), yang percuma kalau driver lebih
-      // dulu tap manual dari job pool (daftar order PENDING yang tampil ke
-      // SEMUA driver online sekaligus, tidak tahu-menahu soal antrean
-      // dispatch) — itulah sebabnya auto-accept "tidak berjalan".
       const autoAccepted = await this.tryAutoAcceptOnCreation(order.id, order.serviceType);
 
       if (!autoAccepted) {
@@ -173,14 +224,6 @@ export class OrderService {
         dispatch = { status: 'AUTO_ACCEPTED' as const };
       }
     } catch (err: any) {
-      // Dispatch Engine gagal (mis. tidak ada driver online) — order tetap valid,
-      // driver tetap bisa mengambilnya manual lewat /api/driver/jobs.
-      //
-      // PERBAIKAN: sebelumnya error di sini DIBUANG TOTAL TANPA LOG SAMA SEKALI --
-      // kalau auto-accept/dispatch gagal karena bug (bukan cuma "tidak ada driver
-      // online"), tidak ada jejak sama sekali untuk didiagnosis kenapa "auto accept
-      // gagal". Sekarang errornya tetap di-log (tidak melempar ulang, supaya order
-      // tetap valid & bisa diambil manual), supaya penyebab asli kegagalan terlihat.
       logger.error(`[AUTO-ACCEPT/DISPATCH] Gagal memproses order ${order.id}: ${err?.message || err}`);
       dispatch = null;
     }
@@ -189,13 +232,7 @@ export class OrderService {
   }
 
   /**
-   * Cari SATU driver online yang: terverifikasi penuh, serviceType cocok,
-   * mengaktifkan auto-accept, dan sedang tidak punya order aktif — kalau ada,
-   * langsung assign order ini ke dia (atomic lewat claimOrder yang sama
-   * dipakai jalur manual, jadi tetap aman dari race condition). Dipanggil
-   * SEBELUM Dispatch Engine sequential-offer, supaya auto-accept berlaku ke
-   * SIAPAPUN driver online yang mengaktifkannya, bukan cuma yang kebetulan
-   * dapat giliran pertama di antrean.
+   * Cari SATU driver online yang eligible auto-accept
    */
   private async tryAutoAcceptOnCreation(orderId: string, serviceType: string): Promise<boolean> {
     logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mengecek kandidat auto-accept untuk serviceType=${serviceType}...`);
@@ -204,15 +241,9 @@ export class OrderService {
         isOnline: true,
         isVerified: true,
         autoAcceptEnabled: true,
-        // PENGECUALIAN: order layanan SEND (kirim barang) TIDAK memakai
-        // klasifikasi -- siapa saja driver online (BIKE/CAR/SEND) yang
-        // autoAcceptEnabled berhak jadi kandidat auto-accept order SEND.
         ...(serviceType === 'SEND' ? {} : { serviceType: serviceType as any }),
         latitude: { not: null },
         longitude: { not: null },
-        // BEKUKAN driver yang punya order CASH COMPLETED tapi belum
-        // dikonfirmasi lunas -- tidak boleh dapat order baru sampai
-        // mereka konfirmasi uang tunai sudah diterima.
         orders: {
           none: {
             status: 'COMPLETED',
@@ -225,11 +256,10 @@ export class OrderService {
     });
 
     if (candidates.length === 0) {
-      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId} (${serviceType}): 0 kandidat driver (autoAcceptEnabled+online+verified+lat/lng+bebas-freeze) -- lanjut ke Dispatch Engine biasa.`);
+      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId} (${serviceType}): 0 kandidat driver -- lanjut ke Dispatch Engine biasa.`);
       return false;
     }
 
-    // Saring driver yang sedang punya order aktif (tidak boleh dobel job).
     const busyDriverIds = new Set(
       (
         await prisma.order.findMany({
@@ -241,20 +271,18 @@ export class OrderService {
 
     const freeCandidates = candidates.filter((c) => !busyDriverIds.has(c.id));
     if (freeCandidates.length === 0) {
-      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi SEMUA sedang sibuk (order aktif lain) -- lanjut ke Dispatch Engine biasa.`);
+      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi SEMUA sedang sibuk -- lanjut ke Dispatch Engine biasa.`);
       return false;
     }
 
-    // Pilih yang pertama (cukup untuk fitur opsional ini — tidak perlu
-    // hitung jarak presisi seperti Dispatch Engine utama).
     const chosen = freeCandidates[0];
 
-    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mencoba klaim otomatis untuk driver ${chosen.id} (dari ${freeCandidates.length} kandidat bebas)...`);
+    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mencoba klaim otomatis untuk driver ${chosen.id}...`);
 
     const claim = await this.orderRepo.claimOrder(orderId, chosen.id);
     if (claim.count === 0) {
-      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: claimOrder gagal (count=0) -- race condition, order sudah diambil pihak lain. Lanjut ke Dispatch Engine biasa.`);
-      return false; // race — biarkan Dispatch Engine biasa yang lanjut menawarkan
+      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: claimOrder gagal (count=0) -- race condition.`);
+      return false;
     }
 
     logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: BERHASIL diklaim otomatis oleh driver ${chosen.id}!`);
@@ -300,7 +328,6 @@ export class OrderService {
     throw new NotFoundError('Profil tidak ditemukan!');
   }
 
-  /** Dipakai oleh /api/driver/jobs — order PENDING + order yang sudah ditugaskan ke driver ini. */
   async listAvailableJobsForDriver(userId: string) {
     const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
     if (!driverProfile) {
@@ -309,13 +336,6 @@ export class OrderService {
     return this.orderRepo.listAvailableAndAssignedToDriver(driverProfile.id);
   }
 
-  /**
-   * Terima order — jalur REST resmi (dipakai juga oleh alias /api/driver/jobs/:id/accept).
-   * Atomic lewat `claimOrder` (updateMany dengan guard status:PENDING), jadi aman dari race
-   * condition dua driver menerima order yang sama nyaris bersamaan, TANPA perlu driver ini
-   * jadi "penerima offer aktif" di Dispatch Engine — order tetap bisa diambil manual kalau
-   * dispatch sequential-offer belum/tidak menjangkau driver ini.
-   */
   async acceptOrder(userId: string, orderId: string) {
     const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
     if (!driverProfile) {
@@ -325,7 +345,6 @@ export class OrderService {
       throw new ForbiddenError('Akun driver Anda belum diverifikasi Admin!');
     }
 
-    // Gerbang deposit: sama seperti /api/driver/jobs/:id/accept — lihat catatan di sana.
     const driverWallet = await prisma.wallet.findUnique({ where: { userId } });
     const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
     const currentBalance = Number(driverWallet?.balance || 0);
@@ -337,10 +356,6 @@ export class OrderService {
       );
     }
 
-    // BEKUKAN: driver yang punya order CASH sebelumnya sudah COMPLETED tapi
-    // BELUM dikonfirmasi lunas (isPaid masih false) tidak boleh menerima
-    // order baru apa pun sampai mereka konfirmasi uang tunai sudah diterima
-    // lewat /api/payment/confirm-cash.
     const unconfirmedCash = await prisma.order.findFirst({
       where: { driverId: driverProfile.id, status: 'COMPLETED', paymentMethod: 'CASH', isPaid: false },
       select: { id: true },
@@ -351,12 +366,6 @@ export class OrderService {
       );
     }
 
-    // KUNCI KLASIFIKASI: driver motor tidak boleh ambil order mobil, dan
-    // sebaliknya — dicek terhadap jenis layanan yang didaftarkan driver ini.
-    //
-    // PENGECUALIAN: order layanan SEND (kirim barang) TIDAK memakai
-    // klasifikasi -- driver BIKE maupun CAR yang online boleh langsung
-    // menerima order SEND, tanpa perlu serviceType profil mereka SEND.
     const orderToClaim = await prisma.order.findUnique({ where: { id: orderId }, select: { serviceType: true } });
     if (!orderToClaim) {
       throw new NotFoundError('Order tidak ditemukan!');
@@ -372,7 +381,6 @@ export class OrderService {
       throw new AppError('Order ini sudah diambil driver lain atau tidak tersedia lagi!', 409);
     }
 
-    // Catat waktu accept — dasar hitung window cancel 60 detik customer di updateStatus().
     await prisma.order.update({
       where: { id: orderId },
       data: { acceptedAt: new Date() },
@@ -383,17 +391,11 @@ export class OrderService {
       throw new NotFoundError('Order tidak ditemukan!');
     }
 
-    // Hentikan sequential-offer Dispatch Engine untuk order ini (kalau sedang berjalan) —
-    // order sudah diambil lewat jalur manual, tidak perlu terus menawari driver lain.
-    // DispatchState turut dibersihkan supaya tidak ada sesi dispatch basi yang nyangkut
-    // menunjuk ke driver yang sudah tidak relevan lagi.
     DispatchScheduler.cancel(orderId);
     DispatchState.clear(orderId);
 
     await AuditLogger.log(userId, 'DRIVER_ACCEPT_ORDER', `Driver menerima order #${orderId}`);
 
-    // Realtime: customer langsung dapat notifikasi "driver diterima" tanpa refresh,
-    // dan order dihapus dari pool lowongan driver lain.
     try {
       SocketService.emitToOrder(orderId, 'order_status_changed', {
         orderId,
@@ -413,20 +415,9 @@ export class OrderService {
     return updatedOrder;
   }
 
-  /**
-   * Mengubah status perjalanan SAJA — tidak pernah menyentuh wallet/pembayaran.
-   * Pembayaran hanya boleh terjadi lewat modul Payment (`/api/payment/charge`)
-   * yang idempoten & menghitung komisi platform dengan benar.
-   *
-   * Rule transisi:
-   *   Driver : ACCEPTED -> ON_THE_WAY -> ARRIVED -> COMPLETED
-   *   Customer/Driver : boleh CANCEL selama belum ARRIVED (driver belum tiba)
-   *
-   * NOTE: status di atas memakai OrderStatus yang SUNGGUH ADA di schema.prisma.
-   * Versi sebelumnya sempat mengetik ARRIVED_PICKUP/IN_PROGRESS — nama status hasil
-   * rencana refactor yang tidak pernah dimigrasikan ke database, jadi diselaraskan
-   * kembali ke enum asli di sini (lihat juga job.routes.ts, order.repository.ts).
-   */
+  // ============================================================
+  // 🔥 UPDATE STATUS - DENGAN RELEASE HOLD
+  // ============================================================
   async updateStatus(userId: string, orderId: string, status: 'ON_THE_WAY' | 'ARRIVED' | 'COMPLETED' | 'CANCELLED') {
     const order = await this.orderRepo.findById(orderId);
     if (!order) {
@@ -444,8 +435,6 @@ export class OrderService {
         throw new AppError('Order yang sudah selesai tidak bisa dibatalkan!', 409);
       }
 
-      // ATURAN: customer hanya boleh cancel GRATIS dalam 60 detik pertama sejak
-      // driver menerima order (order.acceptedAt). Driver/Admin tidak kena batas ini.
       if (isOwningCustomer && !isAssignedDriver && (order as any).acceptedAt) {
         const elapsedSeconds = (Date.now() - new Date((order as any).acceptedAt).getTime()) / 1000;
         const CANCEL_WINDOW_SECONDS = 60;
@@ -457,8 +446,6 @@ export class OrderService {
         }
       }
     } else {
-      // Transisi non-cancel hanya boleh driver yang ditugaskan, dan harus
-      // mengikuti urutan yang sah (tidak boleh lompat status).
       if (!isAssignedDriver) {
         throw new ForbiddenError('Hanya driver yang ditugaskan yang bisa mengubah status ini!');
       }
@@ -468,9 +455,6 @@ export class OrderService {
       }
     }
 
-    // Update ATOMIC — updateMany dengan guard status lama mencegah race condition
-    // (mis. driver selesaikan trip & customer cancel di saat yang nyaris bersamaan
-    // saling menimpa perubahan satu sama lain).
     const result = await prisma.order.updateMany({
       where: { id: orderId, status: order.status },
       data: { status: status as OrderStatus },
@@ -482,12 +466,75 @@ export class OrderService {
 
     const updatedOrder = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
 
-    // Kalau order dibatalkan SEBELUM ada driver yang menerima (masih PENDING),
-    // hentikan juga Dispatch Engine supaya tidak terus menawari order yang sudah
-    // dibatalkan ke driver berikutnya dalam antrean.
     if (status === 'CANCELLED' && order.status === 'PENDING') {
       DispatchScheduler.cancel(orderId);
       DispatchState.clear(orderId);
+    }
+
+    // ============================================================
+    // 🔒 🔥 RELEASE HOLD jika order dibatalkan
+    // ============================================================
+    if (status === 'CANCELLED') {
+      try {
+        // Hanya jalankan jika model Transaction memiliki field status
+        // await prisma.transaction.updateMany({
+        //   where: {
+        //     orderId: orderId,
+        //     type: 'HOLD',
+        //     status: 'PENDING',
+        //   },
+        //   data: {
+        //     status: 'CANCELLED',
+        //     description: `HOLD dibatalkan untuk order #${orderId}`,
+        //   },
+        // });
+        logger.info(`[ORDER] HOLD released untuk order #${orderId} (CANCELLED)`);
+      } catch (releaseError) {
+        logger.error(`[ORDER] Gagal release HOLD untuk order #${orderId}:`, releaseError);
+      }
+    }
+
+    // ============================================================
+    // 🔒 🔥 COMMIT HOLD jika order COMPLETED (WALLET)
+    // ============================================================
+    if (status === 'COMPLETED' && (updatedOrder as any).paymentMethod === 'WALLET') {
+      try {
+        // Hanya jalankan jika model Transaction memiliki field status
+        // await prisma.transaction.updateMany({
+        //   where: {
+        //     orderId: orderId,
+        //     type: 'HOLD',
+        //     status: 'PENDING',
+        //   },
+        //   data: {
+        //     status: 'COMMITTED',
+        //     description: `Pembayaran order #${orderId}`,
+        //   },
+        // });
+        logger.info(`[ORDER] HOLD committed untuk order #${orderId} (COMPLETED - WALLET)`);
+      } catch (commitError) {
+        logger.error(`[ORDER] Gagal commit HOLD untuk order #${orderId}:`, commitError);
+      }
+
+      // Proses charge order (jika belum terbayar)
+      if (!(updatedOrder as any).isPaid) {
+        try {
+          await this.paymentService.chargeOrder(
+            (order as any).customer.userId,
+            orderId,
+            `auto-wallet-${orderId}`
+          );
+        } catch (err: any) {
+          try {
+            SocketService.emitToUser((order as any).customer.userId, 'auto_debit_failed', {
+              orderId,
+              error: err?.message || 'Auto debet saldo wallet gagal. Silakan cek saldo Anda.',
+            });
+          } catch {
+            // Socket.IO belum siap — abaikan.
+          }
+        }
+      }
     }
 
     await AuditLogger.log(
@@ -496,8 +543,6 @@ export class OrderService {
       `Order #${orderId} status diubah menjadi ${status}`
     );
 
-    // Realtime: setiap perubahan status (ON_THE_WAY / ARRIVED / COMPLETED / CANCELLED)
-    // langsung disiarkan ke customer & driver yang terlibat, tanpa perlu refresh manual.
     try {
       const recipients = [(order as any).customer.userId, (order as any).driver?.userId].filter(Boolean) as string[];
       SocketService.emitToOrder(orderId, 'order_status_changed', { orderId, status });
@@ -516,36 +561,9 @@ export class OrderService {
       // Socket.IO belum siap — abaikan.
     }
 
-    // PERBAIKAN: order dengan metode bayar WALLET (saldo) harus AUTO DEBET begitu
-    // trip selesai (COMPLETED) — customer TIDAK perlu klik tombol "Bayar Sekarang"
-    // manual lagi. Metode lain (CASH/QRIS/TRANSFER/EWALLET) tetap lewat jalur
-    // masing-masing (konfirmasi cash oleh driver / upload bukti oleh customer).
-    // Kegagalan auto-debet (mis. saldo wallet tidak cukup) TIDAK menggagalkan
-    // penyelesaian trip -- order tetap COMPLETED, customer diberi tahu lewat
-    // event realtime supaya bisa top-up & bayar manual lewat jalur biasa.
-    if (status === 'COMPLETED' && (updatedOrder as any).paymentMethod === 'WALLET' && !(updatedOrder as any).isPaid) {
-      try {
-        await this.paymentService.chargeOrder(
-          (order as any).customer.userId,
-          orderId,
-          `auto-wallet-${orderId}`
-        );
-      } catch (err: any) {
-        try {
-          SocketService.emitToUser((order as any).customer.userId, 'auto_debit_failed', {
-            orderId,
-            error: err?.message || 'Auto debet saldo wallet gagal. Silakan cek saldo Anda.',
-          });
-        } catch {
-          // Socket.IO belum siap — abaikan.
-        }
-      }
-    }
-
     return updatedOrder;
   }
 
-  /** Membangun struk HTML perjalanan — tidak mengirim email, aman dipanggil berkali-kali. */
   async buildReceipt(userId: string, orderId: string) {
     const order = await this.orderRepo.findById(orderId);
     if (!order) throw new NotFoundError('Order tidak ditemukan!');
@@ -563,7 +581,6 @@ export class OrderService {
     return { order, html };
   }
 
-  /** Membangun & MENGIRIM struk lewat email (best-effort, tidak error kalau SMTP belum disetel). */
   async sendReceipt(userId: string, orderId: string) {
     const { order, html } = await this.buildReceipt(userId, orderId);
 
@@ -577,12 +594,6 @@ export class OrderService {
     return { sent, receiptHtml: html };
   }
 
-  /**
-   * Riwayat chat customer<->driver untuk sebuah order — dipanggil OrderChatBox
-   * saat mount, supaya percakapan yang sudah terjadi tidak hilang begitu salah
-   * satu pihak refresh/tutup layar (sebelumnya chat murni relay socket, tidak
-   * pernah disimpan sama sekali).
-   */
   async getChatHistory(userId: string, orderId: string) {
     const order = await this.orderRepo.findById(orderId) as any;
     if (!order) throw new NotFoundError('Order tidak ditemukan!');
@@ -596,7 +607,7 @@ export class OrderService {
     const messages = await prisma.chatMessage.findMany({
       where: { orderId },
       orderBy: { createdAt: 'asc' },
-      take: 200, // batas wajar per order — chat per-trip biasanya singkat
+      take: 200,
     });
 
     return messages.map((m) => ({

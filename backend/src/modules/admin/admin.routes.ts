@@ -145,6 +145,146 @@ router.post(
   }
 );
 
+// ── PERBAIKAN #3: Otorisasi Admin — Nonaktifkan/Aktifkan Kembali User ──────
+
+// GET /api/admin/users - daftar semua user (Customer/Driver/Merchant/Admin)
+// beserta status aktif/nonaktifnya, untuk dipilih Admin di panel manajemen user.
+router.get(
+  '/users',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const roleFilter = req.query.role as string | undefined;
+
+      const users = await prisma.user.findMany({
+        where: roleFilter ? { role: roleFilter as any } : undefined,
+        select: {
+          id: true,
+          email: true,
+          fullName: true,
+          role: true,
+          isActive: true,
+          deactivatedAt: true,
+          deactivationReason: true,
+          createdAt: true,
+          customerProfile: { select: { phoneNumber: true } },
+          driverProfile: { select: { phoneNumber: true, isVerified: true } },
+          merchant: { select: { name: true, isOpen: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      return res.status(200).json({ users });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal mengambil daftar pengguna.' });
+    }
+  }
+);
+
+// POST /api/admin/users/:userId/deactivate - nonaktifkan (remove akses) akun user.
+// User TIDAK dihapus dari database (data order/wallet/riwayat tetap utuh) —
+// hanya diblokir login & di-force-logout dari sesi yang sedang aktif.
+router.post(
+  '/users/:userId/deactivate',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const adminId = req.user!.id;
+      const { userId } = req.params;
+      const { reason } = req.body || {};
+
+      const target = await prisma.user.findUnique({ where: { id: userId } });
+      if (!target) {
+        return res.status(404).json({ error: 'Pengguna tidak ditemukan.' });
+      }
+      if (target.role === 'ADMIN') {
+        return res.status(403).json({ error: 'Akun sesama Admin tidak bisa dinonaktifkan lewat panel ini.' });
+      }
+      if (target.id === adminId) {
+        return res.status(400).json({ error: 'Anda tidak bisa menonaktifkan akun Anda sendiri.' });
+      }
+
+      const updated = await prisma.user.update({
+        where: { id: userId },
+        data: {
+          isActive: false,
+          refreshToken: null,
+          deactivatedAt: new Date(),
+          deactivatedBy: adminId,
+          deactivationReason: reason || null,
+        },
+      });
+
+      // Paksa logout real-time kalau user sedang online (WebSocket) —
+      // supaya efeknya langsung terasa, bukan menunggu access token expired.
+      try {
+        SocketService.emitToUser(userId, 'account_deactivated', {
+          reason: reason || 'Dinonaktifkan oleh Admin.',
+        });
+      } catch {
+        // Socket.IO belum siap / user sedang tidak online — abaikan.
+      }
+
+      await AuditLogger.log(
+        adminId,
+        'ADMIN_DEACTIVATE_USER',
+        `Menonaktifkan akun ${updated.fullName} (${updated.email}, role: ${updated.role})${reason ? ` — Alasan: ${reason}` : ''}`
+      );
+
+      return res.status(200).json({
+        message: `Akun ${updated.fullName} berhasil dinonaktifkan.`,
+        user: { id: updated.id, email: updated.email, fullName: updated.fullName, isActive: updated.isActive },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal menonaktifkan akun pengguna.' });
+    }
+  }
+);
+
+// POST /api/admin/users/:userId/reactivate - aktifkan kembali akun user
+// (mis. atas permintaan user yang mengajukan banding ke Customer Service).
+router.post(
+  '/users/:userId/reactivate',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const adminId = req.user!.id;
+      const { userId } = req.params;
+
+      const target = await prisma.user.findUnique({ where: { id: userId } });
+      if (!target) {
+        return res.status(404).json({ error: 'Pengguna tidak ditemukan.' });
+      }
+
+      const updated = await prisma.user.update({
+        where: { id: userId },
+        data: {
+          isActive: true,
+          deactivatedAt: null,
+          deactivatedBy: null,
+          deactivationReason: null,
+        },
+      });
+
+      await AuditLogger.log(
+        adminId,
+        'ADMIN_REACTIVATE_USER',
+        `Mengaktifkan kembali akun ${updated.fullName} (${updated.email}, role: ${updated.role}) atas permintaan pengguna.`
+      );
+
+      return res.status(200).json({
+        message: `Akun ${updated.fullName} berhasil diaktifkan kembali.`,
+        user: { id: updated.id, email: updated.email, fullName: updated.fullName, isActive: updated.isActive },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal mengaktifkan kembali akun pengguna.' });
+    }
+  }
+);
+
 // GET /api/admin/logs - Fetch global platform logs directly
 router.get(
   '/logs',

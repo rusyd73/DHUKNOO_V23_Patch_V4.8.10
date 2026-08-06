@@ -41,6 +41,22 @@ export const changePasswordSchema = z.object({
   newPassword: z.string().min(4, 'Password baru minimal harus 4 karakter!'),
 });
 
+// 🆕 PERBAIKAN #1 (Lupa/Reset Password)
+export const requestPasswordResetSchema = z
+  .object({
+    email: z.string().optional(),
+    phone: z.string().optional(),
+    emailOrPhone: z.string().optional(),
+  })
+  .refine((data) => !!(data.email || data.phone || data.emailOrPhone), {
+    message: 'Email atau Nomor HP wajib diisi!',
+  });
+
+export const confirmPasswordResetSchema = z.object({
+  token: z.string().min(1, 'Kode reset wajib diisi!'),
+  newPassword: z.string().min(4, 'Password baru minimal harus 4 karakter!'),
+});
+
 export const createOrderSchema = z.object({
   serviceType: z.enum(['BIKE', 'CAR', 'SEND'], {
     errorMap: () => ({ message: 'Tipe layanan harus BIKE, CAR, atau SEND!' }),

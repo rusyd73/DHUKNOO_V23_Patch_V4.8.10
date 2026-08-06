@@ -1,6 +1,19 @@
 import axios from "axios";
 
+// PERBAIKAN UNTUK BUILD ANDROID (Capacitor): window.location.origin HANYA
+// valid untuk web biasa (browser, same-origin dengan backend via reverse
+// proxy). Di dalam WebView native (Capacitor), origin-nya jadi skema internal
+// app ("capacitor://localhost" / "https://localhost"), BUKAN alamat server
+// backend sungguhan -- kalau dipakai apa adanya, semua request API & koneksi
+// Socket.IO akan gagal total di HP. VITE_API_BASE_URL (diisi di file .env,
+// lihat capacitor.config.ts & README-ANDROID.md) WAJIB diisi untuk build
+// Android, menunjuk ke alamat backend yang bisa dijangkau HP (mis. IP LAN
+// komputer pengembang, atau domain production).
 export function getApiBaseUrl(): string {
+  const envUrl = (import.meta as any)?.env?.VITE_API_BASE_URL;
+  if (envUrl) {
+    return envUrl;
+  }
   if (typeof window !== "undefined") {
     return window.location.origin;
   }
@@ -9,7 +22,12 @@ export function getApiBaseUrl(): string {
 
 export function createApiClient(getToken: () => string | null | undefined, onLogout?: () => void) {
   const instance = axios.create({
-    baseURL: "",
+    // PERBAIKAN: sebelumnya selalu "" (relatif) -- benar untuk web (same-origin)
+    // tapi SALAH TOTAL di app Android/Capacitor karena tidak ada "origin" yang
+    // berarti untuk di-resolve relatif terhadapnya. Sekarang pakai
+    // getApiBaseUrl() yang sama dipakai Socket.IO, supaya konsisten dan bisa
+    // dioverride lewat VITE_API_BASE_URL untuk build native.
+    baseURL: getApiBaseUrl(),
   });
 
   instance.interceptors.request.use((config) => {
@@ -30,6 +48,14 @@ export const API_ENDPOINTS = {
     refresh: "/api/auth/refresh",
     profile: "/api/customer/profile",
     changePassword: "/api/auth/change-password",
+    // 🆕 PERBAIKAN #1 (Lupa/Reset Password): endpoint ini sebelumnya TIDAK
+    // ADA di kedua salinan @obama/shared-api (di sini maupun di
+    // packages/shared-api/index.ts), padahal frontend/src/api/auth.api.ts
+    // sudah memanggilnya — itulah kenapa "lupa/reset password tidak bisa
+    // kirim". Endpoint backend-nya sekarang sudah dibuat di
+    // backend/src/modules/auth/auth.routes.ts.
+    requestPasswordReset: "/api/auth/reset-password-request",
+    confirmPasswordReset: "/api/auth/reset-password-confirm",
   },
   customer: {
     profile: "/api/customer/profile",

@@ -15,8 +15,12 @@ export class AuthController {
         email, password, fullName, role, vehiclePlate, vehicleModel, driverServiceType,
         merchantName, merchantCategory, merchantAddress, merchantLatitude, merchantLongitude,
       } = req.body;
+
+      // ✅ PERBAIKAN 1: Normalize email
+      const normalizedEmail = email?.toLowerCase().trim();
+
       const result = await this.authService.registerUser({
-        email,
+        email: normalizedEmail, // ✅ Pakai email yang sudah dinormalisasi
         passwordPlain: password,
         fullName,
         role,
@@ -30,10 +34,8 @@ export class AuthController {
         merchantLongitude,
       });
 
-      // Write Audit Log
       await AuditLogger.log(result.id, 'USER_REGISTER', `Akun terdaftar dengan peran: ${role}`);
 
-      // Dispatch BullMQ background job for welcoming notification
       await QueueService.addNotificationJob(
         result.id,
         'Registrasi Akun Berhasil!',
@@ -48,17 +50,41 @@ export class AuthController {
     }
   };
 
+  // ✅ PERBAIKAN 2: Login dengan debug log
   login = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { email, password } = req.body;
-      const result = await this.authService.loginUser(email, password);
+
+      // ✅ Debug log
+      logger.info('🔍 LOGIN ATTEMPT:');
+      logger.info('  Raw email:', email);
+      logger.info('  Email length:', email?.length);
+      logger.info('  Email char codes:', email ? [...email].map(c => c.charCodeAt(0)) : 'null');
+      logger.info('  User-Agent:', req.headers['user-agent']);
+
+      // ✅ Normalize email
+      const normalizedEmail = email?.toLowerCase().trim();
+      logger.info('  Normalized email:', normalizedEmail);
+
+      // ✅ Validasi input
+      if (!normalizedEmail || !password) {
+        return res.status(400).json({ 
+          error: 'Email dan password wajib diisi!' 
+        });
+      }
+
+      // ✅ Panggil service dengan email yang sudah dinormalisasi
+      const result = await this.authService.loginUser(normalizedEmail, password);
+
+      logger.info('✅ Login successful for user:', result.user.id);
 
       // Write Audit Log
-      await AuditLogger.log(result.user.id, 'USER_LOGIN', `User ${email} masuk sistem.`);
+      await AuditLogger.log(result.user.id, 'USER_LOGIN', `User ${normalizedEmail} masuk sistem.`);
 
       return res.status(200).json(result);
     } catch (err: any) {
-      logger.error('Login controller error: %s', err.message);
+      logger.error('❌ Login controller error: %s', err.message);
+      logger.error('  Stack:', err.stack);
       const status = err instanceof AppError ? err.statusCode : 401;
       return res.status(status).json({ error: err.message });
     }
@@ -87,12 +113,43 @@ export class AuthController {
       const { oldPassword, newPassword } = req.body;
       await this.authService.changePassword(userId, oldPassword, newPassword);
 
-      // Write Audit Log
       await AuditLogger.log(userId, 'USER_PASSWORD_CHANGE', `Mengganti kata sandi.`);
 
       return res.status(200).json({ message: 'Password berhasil diperbarui!' });
     } catch (err: any) {
       logger.error('Change password controller error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 400;
+      return res.status(status).json({ error: err.message });
+    }
+  };
+
+  // 🆕 PERBAIKAN #1 — Lupa/Reset Password (Langkah 1: minta kode reset)
+  requestPasswordReset = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { phone, email, emailOrPhone } = req.body;
+      const identifier = emailOrPhone || email || phone;
+
+      const result = await this.authService.requestPasswordReset(identifier);
+
+      return res.status(200).json(result);
+    } catch (err: any) {
+      logger.error('Request password reset controller error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 400;
+      return res.status(status).json({ error: err.message });
+    }
+  };
+
+  // 🆕 PERBAIKAN #1 — Lupa/Reset Password (Langkah 2: konfirmasi kode + password baru)
+  confirmPasswordReset = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { token, newPassword } = req.body;
+      const { userId, ...result } = await this.authService.confirmPasswordReset(token, newPassword);
+
+      await AuditLogger.log(userId, 'USER_PASSWORD_RESET', 'Password direset lewat alur lupa password.');
+
+      return res.status(200).json(result);
+    } catch (err: any) {
+      logger.error('Confirm password reset controller error: %s', err.message);
       const status = err instanceof AppError ? err.statusCode : 400;
       return res.status(status).json({ error: err.message });
     }

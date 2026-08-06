@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { logger } from '../../config/logger';
 import { ENV } from '../../config/env';
 import { AuthenticationError, ForbiddenError } from '../errors/AppError';
+import { prisma } from '../../config/prisma';
 
 export interface AuthenticatedRequest extends Request {
   user?: {
@@ -25,7 +26,7 @@ export const authenticateToken = (
     return res.status(401).json({ error: 'Akses ditolak. Token autentikasi kosong!' });
   }
 
-  jwt.verify(token, ENV.JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, ENV.JWT_SECRET, async (err, decoded) => {
     if (err) {
       logger.error(`Invalid JWT token attempt on path: ${req.path}`);
       // PERBAIKAN: sebelumnya balas 403 di sini. Token EXPIRED itu situasi
@@ -39,7 +40,35 @@ export const authenticateToken = (
       // sampai logout & login manual.
       return res.status(401).json({ error: 'Token kedaluwarsa atau tidak valid!' });
     }
-    req.user = decoded as AuthenticatedRequest['user'];
+
+    const payload = decoded as AuthenticatedRequest['user'];
+
+    // 🆕 PERBAIKAN #3: kalau admin menonaktifkan akun user SEMENTARA access
+    // token lamanya masih berlaku (belum expired 15 menit), request
+    // berikutnya tetap harus ditolak — jangan tunggu token itu expired dulu.
+    try {
+      const dbUser = await prisma.user.findUnique({
+        where: { id: payload!.id },
+        select: { isActive: true },
+      });
+
+      if (!dbUser) {
+        return res.status(401).json({ error: 'Akun tidak ditemukan.' });
+      }
+
+      if (dbUser.isActive === false) {
+        logger.warn(`⛔ Access denied — account deactivated: ${payload!.id}`);
+        return res.status(403).json({
+          error: 'Akun Anda telah dinonaktifkan oleh Admin. Hubungi Customer Service DHUKNOO untuk aktivasi kembali.',
+        });
+      }
+    } catch (dbErr: any) {
+      logger.error('Gagal memeriksa status akun (isActive) saat autentikasi: %s', dbErr.message || dbErr);
+      // Jangan blokir request hanya karena DB check gagal (mis. koneksi
+      // sesaat) — kegagalan nyata tetap akan tertangkap di layer bawahnya.
+    }
+
+    req.user = payload;
     next();
   });
 };

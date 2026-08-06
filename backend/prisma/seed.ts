@@ -98,7 +98,11 @@ async function main() {
   });
   console.log(`👤 Seeded Customers: ${customer1.email}, ${customer2.email}`);
 
+  // ============================================================
   // 3. Seed DRIVERS
+  // ============================================================
+  
+  // 3a. Driver BIKE (sudah ada)
   const driver1 = await prisma.user.create({
     data: {
       email: 'driver1@gmail.com',
@@ -113,9 +117,11 @@ async function main() {
       phoneNumber: '+6281234567890',
       vehiclePlate: 'N 1234 BAT',
       vehicleModel: 'Honda Vario 150',
+      serviceType: ServiceType.BIKE, // ✅ Tambahkan serviceType
       isOnline: true,
+      autoAcceptEnabled: true, // ✅ Auto accept aktif
       latitude: -7.8712,
-      longitude: 112.5268, // Near Batu, East Java
+      longitude: 112.5268,
       isVerified: true,
     },
   });
@@ -125,10 +131,12 @@ async function main() {
       balance: 180000.00,
     },
   });
+  console.log(`👤 Seeded Driver BIKE: ${driver1.email}`);
 
+  // 3b. Driver CAR (BARU!)
   const driver2 = await prisma.user.create({
     data: {
-      email: 'driver2@gmail.com',
+      email: 'drivercar@dhuknoo.com',
       fullName: 'Rian Mobil',
       passwordHash: driverHash,
       role: Role.DRIVER,
@@ -140,19 +148,52 @@ async function main() {
       phoneNumber: '+6289876543210',
       vehiclePlate: 'N 8888 MLG',
       vehicleModel: 'Toyota Avanza',
-      isOnline: false,
+      serviceType: ServiceType.CAR, // ✅ CAR
+      isOnline: true, // ✅ Online
+      autoAcceptEnabled: true, // ✅ Auto accept aktif
       latitude: -7.9829,
-      longitude: 112.6308, // Near Malang, East Java
-      isVerified: false,
+      longitude: 112.6308,
+      isVerified: true, // ✅ Verified
     },
   });
   await prisma.wallet.create({
     data: {
       userId: driver2.id,
-      balance: 0.00,
+      balance: 500000.00,
     },
   });
-  console.log(`👤 Seeded Drivers: ${driver1.email}, ${driver2.email}`);
+  console.log(`👤 Seeded Driver CAR: ${driver2.email}`);
+
+  // 3c. Driver SEND (BARU!)
+  const driver3 = await prisma.user.create({
+    data: {
+      email: 'driversend@dhuknoo.com',
+      fullName: 'Agus Pickup',
+      passwordHash: driverHash,
+      role: Role.DRIVER,
+    },
+  });
+  const driver3Profile = await prisma.driverProfile.create({
+    data: {
+      userId: driver3.id,
+      phoneNumber: '+6281112223334',
+      vehiclePlate: 'N 5678 MLG',
+      vehicleModel: 'Mitsubishi L300',
+      serviceType: ServiceType.SEND, // ✅ SEND
+      isOnline: true, // ✅ Online
+      autoAcceptEnabled: true, // ✅ Auto accept aktif
+      latitude: -7.8750,
+      longitude: 112.5350,
+      isVerified: true, // ✅ Verified
+    },
+  });
+  await prisma.wallet.create({
+    data: {
+      userId: driver3.id,
+      balance: 300000.00,
+    },
+  });
+  console.log(`👤 Seeded Driver SEND: ${driver3.email}`);
 
   // 4. Seed an Active Order
   const activeOrder = await prisma.order.create({
@@ -186,8 +227,7 @@ async function main() {
   });
   console.log(`🎟️  Seeded promo code: ${promo.code}`);
 
-  // 4c. Seed a COMPLETED + PAID order (with matching wallet transactions & a review),
-  //     so the wallet/payment/review endpoints have something real to query right away.
+  // 4c. Seed a COMPLETED + PAID order
   const completedOrder = await prisma.order.create({
     data: {
       serviceType: ServiceType.BIKE,
@@ -225,7 +265,7 @@ async function main() {
     data: {
       walletId: driver1Wallet.id,
       type: TransactionType.EARNING,
-      amount: 16000.0, // 20000 dikurangi komisi platform 20%
+      amount: 16000.0,
       description: `Pendapatan order #${completedOrder.id} (setelah komisi platform 20%)`,
       orderId: completedOrder.id,
       idempotencyKey: `seed-${completedOrder.id}-credit`,
@@ -242,9 +282,7 @@ async function main() {
   });
   console.log(`💳 Seeded completed+paid order with review: ${completedOrder.id}`);
 
-  // 6. Seed sample merchants + menu items (untuk fitur SEND / pesan-antar)
-
-  // Salah satu merchant punya akun login sendiri (role MERCHANT) untuk contoh self-service
+  // 6. Seed sample merchants + menu items
   const merchantHash = await bcrypt.hash('merchant123', salt);
   const merchantOwner = await prisma.user.create({
     data: {
@@ -316,20 +354,16 @@ async function main() {
   });
   console.log('📝 Seeded system activity logs.');
 
-  // 7. Seed Tariff Engine — WAJIB ada minimal 1 PricingRule per ServiceType,
-  //    kalau tidak, pembuatan order baru akan gagal total (harga tidak bisa dihitung).
+  // 7. Seed Tariff Engine
   const zoneBatu = await prisma.pricingZone.create({ data: { name: 'Kota Batu' } });
   const zoneMalang = await prisma.pricingZone.create({ data: { name: 'Malang Kota' } });
 
-  // Rule fallback umum (zoneId null) — dipakai kalau order tidak menyebutkan zona spesifik.
   await prisma.pricingRule.createMany({
     data: [
       { zoneId: null, serviceType: ServiceType.BIKE, baseFare: 5000, pickupFee: 1000, perKmFee: 2000, perMinuteWaitFee: 200 },
       { zoneId: null, serviceType: ServiceType.CAR, baseFare: 15000, pickupFee: 2000, perKmFee: 3500, perMinuteWaitFee: 300 },
       { zoneId: null, serviceType: ServiceType.SEND, baseFare: 8000, pickupFee: 1000, perKmFee: 2500, perMinuteWaitFee: 200 },
-      // Kota Batu sedikit lebih murah (kota kecil, jarak umumnya pendek)
       { zoneId: zoneBatu.id, serviceType: ServiceType.BIKE, baseFare: 4000, pickupFee: 1000, perKmFee: 1800, perMinuteWaitFee: 200 },
-      // Malang Kota sedikit lebih mahal (lalu lintas lebih padat)
       { zoneId: zoneMalang.id, serviceType: ServiceType.BIKE, baseFare: 6000, pickupFee: 1500, perKmFee: 2200, perMinuteWaitFee: 250 },
     ],
   });
@@ -338,20 +372,18 @@ async function main() {
   await prisma.regionalPolicy.create({
     data: {
       zoneId: zoneMalang.id,
-      tollFee: 15000, // Tol Malang-Batu kalau lewat tol
+      tollFee: 15000,
       parkingFee: 3000,
-      weatherSurcharge: 5000, // tambahan saat hujan deras
-      holidaySurcharge: 8000, // tambahan saat hari libur/high-demand
+      weatherSurcharge: 5000,
+      holidaySurcharge: 8000,
     },
   });
-  console.log('🌦️  Seeded RegionalPolicy (tol, parkir, cuaca, hari libur) untuk Malang Kota.');
+  console.log('🌦️  Seeded RegionalPolicy untuk Malang Kota.');
 
-  // Versi tarif komisi TIERED sesuai kebijakan fair-tarif:
-  // ≤20rb: 8%, 20.001-50rb: 7%, 50.001-100rb: 6%, >100rb: 5%
   const tariffVersion = await prisma.tariffVersion.create({
     data: {
       versionName: 'v2026-07-fair-tiered-commission',
-      description: 'Komisi platform tiered berdasarkan nilai order — makin besar order, makin kecil persentase komisi.',
+      description: 'Komisi platform tiered berdasarkan nilai order',
       commissionTiers: [
         { maxOrderValue: 20000, rate: 0.08 },
         { maxOrderValue: 50000, rate: 0.07 },
@@ -362,7 +394,7 @@ async function main() {
       activatedAt: new Date(),
     },
   });
-  console.log(`⚖️  Seeded & mengaktifkan TariffVersion: ${tariffVersion.versionName}`);
+  console.log(`⚖️  Seeded TariffVersion: ${tariffVersion.versionName}`);
 
   await prisma.platformConfig.create({
     data: {
@@ -373,7 +405,40 @@ async function main() {
   });
   console.log('⚙️  Seeded PlatformConfig: MINIMUM_DRIVER_DEPOSIT = Rp20.000');
 
-  console.log('✅ Database seeded successfully!');
+  // ============================================================
+  // ✅ SUMMARY DRIVERS
+  // ============================================================
+  console.log('\n📋 DRIVER SUMMARY:');
+  console.log('====================================');
+  const allDrivers = await prisma.driverProfile.findMany({
+    include: {
+      user: {
+        select: {
+          email: true,
+          fullName: true,
+        }
+      }
+    }
+  });
+
+  allDrivers.forEach(driver => {
+    console.log(`- ${driver.user.fullName} (${driver.serviceType})`);
+    console.log(`  Email: ${driver.user.email}`);
+    console.log(`  Vehicle: ${driver.vehicleModel} (${driver.vehiclePlate})`);
+    console.log(`  Status: ${driver.isOnline ? '🟢 ONLINE' : '🔴 OFFLINE'}`);
+    console.log(`  Auto Accept: ${driver.autoAcceptEnabled ? '✅ ON' : '❌ OFF'}`);
+    console.log(`  Verified: ${driver.isVerified ? '✅' : '❌'}`);
+    console.log('---');
+  });
+
+  console.log('\n✅ Database seeded successfully!');
+  console.log('\n🔑 Login Credentials:');
+  console.log('====================================');
+  console.log('Admin:   admin@dhuknooride.com / admin123');
+  console.log('BIKE:    driver1@gmail.com / driver123');
+  console.log('CAR:     drivercar@dhuknoo.com / driver123');
+  console.log('SEND:    driversend@dhuknoo.com / driver123');
+  console.log('Customer: customer1@gmail.com / customer123');
 }
 
 main()

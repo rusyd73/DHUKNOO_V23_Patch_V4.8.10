@@ -24,7 +24,7 @@ import { adminRouter } from './modules/admin/admin.routes';
 import { reportRoutes } from './modules/report/report.routes';
 import { driverRouter } from './modules/driver/driver.routes';
 import { customerRouter } from './modules/customer/customer.routes';
-import { merchantRouter } from './modules/merchant/merchant.routes';
+import merchantRouter from './modules/merchant/merchant.routes';
 import { orderRouter } from './modules/order/order.routes';
 import { paymentRouter } from './modules/payment/payment.routes';
 import { walletRouter } from './modules/wallet/wallet.routes';
@@ -70,10 +70,30 @@ if (process.env.NODE_ENV !== 'test') {
 // 2. Register Global Middlewares
 // CORS dibatasi ke ALLOWED_ORIGINS (env, comma-separated). Kalau belum diset,
 // fallback ke "*" supaya development tetap mudah — TAPI wajib diisi di production.
+// ✅ PALING AMAN
 app.use(
   cors({
-    origin: ENV.ALLOWED_ORIGINS.length > 0 ? ENV.ALLOWED_ORIGINS : '*',
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps or curl)
+      if (!origin) return callback(null, true);
+      
+      // Allow if in ALLOWED_ORIGINS
+      if (ENV.ALLOWED_ORIGINS.length > 0) {
+        if (ENV.ALLOWED_ORIGINS.includes(origin)) {
+          return callback(null, true);
+        }
+      } else {
+        // Development fallback - allow localhost
+        if (origin.match(/^https?:\/\/localhost(:\d+)?$/)) {
+          return callback(null, true);
+        }
+      }
+      
+      callback(new Error('Not allowed by CORS'));
+    },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   })
 );
 app.use(express.json());

@@ -66,6 +66,9 @@ export const API_ENDPOINTS = {
     refresh: '/api/auth/refresh',
     profile: '/api/auth/profile',
     changePassword: '/api/auth/change-password',
+    // 🆕 PERBAIKAN #1: Lupa/Reset Password
+    requestPasswordReset: '/api/auth/reset-password-request',
+    confirmPasswordReset: '/api/auth/reset-password-confirm',
   },
   // Alias historis yang tetap dipertahankan backend untuk kompatibilitas mundur.
   // Untuk kode baru, lebih baik pakai `order` dan `wallet` di bawah — keduanya
@@ -93,6 +96,10 @@ export const API_ENDPOINTS = {
     verifyDriver: (id: string) => `/api/admin/drivers/${id}/verify`,
     suspendDriver: (id: string) => `/api/admin/drivers/${id}/suspend`,
     logs: '/api/admin/logs',
+    // 🆕 PERBAIKAN #3: Otorisasi Admin — nonaktifkan/aktifkan kembali user
+    users: '/api/admin/users',
+    deactivateUser: (userId: string) => `/api/admin/users/${userId}/deactivate`,
+    reactivateUser: (userId: string) => `/api/admin/users/${userId}/reactivate`,
   },
 order: {
   create: '/api/order',
@@ -138,7 +145,7 @@ order: {
     forDriver: (driverId: string) => `/api/review/driver/${driverId}`,
   },
   location: {
-    updateMine: '/api/location/driver',
+    updateDriver: '/api/location/driver',
     forDriver: (driverId: string) => `/api/location/driver/${driverId}`,
     onlineDrivers: '/api/location/drivers/online',
   },

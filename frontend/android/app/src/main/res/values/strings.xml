@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DHUKNOO</string>
+    <string name="title_activity_main">DHUKNOO</string>
+    <string name="package_name">com.dhuknoo.app</string>
+    <string name="custom_url_scheme">com.dhuknoo.app</string>
+</resources>

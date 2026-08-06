@@ -11,28 +11,55 @@ interface LatLng {
 
 interface LiveTripMapProps {
   orderId: string;
-  pickupCoords: LatLng;
-  dropoffCoords: LatLng;
+  pickupCoords: LatLng;      // Wajib ada
+  dropoffCoords: LatLng;     // Wajib ada
   driverCoords: LatLng | null;
   isDriverSide: boolean;
   onDriverCoordsChange?: (coords: LatLng) => void;
   orderStatus: string;
 }
 
+// ✅ PERBAIKAN 1: Koordinat fallback (Malang)
+const FALLBACK_COORDS: LatLng = { lat: -7.9666, lng: 112.6326 };
+
+// ✅ PERBAIKAN 2: Fungsi validasi koordinat
+const isValidCoords = (coords: any): coords is LatLng => {
+  return coords && 
+         typeof coords.lat === 'number' && 
+         typeof coords.lng === 'number' &&
+         !isNaN(coords.lat) && 
+         !isNaN(coords.lng) &&
+         coords.lat >= -90 && coords.lat <= 90 &&
+         coords.lng >= -180 && coords.lng <= 180;
+};
+
 // Sub-component to auto-fit the map viewport to fit all active markers
 function FitBounds({ pickup, dropoff, driver }: { pickup: LatLng; dropoff: LatLng; driver: LatLng | null }) {
   const map = useMap();
+  
   useEffect(() => {
-    const points: [number, number][] = [
-      [pickup.lat, pickup.lng],
-      [dropoff.lat, dropoff.lng],
-    ];
-    if (driver) {
+    // ✅ PERBAIKAN 3: Validasi sebelum pakai
+    const points: [number, number][] = [];
+    
+    if (isValidCoords(pickup)) {
+      points.push([pickup.lat, pickup.lng]);
+    }
+    if (isValidCoords(dropoff)) {
+      points.push([dropoff.lat, dropoff.lng]);
+    }
+    if (driver && isValidCoords(driver)) {
       points.push([driver.lat, driver.lng]);
     }
+    
+    // ✅ Jika tidak ada points, pakai fallback
+    if (points.length === 0) {
+      points.push([FALLBACK_COORDS.lat, FALLBACK_COORDS.lng]);
+    }
+    
     const bounds = L.latLngBounds(points);
     map.fitBounds(bounds, { padding: [40, 40] });
   }, [pickup, dropoff, driver, map]);
+  
   return null;
 }
 
@@ -47,6 +74,25 @@ export default function LiveTripMap({
 }: LiveTripMapProps) {
   const [isSimulating, setIsSimulating] = useState(false);
   const simulationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ✅ PERBAIKAN 4: Validasi pickupCoords dan dropoffCoords
+  const safePickup = isValidCoords(pickupCoords) ? pickupCoords : FALLBACK_COORDS;
+  const safeDropoff = isValidCoords(dropoffCoords) ? dropoffCoords : FALLBACK_COORDS;
+
+  // ✅ PERBAIKAN 5: Pastikan driverCoords valid
+  const safeDriverCoords = driverCoords && isValidCoords(driverCoords) 
+    ? driverCoords 
+    : null;
+
+  // ✅ PERBAIKAN 6: Fallback untuk effectiveDriverCoords
+  const effectiveDriverCoords = useMemo(() => {
+    if (safeDriverCoords) return safeDriverCoords;
+    // Buat titik di dekat pickup
+    return {
+      lat: safePickup.lat + 0.01,
+      lng: safePickup.lng - 0.01,
+    };
+  }, [safeDriverCoords, safePickup]);
 
   // Custom styling markers
   const pickupIcon = L.divIcon({
@@ -92,15 +138,14 @@ export default function LiveTripMap({
     [onDriverCoordsChange]
   );
 
-  // Simulation Engine: Interpolate coordinates to move smoothly
+  // Simulation Engine
   const startSimulation = () => {
     if (!onDriverCoordsChange) return;
     setIsSimulating(true);
 
-    // Initial driver position starts near pickup for a realistic experience
     let progress = 0;
     const totalSteps = 40;
-    const currentPos = driverCoords || { lat: pickupCoords.lat + 0.02, lng: pickupCoords.lng - 0.02 };
+    const currentPos = effectiveDriverCoords;
 
     if (simulationIntervalRef.current) clearInterval(simulationIntervalRef.current);
 
@@ -109,17 +154,14 @@ export default function LiveTripMap({
       let targetLat = currentPos.lat;
       let targetLng = currentPos.lng;
 
-      // Stage 1: Move towards pickup (0% to 40% progress)
       if (progress <= 16) {
         const ratio = progress / 16;
-        targetLat = currentPos.lat + (pickupCoords.lat - currentPos.lat) * ratio;
-        targetLng = currentPos.lng + (pickupCoords.lng - currentPos.lng) * ratio;
-      }
-      // Stage 2: Arrived at pickup and heading towards destination (40% to 100% progress)
-      else {
+        targetLat = currentPos.lat + (safePickup.lat - currentPos.lat) * ratio;
+        targetLng = currentPos.lng + (safePickup.lng - currentPos.lng) * ratio;
+      } else {
         const ratio = (progress - 16) / (totalSteps - 16);
-        targetLat = pickupCoords.lat + (dropoffCoords.lat - pickupCoords.lat) * ratio;
-        targetLng = pickupCoords.lng + (dropoffCoords.lng - pickupCoords.lng) * ratio;
+        targetLat = safePickup.lat + (safeDropoff.lat - safePickup.lat) * ratio;
+        targetLng = safePickup.lng + (safeDropoff.lng - safePickup.lng) * ratio;
       }
 
       onDriverCoordsChange({ lat: targetLat, lng: targetLng });
@@ -144,8 +186,6 @@ export default function LiveTripMap({
     };
   }, []);
 
-  const effectiveDriverCoords = driverCoords || { lat: pickupCoords.lat + 0.01, lng: pickupCoords.lng - 0.01 };
-
   return (
     <div id={`live-trip-map-${orderId}`} className="bg-[#06170E] p-4 rounded-3xl border border-[#23583E] flex flex-col gap-3">
       <div className="flex justify-between items-center">
@@ -165,8 +205,9 @@ export default function LiveTripMap({
 
       {/* Map stage */}
       <div className="rounded-2xl overflow-hidden border border-[#23583E]" style={{ height: 300 }}>
+        {/* ✅ PERBAIKAN 7: MapContainer selalu pakai koordinat valid */}
         <MapContainer
-          center={[pickupCoords.lat, pickupCoords.lng]}
+          center={[safePickup.lat, safePickup.lng]}
           zoom={13}
           style={{ height: '100%', width: '100%' }}
         >
@@ -174,13 +215,19 @@ export default function LiveTripMap({
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          <FitBounds pickup={pickupCoords} dropoff={dropoffCoords} driver={effectiveDriverCoords} />
+          
+          {/* ✅ PERBAIKAN 8: FitBounds selalu dapat koordinat valid */}
+          <FitBounds 
+            pickup={safePickup} 
+            dropoff={safeDropoff} 
+            driver={safeDriverCoords} 
+          />
 
           {/* Polyline Route */}
           <Polyline
             positions={[
-              [pickupCoords.lat, pickupCoords.lng],
-              [dropoffCoords.lat, dropoffCoords.lng],
+              [safePickup.lat, safePickup.lng],
+              [safeDropoff.lat, safeDropoff.lng],
             ]}
             color="#FFD700"
             weight={4}
@@ -189,10 +236,10 @@ export default function LiveTripMap({
           />
 
           {/* Pickup Point A */}
-          <Marker position={[pickupCoords.lat, pickupCoords.lng]} icon={pickupIcon} />
+          <Marker position={[safePickup.lat, safePickup.lng]} icon={pickupIcon} />
 
           {/* Dropoff Point B */}
-          <Marker position={[dropoffCoords.lat, dropoffCoords.lng]} icon={dropoffIcon} />
+          <Marker position={[safeDropoff.lat, safeDropoff.lng]} icon={dropoffIcon} />
 
           {/* Active Driver Icon */}
           <Marker
@@ -247,10 +294,12 @@ export default function LiveTripMap({
       {/* Info display */}
       <div className="flex justify-between items-center text-[9px] text-[#A5C9B8]/70 px-1">
         <span className="flex items-center gap-1">
-          <MapPin className="w-3 h-3 text-[#00E575]" /> Jemput: {pickupCoords.lat.toFixed(5)}, {pickupCoords.lng.toFixed(5)}
+          <MapPin className="w-3 h-3 text-[#00E575]" /> 
+          Jemput: {safePickup.lat.toFixed(5)}, {safePickup.lng.toFixed(5)}
         </span>
         <span className="flex items-center gap-1">
-          <MapPin className="w-3 h-3 text-[#EF4444]" /> Tujuan: {dropoffCoords.lat.toFixed(5)}, {dropoffCoords.lng.toFixed(5)}
+          <MapPin className="w-3 h-3 text-[#EF4444]" /> 
+          Tujuan: {safeDropoff.lat.toFixed(5)}, {safeDropoff.lng.toFixed(5)}
         </span>
       </div>
     </div>

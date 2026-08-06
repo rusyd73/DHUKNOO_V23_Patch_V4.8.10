@@ -1,6 +1,11 @@
+// frontend/src/store/useAuthStore.ts
 import { create } from 'zustand';
 import { connectSocket, disconnectSocket } from '../services/socket';
 
+// ✅ Tipe Role yang benar (tanpa backtick)
+type Role = 'CUSTOMER' | 'DRIVER' | 'MERCHANT' | 'ADMIN' | null;
+
+// ✅ Parse user dari localStorage
 const savedUser = JSON.parse(
   localStorage.getItem("dhuknoo_user") || "null"
 );
@@ -9,32 +14,30 @@ interface User {
   id: string;
   email: string;
   fullName: string;
-  role: 'CUSTOMER' | 'DRIVER' | 'ADMIN';
+  role: Role; // ✅ Gunakan tipe Role
 }
 
 interface AuthState {
   token: string | null;
   refreshToken: string | null;
   user: User | null;
-  currentRole: 'CUSTOMER' | 'DRIVER' | 'ADMIN' | null;
+  currentRole: Role; // ✅ Gunakan tipe Role
   useSerifFont: boolean; // false = Arial (SansSerif), true = Times New Roman (Serif)
   fontScale: number; // e.g. 1.0 (100%), 1.15 (115%), 1.3 (130%)
   
   // Actions
   login: (user: User, token: string, refreshToken: string) => void;
   logout: () => void;
-  setRole: (role: 'CUSTOMER' | 'DRIVER' | 'ADMIN' | null) => void;
+  setRole: (role: Role) => void; // ✅ Parameter menggunakan tipe Role
   toggleFontFamily: () => void;
   increaseFontScale: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
   token: localStorage.getItem('dhuknoo_token'),
-	refreshToken: localStorage.getItem('dhuknoo_refresh_token'),
-
-	user: savedUser,
-
-	currentRole: savedUser?.role ?? null,
+  refreshToken: localStorage.getItem('dhuknoo_refresh_token'),
+  user: savedUser,
+  currentRole: savedUser?.role ?? null,
   useSerifFont: localStorage.getItem('dhuknoo_use_serif') === 'true',
   fontScale: parseFloat(localStorage.getItem('dhuknoo_font_scale') || '1.15'),
 
