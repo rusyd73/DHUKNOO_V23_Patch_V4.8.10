@@ -1,3 +1,4 @@
+// src/services/socket.ts
 import { io } from "socket.io-client";
 import { getApiBaseUrl } from "@obama/shared-api";
 
@@ -7,30 +8,75 @@ import { getApiBaseUrl } from "@obama/shared-api";
 // ditolak oleh server di tahap handshake, sebelum event apa pun bisa dikirim.
 const getStoredToken = () => localStorage.getItem("dhuknoo_token");
 
+// ============================================
+// SOCKET INSTANCE WITH RECONNECT CONFIG
+// ============================================
 export const socket = io(getApiBaseUrl(), {
   transports: ["websocket"],
-  autoConnect: false, // baru connect setelah kita pastikan ada token (lihat connectSocket())
+  autoConnect: false,
   auth: { token: getStoredToken() },
+  
+  // ✅ TAMBAHAN: Konfigurasi reconnect
+  reconnection: true,
+  reconnectionAttempts: 10, // Maksimal 10 kali percobaan reconnect
+  reconnectionDelay: 1000, // Delay awal 1 detik
+  reconnectionDelayMax: 10000, // Maksimal delay 10 detik
+  randomizationFactor: 0.5, // Randomisasi untuk menghindari thundering herd
+  timeout: 20000, // Timeout koneksi 20 detik
 });
 
+// ============================================
+// RECONNECT STATE
+// ============================================
+let reconnectAttempts = 0;
+let isReconnecting = false;
+
+// ============================================
+// CONNECT SOCKET
+// ============================================
 /**
  * Panggil setelah login berhasil, atau saat mount App kalau user sudah punya
  * token tersimpan. Aman dipanggil berkali-kali (no-op kalau sudah connected).
+ * 
+ * 🆕 Support parameter userId (opsional):
+ * - Jika userId diberikan, akan disimpan di socket.auth.userId
+ * - Berguna untuk kasus di mana userId diperlukan untuk join room tertentu
  */
-export function connectSocket() {
+export function connectSocket(userId?: string) {
   const token = getStoredToken();
-  if (!token) return;
-  socket.auth = { token };
+  if (!token) {
+    console.warn('🔌 connectSocket: No token found, skipping connection');
+    return;
+  }
+  
+  // Set auth dengan token dan userId (jika ada)
+  socket.auth = { 
+    token,
+    ...(userId && { userId }) // Tambahkan userId jika diberikan
+  };
+  
   if (!socket.connected) {
+    console.log('🔌 Connecting socket...');
     socket.connect();
+  } else {
+    console.log('🔌 Socket already connected');
   }
 }
 
+// ============================================
+// DISCONNECT SOCKET
+// ============================================
 /** Panggil saat logout supaya koneksi lama (dengan token kedaluwarsa) tidak nyangkut. */
 export function disconnectSocket() {
+  console.log('🔌 Disconnecting socket...');
+  reconnectAttempts = 0;
+  isReconnecting = false;
   socket.disconnect();
 }
 
+// ============================================
+// JOIN ROOM
+// ============================================
 /**
  * Join room dengan acknowledgement dari server — server memvalidasi kepemilikan
  * (mis. customer hanya boleh join room order miliknya sendiri) sebelum benar-benar
@@ -38,13 +84,26 @@ export function disconnectSocket() {
  */
 export function joinRoom(roomId: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (!socket.connected) {
+      reject(new Error('Socket tidak terhubung. Silakan coba lagi.'));
+      return;
+    }
+    
     socket.emit("join_room", roomId, (ok: boolean, reason?: string) => {
-      if (ok) resolve();
-      else reject(new Error(reason || `Gagal join room ${roomId}`));
+      if (ok) {
+        console.log(`✅ Joined room: ${roomId}`);
+        resolve();
+      } else {
+        console.error(`❌ Failed to join room ${roomId}:`, reason);
+        reject(new Error(reason || `Gagal join room ${roomId}`));
+      }
     });
   });
 }
 
+// ============================================
+// REPORT READY EVENT
+// ============================================
 export interface ReportReadyPayload {
   reportType: string;
   format: "pdf" | "excel";
@@ -64,14 +123,128 @@ export function onReportReady(callback: (payload: ReportReadyPayload) => void): 
   };
 }
 
+// ============================================
+// SOCKET EVENT HANDLERS
+// ============================================
+
+// ----- CONNECT -----
 socket.on("connect", () => {
-  console.log("Socket Connected:", socket.id);
+  console.log("✅ Socket Connected:", socket.id);
+  reconnectAttempts = 0;
+  isReconnecting = false;
 });
 
+// ----- CONNECT ERROR -----
 socket.on("connect_error", (err) => {
-  console.warn("Socket connect_error:", err.message);
+  console.warn("❌ Socket connect_error:", err.message);
+  
+  // Cek apakah error karena auth token
+  if (err.message.includes('auth') || err.message.includes('token')) {
+    console.warn('🔑 Auth error - token mungkin expired atau invalid');
+    // Bisa trigger logout jika perlu
+    // useAuthStore.getState().logout();
+  }
 });
 
-socket.on("disconnect", () => {
-  console.log("Socket Disconnected");
+// ----- DISCONNECT -----
+socket.on("disconnect", (reason) => {
+  console.log("🔌 Socket Disconnected:", reason);
+  
+  // Log reason untuk debugging
+  if (reason === "io server disconnect") {
+    // Server yang memutus koneksi, perlu reconnect manual
+    console.warn("🔌 Server disconnected socket, attempting reconnect...");
+    const token = getStoredToken();
+    if (token) {
+      setTimeout(() => {
+        socket.connect();
+      }, 1000);
+    }
+  } else if (reason === "transport close") {
+    // Transport error, biasanya network issue
+    console.warn("🔌 Transport closed, will auto-reconnect");
+  }
 });
+
+// ----- RECONNECT ATTEMPT -----
+socket.on("reconnect_attempt", (attempt) => {
+  reconnectAttempts = attempt;
+  isReconnecting = true;
+  console.log(`🔄 Reconnect attempt ${attempt}/${socket.io?.opts?.reconnectionAttempts || 10}`);
+  
+  // Refresh token sebelum reconnect attempt
+  const freshToken = getStoredToken();
+  if (freshToken) {
+    socket.auth = { ...socket.auth, token: freshToken };
+  }
+});
+
+// ----- RECONNECT -----
+socket.on("reconnect", (attempt) => {
+  console.log(`🔄 Reconnected successfully after ${attempt} attempts`);
+  reconnectAttempts = 0;
+  isReconnecting = false;
+});
+
+// ----- RECONNECT ERROR -----
+socket.on("reconnect_error", (err) => {
+  console.warn("🔄 Reconnect error:", err.message);
+});
+
+// ----- RECONNECT FAILED -----
+socket.on("reconnect_failed", () => {
+  console.error("❌ Reconnect failed after maximum attempts");
+  isReconnecting = false;
+  
+  // Notifikasi user bahwa koneksi gagal
+  // Bisa trigger toast atau alert
+  const event = new CustomEvent('socketReconnectFailed', {
+    detail: { message: 'Koneksi realtime gagal. Silakan refresh halaman.' }
+  });
+  window.dispatchEvent(event);
+});
+
+// ----- ERROR -----
+socket.on("error", (err) => {
+  console.error("❌ Socket error:", err);
+});
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+/**
+ * Cek status koneksi socket
+ */
+export function isSocketConnected(): boolean {
+  return socket.connected;
+}
+
+/**
+ * Dapatkan status reconnect
+ */
+export function getReconnectStatus(): { isReconnecting: boolean; attempts: number } {
+  return {
+    isReconnecting,
+    attempts: reconnectAttempts
+  };
+}
+
+/**
+ * Force reconnect socket
+ */
+export function forceReconnect(): void {
+  if (socket.connected) {
+    console.log('🔄 Force reconnecting...');
+    socket.disconnect();
+    setTimeout(() => {
+      const token = getStoredToken();
+      if (token) {
+        socket.auth = { ...socket.auth, token };
+        socket.connect();
+      }
+    }, 500);
+  } else {
+    connectSocket();
+  }
+}

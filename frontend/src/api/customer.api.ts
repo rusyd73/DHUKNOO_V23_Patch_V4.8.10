@@ -22,4 +22,15 @@ export const CustomerAPI = {
         API_ENDPOINTS.order.sendReceiptEmail(orderId)
       )
     ).data,
+
+  // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
+  checkoutMerchant: async (payload: {
+    merchantId: string;
+    items: { productId: string; quantity: number }[];
+    dropoffAddress: string;
+    dropoffLat: number;
+    dropoffLng: number;
+    paymentMethod?: string;
+    notes?: string;
+  }) => (await api.post(API_ENDPOINTS.order.merchantCheckout, payload)).data,
 };

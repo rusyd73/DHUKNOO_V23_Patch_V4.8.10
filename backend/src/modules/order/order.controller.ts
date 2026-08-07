@@ -32,6 +32,20 @@ export class OrderController {
     }
   };
 
+  // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
+  checkoutMerchant = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user!.id;
+      const { order, breakdown, dispatch } = await this.orderService.createMerchantOrder(userId, req.body);
+
+      return res.status(201).json({ message: 'Pesanan berhasil dibuat! Menunggu driver mengantar.', order, breakdown, dispatch });
+    } catch (err: any) {
+      logger.error('OrderController.checkoutMerchant error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Gagal membuat pesanan dari toko.' });
+    }
+  };
+
   list = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;

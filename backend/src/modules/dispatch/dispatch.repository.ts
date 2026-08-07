@@ -141,6 +141,23 @@ export class DispatchRepository {
         longitude:true,
 
 
+        vehicleModel:true,
+
+
+        vehiclePlate:true,
+
+
+        user:{
+
+          select:{
+
+            fullName:true,
+
+          },
+
+        },
+
+
       },
 
 

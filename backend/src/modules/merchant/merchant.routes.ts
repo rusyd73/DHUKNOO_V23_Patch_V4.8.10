@@ -45,6 +45,8 @@ router.get('/my/merchant', authorizeRoles('MERCHANT'), merchantController.getMin
 router.put('/my/merchant', authorizeRoles('MERCHANT'), merchantController.updateMyMerchant);
 router.patch('/my/merchant/toggle', authorizeRoles('MERCHANT'), merchantController.toggleMyMerchantStatus);
 router.get('/my/stats', authorizeRoles('MERCHANT'), merchantController.getMyStats);
+// 🆕 (Link Merchant <-> Order): pesanan yang masuk ke toko sendiri.
+router.get('/my/orders', authorizeRoles('MERCHANT'), merchantController.getMyOrders);
 router.post('/my/products', authorizeRoles('MERCHANT'), merchantController.addMenuItem);
 router.post('/my/products/bulk', authorizeRoles('MERCHANT'), merchantController.bulkAddProducts);
 router.put('/my/products/:itemId', authorizeRoles('MERCHANT'), merchantController.updateMenuItem);

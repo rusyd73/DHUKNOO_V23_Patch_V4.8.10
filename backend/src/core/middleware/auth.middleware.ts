@@ -4,6 +4,10 @@ import { logger } from '../../config/logger';
 import { ENV } from '../../config/env';
 import { AuthenticationError, ForbiddenError } from '../errors/AppError';
 import { prisma } from '../../config/prisma';
+import { RedisService } from '../../config/redis';
+
+const ACTIVE_STATUS_CACHE_PREFIX = 'auth:isActive:';
+const ACTIVE_STATUS_CACHE_TTL_SECONDS = 30;
 
 export interface AuthenticatedRequest extends Request {
   user?: {
@@ -43,20 +47,43 @@ export const authenticateToken = (
 
     const payload = decoded as AuthenticatedRequest['user'];
 
-    // 🆕 PERBAIKAN #3: kalau admin menonaktifkan akun user SEMENTARA access
-    // token lamanya masih berlaku (belum expired 15 menit), request
-    // berikutnya tetap harus ditolak — jangan tunggu token itu expired dulu.
+    // 🆕 PERBAIKAN #3 (revisi): kalau admin menonaktifkan akun user SEMENTARA
+    // access token lamanya masih berlaku, request berikutnya tetap harus
+    // ditolak. TAPI versi awal perbaikan ini melakukan SATU query DB penuh
+    // (prisma.user.findUnique) pada SETIAP SATU request terautentikasi di
+    // SELURUH aplikasi -- termasuk polling GPS driver, polling daftar order,
+    // riwayat chat, dst. Di produksi ini menambah latensi + beban DB yang
+    // konsisten di jalur tercepat sekalipun, dan persis pola gejala yang
+    // dilaporkan (auto-accept/notifikasi ring jadi terasa tidak realtime,
+    // beberapa request "hilang"/timeout) -- terutama saat DB sedang sedikit
+    // lambat. Sekarang status isActive di-cache lewat Redis (fallback
+    // in-memory kalau Redis tidak dikonfigurasi) selama 30 detik per user,
+    // supaya jalur request normal TIDAK query DB sama sekali di request
+    // ke-2 dst. Saat admin men-deactivate/reactivate user (lihat
+    // admin.routes.ts), cache ini langsung dihapus supaya efeknya tetap
+    // terasa dalam hitungan detik, bukan menunggu TTL habis.
     try {
-      const dbUser = await prisma.user.findUnique({
-        where: { id: payload!.id },
-        select: { isActive: true },
-      });
+      const cacheKey = `${ACTIVE_STATUS_CACHE_PREFIX}${payload!.id}`;
+      const cached = await RedisService.get(cacheKey);
 
-      if (!dbUser) {
-        return res.status(401).json({ error: 'Akun tidak ditemukan.' });
+      let isActive: boolean;
+      if (cached !== null) {
+        isActive = cached === '1';
+      } else {
+        const dbUser = await prisma.user.findUnique({
+          where: { id: payload!.id },
+          select: { isActive: true },
+        });
+
+        if (!dbUser) {
+          return res.status(401).json({ error: 'Akun tidak ditemukan.' });
+        }
+
+        isActive = dbUser.isActive !== false;
+        await RedisService.set(cacheKey, isActive ? '1' : '0', ACTIVE_STATUS_CACHE_TTL_SECONDS);
       }
 
-      if (dbUser.isActive === false) {
+      if (!isActive) {
         logger.warn(`⛔ Access denied — account deactivated: ${payload!.id}`);
         return res.status(403).json({
           error: 'Akun Anda telah dinonaktifkan oleh Admin. Hubungi Customer Service DHUKNOO untuk aktivasi kembali.',
@@ -64,8 +91,8 @@ export const authenticateToken = (
       }
     } catch (dbErr: any) {
       logger.error('Gagal memeriksa status akun (isActive) saat autentikasi: %s', dbErr.message || dbErr);
-      // Jangan blokir request hanya karena DB check gagal (mis. koneksi
-      // sesaat) — kegagalan nyata tetap akan tertangkap di layer bawahnya.
+      // Jangan blokir request hanya karena pengecekan ini gagal (mis. DB/Redis
+      // sesaat tidak responsif) — kegagalan nyata tetap tertangkap di layer bawahnya.
     }
 
     req.user = payload;

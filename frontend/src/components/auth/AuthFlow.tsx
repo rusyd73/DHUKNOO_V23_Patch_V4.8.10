@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAuthStore } from '../../store/useAuthStore';
 import { AuthAPI } from '../../api';
 import { PasswordResetModal } from '../modals/SharedModals';
+import { MerchantRegister } from '../../pages/MerchantRegister';
 import { Clock, Key, RefreshCw } from 'lucide-react';
 
 // PERBAIKAN PERFORMA: AuthFlow dipakai oleh App.tsx (layar login/register awal)
@@ -11,14 +12,7 @@ import { Clock, Key, RefreshCw } from 'lucide-react';
 // tanpa harus "impor balik" dari App.tsx (yang akan merusak pemisahan bundle).
 
 interface AuthFlowProps {
-  role: 'CUSTOMER' | 'DRIVER' | 'ADMIN';
-  onBack: () => void;
-  onSuccess: (user: any, token: string, refreshToken: string) => void;
-  triggerToast: (m: string) => void;
-}
-
-interface AuthFlowProps {
-  role: 'CUSTOMER' | 'DRIVER' | 'ADMIN';
+  role: 'CUSTOMER' | 'DRIVER' | 'ADMIN' | 'MERCHANT';
   onBack: () => void;
   onSuccess: (user: any, token: string, refreshToken: string) => void;
   triggerToast: (m: string) => void;
@@ -138,10 +132,50 @@ export default function AuthFlow({ role, onBack, onSuccess, triggerToast }: Auth
   const getAccentColor = () => {
     if (role === 'CUSTOMER') return '#FFD700';
     if (role === 'DRIVER') return '#00E575';
+    if (role === 'MERCHANT') return '#FF6B6B';
     return '#EF4444';
   };
 
   const accentColor = getAccentColor();
+
+  // 🆕 PERBAIKAN (Merchant belum bisa diakses): akun MERCHANT TIDAK dibuat
+  // lewat endpoint generik /api/auth/register (form di bawah ini tidak
+  // pernah mengumpulkan data toko sama sekali — nama toko, kategori,
+  // alamat, dst), melainkan lewat endpoint khusus /api/merchant/register
+  // (komponen MerchantRegister) yang membuat User + profil Merchant
+  // sekaligus dalam satu transaksi. Jadi untuk role MERCHANT, mode
+  // "Daftar" menampilkan form pendaftaran merchant yang sesungguhnya,
+  // bukan form generik customer/driver/admin di bawah.
+  if (role === 'MERCHANT' && isRegisterMode) {
+    return (
+      <div className="w-full max-w-2xl mx-auto px-4 py-12 flex-1">
+        <div className="bg-[#0D2E1F] border p-6 sm:p-8 rounded-3xl shadow-2xl" style={{ borderColor: accentColor }}>
+          <MerchantRegister
+            onDone={() => {
+              triggerToast('Pendaftaran merchant sukses! Silakan login dengan email & password toko Anda.');
+              setIsRegisterMode(false);
+            }}
+          />
+        </div>
+        <div className="flex flex-col gap-2 mt-4">
+          <button
+            type="button"
+            onClick={() => setIsRegisterMode(false)}
+            className="text-xs text-[#A5C9B8] hover:underline text-center"
+          >
+            Sudah punya akun? Login di sini
+          </button>
+          <button
+            type="button"
+            onClick={onBack}
+            className="text-xs text-[#A5C9B8]/70 hover:underline text-center"
+          >
+            Kembali ke Launcher Hub
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full max-w-md mx-auto px-4 py-12 flex flex-col justify-center flex-1">
@@ -152,10 +186,10 @@ export default function AuthFlow({ role, onBack, onSuccess, triggerToast }: Auth
       >
         <div className="text-center">
           <span className="text-4xl">
-            {role === 'CUSTOMER' ? '👤' : role === 'DRIVER' ? '🏍️' : '🔑'}
+            {role === 'CUSTOMER' ? '👤' : role === 'DRIVER' ? '🏍️' : role === 'MERCHANT' ? '🏪' : '🔑'}
           </span>
           <h2 className="text-2xl font-black mt-2" style={{ color: accentColor }}>
-            {role === 'CUSTOMER' ? 'Client Customer' : role === 'DRIVER' ? 'Portal Mitra Driver' : 'Otoritas Admin'}
+            {role === 'CUSTOMER' ? 'Client Customer' : role === 'DRIVER' ? 'Portal Mitra Driver' : role === 'MERCHANT' ? 'Portal Mitra Merchant' : 'Otoritas Admin'}
           </h2>
           <p className="text-xs text-[#A5C9B8] mt-1">
             {isRegisterMode ? 'Pendaftaran Akun Baru' : 'Autentikasi Kredensial'}

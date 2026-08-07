@@ -96,6 +96,22 @@ export class SocketService {
         socket.join("admins");
       }
 
+      // PERBAIKAN: sebelumnya key Redis untuk cleanup "set offline saat
+      // disconnect" (di bawah) hanya dibuat oleh event 'driver-register',
+      // yang TIDAK PERNAH dipanggil oleh frontend manapun (driver online
+      // status di-toggle lewat REST, bukan socket). Akibatnya driver yang
+      // koneksinya putus (app crash, sinyal hilang, tab ditutup paksa)
+      // TIDAK PERNAH otomatis di-set offline di database -- dispatch
+      // engine akan terus menawarkan order ke driver "hantu" ini sampai
+      // OFFER_TIMEOUT_SECONDS habis sebelum lanjut ke driver berikutnya,
+      // salah satu penyebab order terasa lambat/tidak realtime. Sekarang
+      // key registrasi dibuat langsung saat koneksi socket terbentuk.
+      if (user.role === "DRIVER") {
+        RedisService.setex(`${SOCKET_PREFIX}${user.id}`, 60 * 60 * 24 * 7, socket.id).catch((err) => {
+          logger.error(`[SOCKET] Gagal mendaftarkan socket driver ${user.id} ke Redis: ${(err as Error).message}`);
+        });
+      }
+
       // ──────────────────────────────────────────────────────────────────
       // 🔥 EVENT HANDLER YANG SUDAH ADA (TIDAK DIUBAH)
       // ──────────────────────────────────────────────────────────────────
@@ -291,402 +307,32 @@ export class SocketService {
       });
 
       // ──────────────────────────────────────────────────────────────────
-      // 🔥 EVENT HANDLER BARU UNTUK DRIVER TOGGLE & PUBLISH ORDER
+      // 🔥 [DIHAPUS] LEGACY DUPLICATE HANDLERS: driver-register,
+      // driver-toggle-ready, publish-order, accept-order
       // ──────────────────────────────────────────────────────────────────
-
-      /**
-       * DRIVER REGISTER - Menghubungkan driver ke socket
-       */
-      socket.on("driver-register", async (data: { driverId: string; name: string }) => {
-        try {
-          const { driverId, name } = data;
-
-          // Validasi: hanya driver yang boleh register
-          if (user.role !== "DRIVER") {
-            socket.emit("error", { message: "Only DRIVER can register" });
-            return;
-          }
-
-          // Validasi: driverId harus sama dengan user.id
-          if (driverId !== user.id) {
-            socket.emit("error", { message: "Driver ID mismatch" });
-            return;
-          }
-
-          // Simpan di Redis untuk tracking
-          await RedisService.setex(
-            `${SOCKET_PREFIX}${driverId}`,
-            60 * 60 * 24 * 7, // 7 hari
-            socket.id
-          );
-
-          // Join room khusus driver
-          socket.join(`driver-${driverId}`);
-          logger.info(`✅ Driver ${name} (${driverId}) registered`);
-
-          socket.emit("register-success", {
-            message: "Driver registered successfully",
-            driverId
-          });
-
-          // Kirim order PENDING yang sesuai dengan serviceType driver
-          const driver = await prisma.driverProfile.findUnique({
-            where: { userId: driverId },
-            include: { user: true }
-          });
-
-          if (driver && driver.isOnline) {
-            const pendingOrders = await prisma.order.findMany({
-              where: {
-                status: "PENDING",
-                serviceType: driver.serviceType,
-              },
-              include: {
-                customer: {
-                  include: { user: true }
-                }
-              },
-              orderBy: { createdAt: "desc" },
-              take: 20
-            });
-
-            if (pendingOrders.length > 0) {
-              logger.info(`📦 Sending ${pendingOrders.length} pending orders to ${name}`);
-              pendingOrders.forEach(order => {
-                socket.emit("new-order", order);
-              });
-            }
-          }
-
-        } catch (error) {
-          logger.error("Driver register error:", error);
-          socket.emit("error", { message: "Failed to register driver" });
-        }
-      });
-
-      /**
-       * 🔥 TOGGLE READY - FIX UTAMA
-       * Driver mengaktifkan/menonaktifkan status siap menerima order
-       */
-      socket.on("driver-toggle-ready", async (data: { driverId: string; isReady: boolean }) => {
-        try {
-          const { driverId, isReady } = data;
-
-          // Validasi: hanya driver yang boleh toggle
-          if (user.role !== "DRIVER") {
-            socket.emit("error", { message: "Only DRIVER can toggle" });
-            return;
-          }
-
-          // Validasi: driverId harus sama dengan user.id
-          if (driverId !== user.id) {
-            socket.emit("error", { message: "Driver ID mismatch" });
-            return;
-          }
-
-          // Update database
-          const driver = await prisma.driverProfile.update({
-            where: { userId: driverId },
-            data: {
-              isOnline: isReady,
-              autoAcceptEnabled: isReady,
-            },
-            include: { user: true }
-          });
-
-          logger.info(`🔄 Driver ${driver.user.fullName} toggled: ${isReady ? "ONLINE ✅" : "OFFLINE ❌"}`);
-
-          // Broadcast ke semua client
-          this.io?.emit("driver_status_changed", {
-            driverId,
-            driverName: driver.user.fullName,
-            isOnline: driver.isOnline,
-            autoAccept: driver.autoAcceptEnabled,
-            serviceType: driver.serviceType
-          });
-
-          // Jika ONLINE, kirim order PENDING
-          if (isReady) {
-            const pendingOrders = await prisma.order.findMany({
-              where: {
-                status: "PENDING",
-                serviceType: driver.serviceType,
-              },
-              include: {
-                customer: {
-                  include: { user: true }
-                }
-              },
-              orderBy: { createdAt: "desc" },
-              take: 20
-            });
-
-            if (pendingOrders.length > 0) {
-              logger.info(`📦 Sending ${pendingOrders.length} orders to ${driver.user.fullName}`);
-              pendingOrders.forEach(order => {
-                this.io?.to(`driver-${driverId}`).emit("new-order", order);
-              });
-            } else {
-              socket.emit("no-orders", {
-                message: `Tidak ada order ${driver.serviceType} yang tersedia`
-              });
-            }
-          }
-
-          socket.emit("toggle-success", {
-            message: `Status ${isReady ? "ONLINE" : "OFFLINE"}`,
-            isReady,
-            driverId
-          });
-
-        } catch (error) {
-          logger.error("Toggle error:", error);
-          socket.emit("error", { message: "Failed to toggle status" });
-        }
-      });
-
-      /**
-       * PUBLISH ORDER - Dari Admin/Merchant
-       */
-      socket.on("publish-order", async (data: {
-        pickup: string;
-        destination: string;
-        pickupLat?: number;
-        pickupLng?: number;
-        dropoffLat?: number;
-        dropoffLng?: number;
-        serviceType?: "BIKE" | "CAR" | "SEND";
-        price?: number;
-        customerId?: string;
-      }) => {
-        try {
-          // Validasi: hanya ADMIN atau MERCHANT yang boleh publish
-          if (user.role !== "ADMIN" && user.role !== "MERCHANT") {
-            socket.emit("error", { message: "Only ADMIN or MERCHANT can publish order" });
-            return;
-          }
-
-          // Cari customer default
-          let customerId = data.customerId;
-          if (!customerId) {
-            const defaultCustomer = await prisma.customerProfile.findFirst({
-              include: { user: true }
-            });
-            if (defaultCustomer) {
-              customerId = defaultCustomer.id;
-            } else {
-              // Buat customer temporary
-              const newUser = await prisma.user.create({
-                data: {
-                  email: `temp_${Date.now()}@temp.com`,
-                  passwordHash: "temporary",
-                  fullName: "Customer Temp",
-                  role: "CUSTOMER",
-                  customerProfile: {
-                    create: {
-                      phoneNumber: "081234567890"
-                    }
-                  }
-                }
-              });
-              const profile = await prisma.customerProfile.findUnique({
-                where: { userId: newUser.id }
-              });
-              customerId = profile!.id;
-            }
-          }
-
-          const serviceType = data.serviceType || "BIKE";
-          const price = data.price || 15000;
-
-          // Buat order
-          const newOrder = await prisma.order.create({
-            data: {
-              serviceType,
-              status: "PENDING",
-              price,
-              discount: 0,
-              isPaid: false,
-              paymentMethod: "WALLET",
-              pickupAddress: data.pickup,
-              pickupLat: data.pickupLat || -7.8711,
-              pickupLng: data.pickupLng || 112.5269,
-              dropoffAddress: data.destination,
-              dropoffLat: data.dropoffLat || -7.8785,
-              dropoffLng: data.dropoffLng || 112.5204,
-              distanceKm: 3,
-              customerId: customerId,
-            },
-            include: {
-              customer: {
-                include: { user: true }
-              }
-            }
-          });
-
-          logger.info(`📤 New order published: ${newOrder.id} (${serviceType})`);
-
-          // Cari driver yang ONLINE & sesuai SERVICE TYPE
-          const availableDrivers = await prisma.driverProfile.findMany({
-            where: {
-              isOnline: true,
-              autoAcceptEnabled: true,
-              serviceType: serviceType,
-            },
-            include: { user: true }
-          });
-
-          if (availableDrivers.length > 0) {
-            logger.info(`🚀 Sending order to ${availableDrivers.length} matching drivers`);
-
-            availableDrivers.forEach(driver => {
-              this.io?.to(`driver-${driver.userId}`).emit("new-order", newOrder);
-            });
-
-            this.io?.emit("order-published", {
-              order: newOrder,
-              matchedDrivers: availableDrivers.length,
-              drivers: availableDrivers.map(d => d.user.fullName)
-            });
-
-            socket.emit("publish-success", {
-              message: `Order published to ${availableDrivers.length} drivers`,
-              order: newOrder,
-              matchedDrivers: availableDrivers.length
-            });
-
-          } else {
-            logger.warn(`⚠️ No online drivers for service type: ${serviceType}`);
-            this.io?.emit("order-waiting", {
-              order: newOrder,
-              message: `Menunggu driver ${serviceType} siap...`
-            });
-
-            socket.emit("publish-success", {
-              message: "Order published, waiting for drivers...",
-              order: newOrder,
-              matchedDrivers: 0
-            });
-          }
-
-        } catch (error) {
-          logger.error("Publish order error:", error);
-          socket.emit("error", { message: "Failed to publish order" });
-        }
-      });
-
-      /**
-       * ACCEPT ORDER - Driver menerima order
-       */
-      socket.on("accept-order", async (data: { driverId: string; orderId: string }) => {
-        try {
-          const { driverId, orderId } = data;
-
-          // Validasi: hanya driver yang boleh accept
-          if (user.role !== "DRIVER") {
-            socket.emit("error", { message: "Only DRIVER can accept order" });
-            return;
-          }
-
-          // Validasi: driverId harus sama dengan user.id
-          if (driverId !== user.id) {
-            socket.emit("error", { message: "Driver ID mismatch" });
-            return;
-          }
-
-          const order = await prisma.order.findUnique({
-            where: { id: orderId },
-            include: { customer: { include: { user: true } } }
-          });
-
-          if (!order) {
-            socket.emit("error", { message: "Order not found" });
-            return;
-          }
-
-          if (order.status !== "PENDING") {
-            socket.emit("error", { message: "Order already taken" });
-            return;
-          }
-
-          const driver = await prisma.driverProfile.findUnique({
-            where: { userId: driverId },
-            include: { user: true }
-          });
-
-          if (!driver) {
-            socket.emit("error", { message: "Driver not found" });
-            return;
-          }
-
-          // Cek klasifikasi
-          if (order.serviceType !== driver.serviceType) {
-            socket.emit("error", {
-              message: `You can only accept ${driver.serviceType} orders. This is ${order.serviceType}`
-            });
-            return;
-          }
-
-          // Accept order
-          const updatedOrder = await prisma.order.update({
-            where: { id: orderId },
-            data: {
-              status: "ACCEPTED",
-              driverId: driverId,
-              acceptedAt: new Date(),
-            },
-            include: {
-              customer: { include: { user: true } },
-              driver: { include: { user: true } }
-            }
-          });
-
-          // Set driver offline
-          await prisma.driverProfile.update({
-            where: { userId: driverId },
-            data: { isOnline: false, autoAcceptEnabled: false }
-          });
-
-          // Hapus dari Redis
-          await RedisService.del(`${SOCKET_PREFIX}${driverId}`);
-
-          // Broadcast
-          this.io?.emit("order_updated", updatedOrder);
-          this.io?.emit("order_accepted", {
-            orderId: updatedOrder.id,
-            driver: {
-              id: driver.userId,
-              name: driver.user.fullName,
-              vehicle: driver.vehicleModel,
-              plate: driver.vehiclePlate
-            },
-            order: updatedOrder
-          });
-
-          this.io?.to(`driver-${driverId}`).emit("order-accepted", {
-            orderId: updatedOrder.id,
-            message: "✅ Order berhasil diterima!",
-            order: updatedOrder
-          });
-
-          this.io?.to(orderId).emit("driver_assigned", {
-            orderId: updatedOrder.id,
-            driver: {
-              name: driver.user.fullName,
-              phone: driver.phoneNumber,
-              vehicle: driver.vehicleModel,
-              plate: driver.vehiclePlate
-            }
-          });
-
-          logger.info(`✅ Order ${orderId} accepted by driver ${driver.user.fullName}`);
-          socket.emit("accept-success", { orderId, driverId });
-
-        } catch (error) {
-          logger.error("Accept order error:", error);
-          socket.emit("error", { message: "Failed to accept order" });
-        }
-      });
+      // PERBAIKAN (poin #3 - stabilitas): blok event handler ini adalah
+      // implementasi LAMA/DUPLIKAT dari alur order yang sekarang sudah
+      // ditangani dengan benar lewat REST + service layer:
+      //   - toggle online/auto-accept  -> DriverAPI (REST, driverProfile.isOnline)
+      //   - publish/create order       -> OrderService.createOrder (REST)
+      //   - accept order               -> OrderService.acceptOrder /
+      //                                    DispatchService.acceptOffer /
+      //                                    driver/routes/job.routes.ts (REST)
+      // Frontend TIDAK PERNAH memanggil event socket ini (grep
+      // "accept-order"/"driver-register"/"publish-order" di frontend/src
+      // hanya menghasilkan definisi handler, tidak ada `socket.emit` yang
+      // memicunya). Selama masih ada di sini, kode ini adalah jebakan:
+      //   - Melewati semua pengecekan bisnis (verifikasi driver, minimum
+      //     deposit, unconfirmed cash, dsb) yang sudah benar di REST.
+      //   - Broadcast ke SEMUA client (`this.io.emit(...)`) alih-alih ke
+      //     room yang relevan.
+      //   - Nama room-nya salah (`to(orderId)` tanpa prefix "order_"),
+      //     tidak konsisten dengan seluruh sistem room lain di file ini.
+      // Kalau alur ini ternyata memang masih dibutuhkan (mis. untuk versi
+      // Android/iOS native yang belum migrasi ke REST), jangan aktifkan
+      // ulang blok ini apa adanya -- bangun ulang lewat pemanggilan
+      // OrderService/DispatchService yang sama seperti REST, supaya semua
+      // pengecekan bisnis & event realtime tetap konsisten satu jalur.
 
       // ──────────────────────────────────────────────────────────────────
       // 🔥 DISCONNECT - Cleanup

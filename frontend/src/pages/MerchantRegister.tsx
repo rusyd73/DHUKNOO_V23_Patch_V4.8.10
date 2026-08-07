@@ -1,9 +1,21 @@
 // src/pages/MerchantRegister.tsx
 import React, { useState } from 'react';
 import { merchantApi } from '../api/merchant.api';
-// ✅ HAPUS useNavigate - pakai window.location
 
-export function MerchantRegister() {
+interface MerchantRegisterProps {
+  // 🆕 PERBAIKAN (Merchant belum bisa diakses): sebelumnya component ini
+  // langsung redirect ke `window.location.href = '/login'` setelah submit
+  // sukses -- padahal app ini SPA murni berbasis state (App.tsx), TIDAK
+  // PERNAH mendaftarkan route "/login" sama sekali (lihat App.tsx / react-
+  // router tidak dipakai). Akibatnya browser reload ke URL yang tidak
+  // dikenali server dan mendarat di halaman kosong/404 -- pengguna yang
+  // baru saja sukses daftar jadi mentok, tidak pernah sampai ke form login.
+  // Sekarang pemanggil (AuthFlow) yang menentukan apa yang terjadi setelah
+  // sukses daftar (biasanya: kembali ke form login di layar yang sama).
+  onDone: () => void;
+}
+
+export function MerchantRegister({ onDone }: MerchantRegisterProps) {
   const [loading, setLoading] = useState(false);
   const [form, setForm] = useState({
     name: '',
@@ -24,8 +36,7 @@ export function MerchantRegister() {
     setLoading(true);
     try {
       await merchantApi.register(form);
-      alert('✅ Merchant berhasil didaftarkan! Silakan login.');
-      window.location.href = '/login'; // ✅ pakai window.location
+      onDone();
     } catch (error: any) {
       alert(error.response?.data?.error || 'Gagal mendaftarkan merchant');
     } finally {

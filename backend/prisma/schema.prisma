@@ -27,6 +27,7 @@ enum ServiceType {
   BIKE      // Ojek OBAMA
   CAR       // Mobil OBAMA
   SEND      // Kirim Barang
+  MART      // 🆕 Belanja/Pesan-antar dari Merchant (lihat model Merchant/Product)
 }
 
 enum TransactionType {
@@ -198,6 +199,14 @@ model Order {
   promoId      String?
   promo        Promo?          @relation(fields: [promoId], references: [id])
 
+  // 🆕 (Link Merchant <-> Order): kalau order ini berasal dari checkout
+  // toko/merchant (serviceType MART), merchantId diisi & orderItems berisi
+  // rincian barang yang dipesan. Untuk order BIKE/CAR/SEND biasa, kedua
+  // field ini kosong seperti sebelumnya -- tidak mengubah perilaku lama.
+  merchantId   String?
+  merchant     Merchant?       @relation(fields: [merchantId], references: [id])
+  orderItems   OrderItem[]
+
   review       Review?
   transactions Transaction[]
   pricingHistory PricingHistory?
@@ -206,6 +215,23 @@ model Order {
 
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
+}
+
+// 🆕 Rincian barang dalam satu order MART (checkout dari Merchant). Nama &
+// harga di-snapshot pada saat checkout (bukan live-reference ke Product)
+// supaya riwayat order tetap akurat walau merchant kemudian mengubah/
+// menghapus produk tersebut.
+model OrderItem {
+  id         String   @id @default(uuid())
+  orderId    String
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId  String?
+  product    Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  name       String
+  price      Decimal  @db.Decimal(10, 2)
+  quantity   Int      @default(1)
+  subtotal   Decimal  @db.Decimal(10, 2)
+  createdAt  DateTime @default(now())
 }
 
 enum PaymentMethod {
@@ -299,6 +325,7 @@ model Merchant {
   owner     User?     @relation(fields: [ownerId], references: [id], onDelete: SetNull)
 
   products  Product[]
+  orders    Order[]   // 🆕 riwayat order MART yang masuk ke toko ini
 }
 
 model Product {
@@ -312,6 +339,8 @@ model Product {
   isAvailable Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  orderItems  OrderItem[] // 🆕
 }
 
 // Konfigurasi global platform berbentuk key-value, bisa diedit Admin tanpa

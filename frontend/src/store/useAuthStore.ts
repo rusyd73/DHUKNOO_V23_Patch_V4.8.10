@@ -14,21 +14,28 @@ interface User {
   id: string;
   email: string;
   fullName: string;
-  role: Role; // ✅ Gunakan tipe Role
+  role: Role;
 }
+
+// 🆕 Tipe untuk Theme
+type Theme = 'light' | 'dark';
 
 interface AuthState {
   token: string | null;
   refreshToken: string | null;
   user: User | null;
-  currentRole: Role; // ✅ Gunakan tipe Role
-  useSerifFont: boolean; // false = Arial (SansSerif), true = Times New Roman (Serif)
-  fontScale: number; // e.g. 1.0 (100%), 1.15 (115%), 1.3 (130%)
+  currentRole: Role;
+  useSerifFont: boolean;
+  fontScale: number;
+  
+  // 🆕 TAMBAHKAN INI:
+  theme: Theme;
+  setTheme: (theme: Theme) => void;
   
   // Actions
   login: (user: User, token: string, refreshToken: string) => void;
   logout: () => void;
-  setRole: (role: Role) => void; // ✅ Parameter menggunakan tipe Role
+  setRole: (role: Role) => void;
   toggleFontFamily: () => void;
   increaseFontScale: () => void;
 }
@@ -40,6 +47,13 @@ export const useAuthStore = create<AuthState>((set) => ({
   currentRole: savedUser?.role ?? null,
   useSerifFont: localStorage.getItem('dhuknoo_use_serif') === 'true',
   fontScale: parseFloat(localStorage.getItem('dhuknoo_font_scale') || '1.15'),
+  
+  // 🆕 TAMBAHKAN INI:
+  theme: (localStorage.getItem('dhuknoo_theme') as Theme) || 'light',
+  setTheme: (theme) => {
+    localStorage.setItem('dhuknoo_theme', theme);
+    set({ theme });
+  },
 
   login: (user, token, refreshToken) => {
     localStorage.setItem('dhuknoo_token', token);
@@ -67,7 +81,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   increaseFontScale: () => set((state) => {
     let next = state.fontScale + 0.05;
-    if (next > 1.4) next = 1.0; // reset
+    if (next > 1.4) next = 1.0;
     localStorage.setItem('dhuknoo_font_scale', String(next));
     return { fontScale: next };
   }),

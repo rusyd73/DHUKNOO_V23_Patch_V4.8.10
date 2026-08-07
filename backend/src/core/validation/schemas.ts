@@ -87,6 +87,24 @@ export const updateOrderStatusSchema = z.object({
   }),
 });
 
+// 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
+export const merchantCheckoutSchema = z.object({
+  merchantId: z.string().min(1, 'merchantId wajib diisi!'),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().min(1),
+        quantity: z.number().int().min(1, 'Jumlah minimal 1!'),
+      })
+    )
+    .min(1, 'Keranjang belanja tidak boleh kosong!'),
+  dropoffAddress: z.string().min(3, 'Alamat pengantaran minimal 3 karakter!'),
+  dropoffLat: z.number(),
+  dropoffLng: z.number(),
+  paymentMethod: z.enum(['WALLET', 'CASH', 'QRIS', 'TRANSFER', 'EWALLET']).default('WALLET'),
+  notes: z.string().optional(),
+});
+
 // ── Wallet ──────────────────────────────────────────────────────────────
 export const topupSchema = z.object({
   amount: z.number().min(5000, 'Nominal top-up minimal Rp 5.000!').max(10_000_000, 'Nominal top-up maksimal Rp10.000.000 per transaksi!'),

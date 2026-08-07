@@ -7,6 +7,7 @@ import { CustomerAPI, UploadAPI, OrderAPI, PaymentAPI } from '../api';
 import { OrderChatBox } from '../components/chat/OrderChatBox';
 import { TopupModal, QrisCameraScannerModal } from '../components/modals/SharedModals';
 import AuthFlow from '../components/auth/AuthFlow';
+import MerchantOrderModal from '../components/customer/MerchantOrderModal';
 import {
   Camera,
   Clock,
@@ -69,6 +70,8 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
   const [pickup, setPickup] = useState('');
   const [dropoff, setDropoff] = useState('');
   const [service, setService] = useState<'BIKE' | 'CAR' | 'SEND'>('BIKE');
+  // 🆕 (Link Merchant <-> Order): toggle modal belanja dari toko.
+  const [showMerchantModal, setShowMerchantModal] = useState(false);
   const [topupAmount, setTopupAmount] = useState('');
 
   // Fetch real customer profile
@@ -245,6 +248,10 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderAccepted = (data: any) => {
       console.log('Order accepted socket event:', data);
       queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      // Backend sekarang mengirim driver.fullName & driver.vehiclePlate
+      // (lihat order.service.ts / dispatch.service.ts / job.routes.ts) —
+      // field ini memang bisa kosong sesaat kalau relasi driver belum
+      // ter-load, jadi tetap ada fallback pesan generik.
       triggerToast(
         data?.driver?.fullName
           ? `🎉 Orderan DITERIMA oleh ${data.driver.fullName}! (${data.driver.vehiclePlate || 'Mitra Driver'})`
@@ -478,12 +485,29 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
             <div className="bg-[#0D2E1F] border-2 border-[#00E575] p-6 rounded-3xl flex flex-col gap-4">
               <div className="flex justify-between items-center flex-wrap gap-2">
                 <span className="text-xs font-black text-[#00E575] uppercase tracking-wider flex items-center gap-1.5 animate-pulse">
-                  🏍️ Perjalanan Aktif Sedang Berlangsung
+                  {activeOrder.serviceType === 'MART' ? '🏪 Pesanan Belanja Sedang Diproses' : '🏍️ Perjalanan Aktif Sedang Berlangsung'}
                 </span>
                 <span className="text-[10px] bg-[#00E575]/20 text-[#00E575] px-2.5 py-0.5 rounded font-bold uppercase">
                   Status: {activeOrder.status}
                 </span>
               </div>
+
+              {/* 🆕 (Link Merchant <-> Order): rincian belanja untuk order MART.
+                  Order lain (BIKE/CAR/SEND) tidak punya merchant/orderItems,
+                  jadi blok ini otomatis tidak muncul untuk mereka. */}
+              {activeOrder.serviceType === 'MART' && activeOrder.merchant && (
+                <div className="bg-[#06170E] border border-[#23583E] p-4 rounded-2xl">
+                  <p className="text-xs font-bold text-[#FF6B6B] mb-2">🏪 {activeOrder.merchant.name}</p>
+                  <div className="flex flex-col gap-1">
+                    {(activeOrder.orderItems || []).map((item: any) => (
+                      <div key={item.id} className="flex justify-between text-xs text-[#A5C9B8]">
+                        <span>{item.quantity}x {item.name}</span>
+                        <span>Rp{Number(item.subtotal).toLocaleString('id-ID')}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* 1-Minute Cancellation Section */}
               {['PENDING', 'ACCEPTED'].includes(activeOrder.status) && (
@@ -542,7 +566,7 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 <div className="bg-[#06170E] p-4 rounded-2xl border-2 border-[#00E575] flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 shadow-lg">
                   <div className="flex items-center gap-3">
                     <div className="w-12 h-12 rounded-2xl bg-[#00E575]/20 border border-[#00E575] flex items-center justify-center text-2xl shrink-0 font-bold text-[#00E575]">
-                      {activeOrder.serviceType === 'CAR' ? '🚗' : activeOrder.serviceType === 'SEND' ? '📦' : '🏍️'}
+                      {activeOrder.serviceType === 'CAR' ? '🚗' : activeOrder.serviceType === 'SEND' ? '📦' : activeOrder.serviceType === 'MART' ? '🏪' : '🏍️'}
                     </div>
                     <div className="flex flex-col">
                       <div className="flex items-center gap-2">
@@ -654,6 +678,25 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
               </p>
             </div>
           ) : (
+          <>
+          {/* 🆕 (Link Merchant <-> Order): pintu masuk belanja dari toko —
+              sebelumnya dashboard customer tidak punya jalan sama sekali
+              untuk memesan dari Merchant. Modal ini menangani pilih toko,
+              menu, keranjang, alamat antar, sampai checkout. */}
+          <button
+            type="button"
+            onClick={() => setShowMerchantModal(true)}
+            className="bg-[#0D2E1F] border border-[#FF6B6B]/40 hover:border-[#FF6B6B] p-5 rounded-3xl flex items-center gap-4 transition-all text-left"
+          >
+            <div className="w-12 h-12 rounded-2xl bg-[#FF6B6B]/15 flex items-center justify-center text-2xl shrink-0">
+              🏪
+            </div>
+            <div>
+              <h3 className="font-black text-base text-white">Belanja dari Toko</h3>
+              <p className="text-xs text-[#A5C9B8]">Pesan makanan/barang dari merchant terdekat, diantar oleh driver DHUKNOO.</p>
+            </div>
+          </button>
+
           <div className="bg-[#0D2E1F] border border-[#23583E] p-6 rounded-3xl flex flex-col gap-4">
             <div className="flex items-center gap-2 text-[#FFD700]">
               <Send className="w-5 h-5" />
@@ -832,6 +875,7 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
               </button>
             </form>
           </div>
+          </>
           )}
         </div>
 
@@ -1023,6 +1067,15 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
         <QrisCameraScannerModal 
           onClose={() => setShowQrisScanner(false)} 
           triggerToast={triggerToast} 
+        />
+      )}
+
+      {/* 🆕 (Link Merchant <-> Order) */}
+      {showMerchantModal && (
+        <MerchantOrderModal
+          onClose={() => setShowMerchantModal(false)}
+          onCheckoutSuccess={() => queryClient.invalidateQueries({ queryKey: ['customerOrders'] })}
+          triggerToast={triggerToast}
         />
       )}
 

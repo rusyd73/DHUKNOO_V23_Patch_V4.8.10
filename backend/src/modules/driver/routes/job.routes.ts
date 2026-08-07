@@ -181,7 +181,10 @@ router.post(
 
         const orderAfterUpdate = await tx.order.findUnique({
           where: { id: orderId },
-          include: { customer: true },
+          include: {
+            customer: true,
+            driver: { include: { user: { select: { fullName: true } } } },
+          },
         });
 
         if (!orderAfterUpdate) {
@@ -203,6 +206,11 @@ router.post(
         SocketService.emitToUser(updatedOrder.customer.userId, "order_accepted", {
           orderId: updatedOrder.id,
           driverId: driverProfile.id,
+          driver: {
+            fullName: (updatedOrder as any).driver?.user?.fullName,
+            vehicleModel: (updatedOrder as any).driver?.vehicleModel,
+            vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
+          },
         });
         SocketService.emitToDriversPool("order_taken", { orderId: updatedOrder.id });
         SocketService.emitToAdmins("order_accepted", { orderId: updatedOrder.id });

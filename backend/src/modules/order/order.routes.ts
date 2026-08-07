@@ -2,12 +2,19 @@ import { Router } from 'express';
 import { OrderController } from './order.controller';
 import { authenticateToken, authorizeRoles } from '../../core/middleware/auth.middleware';
 import { validateBody } from '../../core/middleware/validation.middleware';
-import { createOrderSchema, updateOrderStatusSchema } from '../../core/validation/schemas';
+import { createOrderSchema, updateOrderStatusSchema, merchantCheckoutSchema } from '../../core/validation/schemas';
 
 const router = Router();
 const orderController = new OrderController();
 
 router.post('/', authenticateToken as any, validateBody(createOrderSchema), orderController.create as any);
+// 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari toko.
+router.post(
+  '/merchant-checkout',
+  authenticateToken as any,
+  validateBody(merchantCheckoutSchema),
+  orderController.checkoutMerchant as any
+);
 router.get('/', authenticateToken as any, orderController.list as any);
 router.patch('/:id/accept', authenticateToken as any, authorizeRoles('DRIVER') as any, orderController.accept as any);
 router.patch(

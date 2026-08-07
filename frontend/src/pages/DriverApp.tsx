@@ -2,7 +2,7 @@ import React, { useState, useEffect, Suspense } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { socket, joinRoom } from '../services/socket';
 import { formatRupiah } from '@obama/shared-utils';
-import { stopRingLoop, playBellRingSound } from '../utils/audio';
+import { startRingLoop, stopRingLoop, playBellRingSound, warmupAudioContext } from '../utils/audio';
 import { useAuthStore } from '../store/useAuthStore';
 import { DriverAPI, UploadAPI, WalletAPI, PaymentAPI, LocationAPI } from '../api';
 import { OrderChatBox } from '../components/chat/OrderChatBox';
@@ -188,6 +188,34 @@ export default function DriverApp({ onBack, triggerToast }: PortalProps) {
   // Find if this driver is currently busy with an accepted order
   const activeJob = jobsData?.jobs?.find((j: any) => j.driverId === currentDriverId && j.status !== 'COMPLETED' && j.status !== 'CANCELLED');
 
+  // 🔥 WARMUP AUDIOCONTEXT - Dipanggil saat komponen mount (user gesture dari klik menu)
+  useEffect(() => {
+    warmupAudioContext();
+    console.log('🔊 AudioContext warmed up for DriverApp');
+  }, []);
+
+  // PERBAIKAN: driver sebelumnya TIDAK PERNAH join room "drivers_pool" --
+  // akibatnya broadcast SocketService.emitToDriversPool() (mis. saat order
+  // baru dipublikasikan atau order diambil driver lain) tidak pernah sampai
+  // ke siapa pun. Offer per-driver (dispatch.service.ts) tetap terkirim
+  // lewat emitToUser (room user_<id>, auto-join), tapi join di sini
+  // melengkapi jalur broadcast pool sebagai lapisan tambahan.
+  useEffect(() => {
+    if (!user) return;
+
+    const joinPool = () => {
+      joinRoom('drivers_pool').catch((err) => {
+        console.warn('Driver gagal join room drivers_pool:', err);
+      });
+    };
+
+    if (socket.connected) joinPool();
+    socket.on('connect', joinPool);
+    return () => {
+      socket.off('connect', joinPool);
+    };
+  }, [user]);
+
   // Join active job socket room
   useEffect(() => {
     if (activeJob) {
@@ -225,6 +253,92 @@ export default function DriverApp({ onBack, triggerToast }: PortalProps) {
       }
     }
   }, [profileData?.profile?.isOnline, isAutoAcceptOn, user?.id, refetchJobs]);
+
+  // ============================================
+  // SOCKET LISTENER UNTUK ORDER BARU (DRIVER)
+  // ============================================
+  useEffect(() => {
+    if (!socket || !user) {
+      console.log('🔌 DriverApp: Socket atau user tidak tersedia, skip listener');
+      return;
+    }
+
+    console.log('🔌 DriverApp: Socket listener aktif untuk order baru - User ID:', user.id);
+
+    // 🔥 HANDLER ORDER BARU DITAWARKAN KE DRIVER
+    // PERBAIKAN: backend (lihat backend/src/modules/dispatch/dispatch.constants.ts
+    // & order.service.ts) mengirim event 'new_order_available', BUKAN 'newOrder'.
+    // Event Socket.IO case-sensitive exact-match, jadi sebelumnya listener ini
+    // TIDAK PERNAH terpanggil sama sekali -- makanya bel/ring tidak pernah bunyi.
+    const handleNewOrderOffered = (data: any) => {
+      console.log('🛎️ ORDER BARU DITAWARKAN KE DRIVER:', data);
+      
+      // ✅ 1. MULAI RING LOOP
+      try {
+        startRingLoop();
+        console.log('🔊 Ring loop started - order baru ditawarkan ke driver');
+      } catch (error) {
+        console.error('❌ Gagal memulai ring loop:', error);
+      }
+      
+      // 2. Tampilkan toast notifikasi
+      // PERBAIKAN: payload dari backend tidak punya field customerName/total,
+      // yang ada 'price' (lihat dispatch.service.ts offerNextDriver).
+      const total = data.price || data.total || 0;
+      const formattedTotal = total.toLocaleString('id-ID');
+      triggerToast(`📦 Order baru! ${data.pickupAddress ? `Dari ${data.pickupAddress}. ` : ''}Total: Rp ${formattedTotal}`);
+      
+      // 3. Refresh daftar order
+      refetchJobs();
+    };
+
+    // 🔥 HANDLER ORDER DIAMBIL DRIVER LAIN
+    // PERBAIKAN: backend mengirim 'order_taken', BUKAN 'orderTaken'.
+    const handleOrderTakenByOther = (data: any) => {
+      console.log('🔄 Order diambil driver lain:', data);
+      stopRingLoop();
+      triggerToast(`⏳ Order #${data.orderId || 'unknown'} sudah diambil driver lain`);
+      refetchJobs();
+    };
+
+    // 🔥 HANDLER OFFER KADALUWARSA / TIDAK ADA DRIVER
+    // PERBAIKAN: backend mengirim 'order_expired' (lihat
+    // DISPATCH_CONSTANTS.ORDER_EXPIRED_EVENT), BUKAN 'orderExpired'.
+    const handleOrderExpired = (data: any) => {
+      console.log('⏰ Order expired:', data);
+      stopRingLoop();
+      triggerToast(`⏰ Order #${data.orderId || 'unknown'} telah kadaluwarsa`);
+      refetchJobs();
+    };
+
+    // 🔥 HANDLER OFFER KADALUWARSA UNTUK DRIVER INI SECARA SPESIFIK
+    // (dispatch pindah ke kandidat driver berikutnya — lihat
+    // dispatch.service.ts, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT)
+    const handleOfferTimeout = (data: any) => {
+      console.log('⏱️ Offer order timeout untuk driver ini:', data);
+      stopRingLoop();
+    };
+
+    // Daftarkan semua listener — nama event HARUS sama persis dengan yang
+    // di-emit backend (lihat grep "SocketService.emitTo" di seluruh backend/src).
+    socket.on('new_order_available', handleNewOrderOffered);
+    socket.on('order_taken', handleOrderTakenByOther);
+    socket.on('order_expired', handleOrderExpired);
+    socket.on('order_timeout', handleOfferTimeout);
+
+    // Cleanup
+    return () => {
+      console.log('🔌 DriverApp: Membersihkan semua socket listener');
+      socket.off('new_order_available', handleNewOrderOffered);
+      socket.off('order_taken', handleOrderTakenByOther);
+      socket.off('order_expired', handleOrderExpired);
+      socket.off('order_timeout', handleOfferTimeout);
+      
+      // ✅ STOP ring loop saat komponen unmount
+      stopRingLoop();
+      console.log('🔇 Ring loop stopped - component unmount');
+    };
+  }, [user, triggerToast, refetchJobs]);
 
   const driverTopupMutation = useMutation({
     mutationFn: (amount: number) => WalletAPI.topup(amount),

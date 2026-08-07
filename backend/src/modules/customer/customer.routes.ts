@@ -156,6 +156,12 @@ router.get(
             },
           },
           paymentProof: true,
+          // 🆕 (Link Merchant <-> Order): sertakan rincian toko & item belanja
+          // supaya UI tracking order (CustomerApp.tsx, memakai query yang
+          // sama untuk SEMUA jenis order) bisa menampilkan nama toko & daftar
+          // barang untuk order MART, bukan cuma order BIKE/CAR/SEND.
+          merchant: { select: { id: true, name: true, phone: true, address: true, imageUrl: true } },
+          orderItems: true,
         },
         orderBy: { createdAt: 'desc' },
       });

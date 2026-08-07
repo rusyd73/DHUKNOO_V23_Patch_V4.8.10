@@ -5,6 +5,7 @@ import { MerchantService } from './merchant.service';
 import { AppError } from '../../core/errors/AppError';
 import { logger } from '../../config/logger';
 import { AuditLogger } from '../../core/logging/audit.logger';
+import { prisma } from '../../config/prisma';
 
 export class MerchantController {
   private merchantService = new MerchantService();
@@ -291,11 +292,49 @@ export class MerchantController {
     }
   };
 
+  // 🆕 (Link Merchant <-> Order): daftar order MART yang masuk ke toko ini
+  // (dipesan oleh customer lewat checkout, lihat order.service.ts
+  // createMerchantOrder). Dipakai oleh halaman "Pesanan" di Dashboard Merchant.
+  getMyOrders = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const ownerId = req.user!.id;
+      const merchant = await this.merchantService.getMerchantByOwner(ownerId);
+
+      const orders = await prisma.order.findMany({
+        where: { merchantId: merchant.id },
+        include: {
+          orderItems: true,
+          customer: { include: { user: { select: { fullName: true, email: true } } } },
+          driver: { include: { user: { select: { fullName: true } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      });
+
+      return res.status(200).json({ success: true, data: orders });
+    } catch (err: any) {
+      logger.error('MerchantController.getMyOrders error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ success: false, error: err.message || 'Gagal mengambil daftar pesanan toko Anda.' });
+    }
+  };
+
+  // 🆕 PERBAIKAN ("pengelolaan tambah data dll belum berfungsi"): route
+  // POST /my/products TIDAK PUNYA `:id` di URL sama sekali (lihat
+  // merchant.routes.ts) -- persis pola bug yang sama seperti
+  // updateMyMerchant/toggleMyMerchantStatus/getMyStats yang sudah diperbaiki
+  // sebelumnya. `req.params.id` di sini SELALU undefined, jadi
+  // `addProduct(userId, {merchantId: undefined, ...})` selalu gagal
+  // "Merchant tidak ditemukan!" untuk pemilik toko manapun -- fitur Tambah
+  // Menu sama sekali tidak bisa dipakai. Selesaikan merchant lewat token
+  // login dulu, seperti method "My*" lainnya.
   addMenuItem = async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { id } = req.params;
-      const product = await this.merchantService.addProduct(req.user!.id, {
-        merchantId: id,
+      const ownerId = req.user!.id;
+      const merchant = await this.merchantService.getMerchantByOwner(ownerId);
+
+      const product = await this.merchantService.addProduct(ownerId, {
+        merchantId: merchant.id,
         name: req.body.name,
         price: req.body.price,
         description: req.body.description,
@@ -304,9 +343,9 @@ export class MerchantController {
       });
 
       await AuditLogger.log(
-        req.user!.id,
+        ownerId,
         'MERCHANT_MENU_ADD',
-        `Menambah menu "${product.name}" ke merchant #${id}`
+        `Menambah menu "${product.name}" ke toko sendiri #${merchant.id}`
       );
 
       return res.status(201).json({
@@ -527,7 +566,7 @@ export class MerchantController {
 
   bulkAddProducts = async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { id } = req.params;
+      const ownerId = req.user!.id;
       const { products } = req.body;
 
       if (!products || !Array.isArray(products) || products.length === 0) {
@@ -537,16 +576,20 @@ export class MerchantController {
         });
       }
 
+      // 🆕 PERBAIKAN: sama seperti addMenuItem -- route '/my/products/bulk'
+      // tidak punya `:id`, jadi selesaikan merchant lewat token login dulu.
+      const merchant = await this.merchantService.getMerchantByOwner(ownerId);
+
       const result = await this.merchantService.bulkAddProducts(
-        req.user!.id,
-        id,
+        ownerId,
+        merchant.id,
         products
       );
 
       await AuditLogger.log(
-        req.user!.id,
+        ownerId,
         'MERCHANT_PRODUCTS_BULK_ADD',
-        `${result.count} produk ditambahkan ke merchant #${id}`
+        `${result.count} produk ditambahkan ke toko sendiri #${merchant.id}`
       );
 
       return res.status(201).json({

@@ -119,6 +119,9 @@ order: {
 
   chatHistory: (orderId: string) =>
     `/api/order/${orderId}/chat`,
+
+  // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
+  merchantCheckout: '/api/order/merchant-checkout',
 },
   wallet: {
     balance: '/api/wallet/balance',

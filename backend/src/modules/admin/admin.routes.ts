@@ -7,6 +7,7 @@ import { reviewDriverDocumentSchema } from '../../core/validation/schemas';
 import { buildAdminRecap, RecapTimeframe } from './admin-recap.service';
 import { buildRecapExcel, buildRecapPdf } from './admin-export.service';
 import { SocketService } from '../../websocket/socket';
+import { RedisService } from '../../config/redis';
 
 const router = Router();
 
@@ -217,6 +218,10 @@ router.post(
         },
       });
 
+      // Hapus cache isActive (lihat auth.middleware.ts) supaya efek nonaktif
+      // langsung terasa di request berikutnya, bukan menunggu TTL cache 30 detik.
+      await RedisService.del(`auth:isActive:${userId}`);
+
       // Paksa logout real-time kalau user sedang online (WebSocket) —
       // supaya efeknya langsung terasa, bukan menunggu access token expired.
       try {
@@ -268,6 +273,9 @@ router.post(
           deactivationReason: null,
         },
       });
+
+      // Hapus cache isActive (lihat catatan yang sama di endpoint deactivate).
+      await RedisService.del(`auth:isActive:${userId}`);
 
       await AuditLogger.log(
         adminId,

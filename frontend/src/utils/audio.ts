@@ -1,24 +1,48 @@
 // Web Audio API Bell Ring Synthesizer
-export function playBellRingSound(peakGain: number = 1.0) {
+let audioContext: AudioContext | null = null;
+
+// 🔥 Fungsi sederhana untuk mendapatkan AudioContext yang sudah running
+function getAudioContext(): AudioContext | null {
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
+    if (!AudioCtx) return null;
+    
+    // Buat sekali saja, reuse
+    if (!audioContext) {
+      audioContext = new AudioCtx();
+    }
+    
+    // Jika suspended, resume
+    if (audioContext.state === 'suspended') {
+      audioContext.resume().catch(() => {});
+    }
+    
+    return audioContext;
+  } catch (err) {
+    console.warn("AudioContext error:", err);
+    return null;
+  }
+}
 
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
+export function playBellRingSound(peakGain: number = 1.0) {
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    
+    // Jika masih suspended, skip dulu (akan dicoba lagi di interval berikutnya)
+    if (ctx.state !== 'running') {
+      console.log('⏳ AudioContext not ready, skipping...');
+      return;
     }
 
     const now = ctx.currentTime;
 
     // Helper to create a rich metallic bell chime tone
     const createBellTone = (freq: number, startTime: number, duration: number) => {
-      // Primary sine oscillator
       const osc1 = ctx.createOscillator();
       osc1.type = 'sine';
       osc1.frequency.setValueAtTime(freq, now + startTime);
 
-      // Harmonics for metallic resonance
       const osc2 = ctx.createOscillator();
       osc2.type = 'triangle';
       osc2.frequency.setValueAtTime(freq * 2.404, now + startTime);
@@ -29,10 +53,6 @@ export function playBellRingSound(peakGain: number = 1.0) {
 
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0.001, now + startTime);
-      // PERBARUAN: volume puncak sekarang bisa diatur (default 1.0 — paling
-      // keras yang aman tanpa distorsi/clipping Web Audio API), dipakai oleh
-      // startRingLoop() di bawah supaya publikasi order benar-benar terdengar
-      // maksimal sampai driver merespons.
       gain.gain.exponentialRampToValueAtTime(peakGain, now + startTime + 0.015);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + startTime + duration);
 
@@ -50,7 +70,6 @@ export function playBellRingSound(peakGain: number = 1.0) {
       osc3.stop(now + startTime + duration);
     };
 
-    // Play crisp double bell ring chime (1567Hz - G6, 2093Hz - C7)
     createBellTone(1567.98, 0, 0.7);
     createBellTone(2093.00, 0.18, 1.2);
   } catch (err) {
@@ -58,16 +77,15 @@ export function playBellRingSound(peakGain: number = 1.0) {
   }
 }
 
-// PERBARUAN: publikasi order sebelumnya cuma berbunyi SEKALI (sekilas, gampang
-// terlewat kalau driver sedang tidak melihat layar). Sekarang tersedia
-// loop yang membunyikan bel berulang-ulang di volume paling keras sampai
-// order diterima otomatis (auto-accept) ATAU driver tap "Terima Order" --
-// dipanggil stopRingLoop() di kedua kondisi tsb dari App.tsx.
 let ringLoopIntervalId: ReturnType<typeof setInterval> | null = null;
 
 export function startRingLoop() {
-  if (ringLoopIntervalId !== null) return; // Sudah berbunyi -- jangan tumpuk interval.
+  if (ringLoopIntervalId !== null) return;
+  
+  // 🔥 Coba mainkan langsung
   playBellRingSound(1.0);
+  
+  // 🔥 Mulai interval
   ringLoopIntervalId = setInterval(() => playBellRingSound(1.0), 1600);
 }
 
@@ -75,5 +93,14 @@ export function stopRingLoop() {
   if (ringLoopIntervalId !== null) {
     clearInterval(ringLoopIntervalId);
     ringLoopIntervalId = null;
+  }
+}
+
+// 🔥 Fungsi tambahan: panggil dari tombol test atau mount komponen
+// untuk "mengaktifkan" AudioContext dengan user gesture
+export function warmupAudioContext() {
+  const ctx = getAudioContext();
+  if (ctx && ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
   }
 }

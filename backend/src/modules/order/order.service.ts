@@ -31,6 +31,17 @@ interface CreateOrderInput {
   paymentMethod?: 'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET';
 }
 
+// 🆕 (Link Merchant <-> Order): input untuk checkout dari toko/Merchant.
+interface MerchantCheckoutInput {
+  merchantId: string;
+  items: { productId: string; quantity: number }[];
+  dropoffAddress: string;
+  dropoffLat: number;
+  dropoffLng: number;
+  paymentMethod?: 'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET';
+  notes?: string;
+}
+
 // Transisi status yang SAH untuk driver — mencegah lompat status
 const ALLOWED_DRIVER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   PENDING: [],
@@ -231,6 +242,198 @@ export class OrderService {
     return { order, breakdown: finalBreakdown, dispatch };
   }
 
+  // ============================================================
+  // 🆕 CHECKOUT MERCHANT (Link Merchant <-> Order)
+  // ============================================================
+  // Sebelumnya modul Merchant sama sekali TIDAK terhubung ke Order/Dispatch
+  // -- toko bisa jualan produk, tapi customer tidak pernah punya cara untuk
+  // benar-benar MEMESAN dari toko itu dan mendapat driver pengantar. Method
+  // ini membuat order serviceType MART: pickup = lokasi toko, dropoff =
+  // alamat customer, lalu masuk ke pipeline dispatch YANG SAMA persis
+  // dengan order BIKE/CAR/SEND (ring ke driver, auto-accept, tracking,
+  // chat, dst semua otomatis ikut karena memakai model Order yang sama).
+  async createMerchantOrder(userId: string, input: MerchantCheckoutInput) {
+    const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
+    if (!customerProfile) {
+      throw new ForbiddenError('Hanya pengguna terdaftar sebagai CUSTOMER yang bisa membuat order!');
+    }
+
+    if (!input.items || input.items.length === 0) {
+      throw new AppError('Keranjang belanja kosong! Pilih minimal 1 produk.', 400);
+    }
+
+    // 🔒 CEGAH DUPLICATE ORDER — sama seperti order BIKE/CAR/SEND biasa.
+    const existingActiveOrder = await prisma.order.findFirst({
+      where: {
+        customerId: customerProfile.id,
+        status: { in: [OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED] },
+      },
+      select: { id: true, status: true },
+    });
+    if (existingActiveOrder) {
+      throw new AppError(
+        `Anda masih punya order yang belum selesai (#${existingActiveOrder.id.slice(0, 8)}, status ${existingActiveOrder.status}). Selesaikan atau batalkan order itu dulu sebelum membuat order baru.`,
+        409
+      );
+    }
+
+    const merchant = await prisma.merchant.findUnique({ where: { id: input.merchantId } });
+    if (!merchant) {
+      throw new AppError('Toko tidak ditemukan!', 404);
+    }
+    if (!merchant.isOpen) {
+      throw new AppError(`Maaf, ${merchant.name} sedang tutup. Coba lagi nanti.`, 400);
+    }
+
+    // 🔒 Harga & ketersediaan produk SELALU dihitung ulang dari database,
+    // TIDAK PERNAH dipercaya dari input client (mencegah manipulasi harga).
+    const productIds = input.items.map((i) => i.productId);
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds }, merchantId: input.merchantId },
+    });
+
+    const orderItemsData: { productId: string; name: string; price: any; quantity: number; subtotal: number }[] = [];
+    let itemsSubtotal = 0;
+
+    for (const item of input.items) {
+      if (!item.quantity || item.quantity < 1) {
+        throw new AppError('Jumlah produk tidak valid!', 400);
+      }
+      const product = products.find((p) => p.id === item.productId);
+      if (!product) {
+        throw new AppError(`Produk dengan ID ${item.productId} tidak ditemukan di toko ini!`, 404);
+      }
+      if (!product.isAvailable) {
+        throw new AppError(`"${product.name}" sedang tidak tersedia.`, 400);
+      }
+      const price = Number(product.price);
+      const subtotal = price * item.quantity;
+      itemsSubtotal += subtotal;
+      orderItemsData.push({
+        productId: product.id,
+        name: product.name,
+        price: product.price,
+        quantity: item.quantity,
+        subtotal,
+      });
+    }
+
+    // Ongkos antar: dihitung sederhana dari jarak toko -> alamat customer
+    // (mengikuti pola estimasi yang sudah dipakai di frontend untuk SEND —
+    // lihat CustomerApp.tsx). Sengaja TIDAK memakai TariffEngine (yang
+    // mewajibkan PricingRule per serviceType di-setup Admin dulu di DB),
+    // supaya fitur checkout Merchant langsung berfungsi tanpa konfigurasi
+    // tambahan. Admin tetap bisa menambah PricingRule('MART') di kemudian
+    // hari kalau ingin ongkir MART diatur terpusat seperti layanan lain.
+    const distanceKm = this.calculateHaversineDistance(
+      merchant.latitude,
+      merchant.longitude,
+      input.dropoffLat,
+      input.dropoffLng
+    );
+    const deliveryFee = Math.round(8000 + distanceKm * 2500);
+    const totalPayable = itemsSubtotal + deliveryFee;
+
+    // 🔒 Validasi saldo — sama seperti order biasa.
+    const customerWallet = await prisma.wallet.findUnique({ where: { userId } });
+    if (!customerWallet) {
+      throw new AppError('Dompet tidak ditemukan! Silakan hubungi customer service.', 404);
+    }
+    const balance = Number(customerWallet.balance);
+    const paymentMethod = input.paymentMethod || 'WALLET';
+
+    if (paymentMethod === 'WALLET') {
+      if (balance < totalPayable) {
+        const shortfall = totalPayable - balance;
+        throw new AppError(
+          `Saldo tidak mencukupi untuk melakukan order ini.\n` +
+            `💰 Saldo Anda: Rp${balance.toLocaleString('id-ID')}\n` +
+            `💳 Total biaya: Rp${totalPayable.toLocaleString('id-ID')} (belanja Rp${itemsSubtotal.toLocaleString('id-ID')} + ongkir Rp${deliveryFee.toLocaleString('id-ID')})\n` +
+            `📉 Kurang: Rp${shortfall.toLocaleString('id-ID')}\n` +
+            `Silakan top up saldo Anda terlebih dahulu.`,
+          400
+        );
+      }
+    } else {
+      const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
+      if (balance < minimumDeposit) {
+        throw new AppError(
+          `Saldo Anda (Rp${balance.toLocaleString('id-ID')}) belum mencapai minimum deposit Rp${minimumDeposit.toLocaleString('id-ID')} untuk memakai metode ${paymentMethod}.`,
+          400
+        );
+      }
+    }
+
+    const order = await this.orderRepo.create({
+      serviceType: 'MART' as any,
+      status: OrderStatus.PENDING,
+      price: totalPayable,
+      discount: 0,
+      pickupAddress: merchant.address,
+      pickupLat: merchant.latitude,
+      pickupLng: merchant.longitude,
+      dropoffAddress: input.dropoffAddress,
+      dropoffLat: input.dropoffLat,
+      dropoffLng: input.dropoffLng,
+      distanceKm,
+      paymentMethod,
+      customer: { connect: { id: customerProfile.id } },
+      merchant: { connect: { id: input.merchantId } },
+      orderItems: { create: orderItemsData },
+    } as any);
+
+    await AuditLogger.log(
+      userId,
+      'CREATE_MERCHANT_ORDER',
+      `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item)`
+    );
+
+    // Realtime & Dispatch — pipeline SAMA dengan order BIKE/CAR/SEND, plus
+    // pemberitahuan khusus ke pemilik toko kalau punya akun login.
+    let dispatch;
+    try {
+      SocketService.emitToDriversPool('new_order_available', {
+        orderId: order.id,
+        serviceType: order.serviceType,
+        pickupAddress: order.pickupAddress,
+        dropoffAddress: order.dropoffAddress,
+        price: order.price,
+      });
+      SocketService.emitToAdmins('order_created', { orderId: order.id, serviceType: order.serviceType });
+      if (merchant.ownerId) {
+        SocketService.emitToUser(merchant.ownerId, 'merchant_new_order', {
+          orderId: order.id,
+          itemCount: orderItemsData.length,
+          total: totalPayable,
+        });
+      }
+
+      const autoAccepted = await this.tryAutoAcceptOnCreation(order.id, order.serviceType);
+      if (!autoAccepted) {
+        dispatch = await this.dispatchService.dispatch({ order });
+      } else {
+        dispatch = { status: 'AUTO_ACCEPTED' as const };
+      }
+    } catch (err: any) {
+      logger.error(`[AUTO-ACCEPT/DISPATCH] Gagal memproses order MART ${order.id}: ${err?.message || err}`);
+      dispatch = null;
+    }
+
+    return { order, breakdown: { itemsSubtotal, deliveryFee, totalPayable }, dispatch };
+  }
+
+  private calculateHaversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const R = 6371; // km
+    const toRad = (deg: number) => (deg * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
   /**
    * Cari SATU driver online yang eligible auto-accept
    */
@@ -241,7 +444,7 @@ export class OrderService {
         isOnline: true,
         isVerified: true,
         autoAcceptEnabled: true,
-        ...(serviceType === 'SEND' ? {} : { serviceType: serviceType as any }),
+        ...(serviceType === 'SEND' || serviceType === 'MART' ? {} : { serviceType: serviceType as any }),
         latitude: { not: null },
         longitude: { not: null },
         orders: {
@@ -300,6 +503,11 @@ export class OrderService {
         SocketService.emitToUser((updatedOrder as any).customer.userId, 'order_accepted', {
           orderId,
           driverId: chosen.id,
+          driver: {
+            fullName: (updatedOrder as any).driver?.user?.fullName,
+            vehicleModel: (updatedOrder as any).driver?.vehicleModel,
+            vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
+          },
         });
         SocketService.emitToUser(chosen.userId, 'order_accepted', { orderId, autoAccepted: true });
         SocketService.emitToDriversPool('order_taken', { orderId });
@@ -405,6 +613,11 @@ export class OrderService {
       SocketService.emitToUser((updatedOrder as any).customer.userId, 'order_accepted', {
         orderId,
         driverId: driverProfile.id,
+        driver: {
+          fullName: (updatedOrder as any).driver?.user?.fullName,
+          vehicleModel: (updatedOrder as any).driver?.vehicleModel,
+          vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
+        },
       });
       SocketService.emitToDriversPool('order_taken', { orderId });
       SocketService.emitToAdmins('order_accepted', { orderId });

@@ -105,9 +105,11 @@ export const API_ENDPOINTS = {
   },
   order: {
     accept: (id: string) => `/api/driver/jobs/${id}/accept`,
-    updateStatus: (id: string) => `/api/orders/${id}/status`,
-    chatHistory: (id: string) => `/api/orders/${id}/chat`,
-    sendReceiptEmail: (id: string) => `/api/orders/${id}/send-receipt`,
+    updateStatus: (id: string) => `/api/order/${id}/status`,
+    chatHistory: (id: string) => `/api/order/${id}/chat`,
+    sendReceiptEmail: (id: string) => `/api/order/${id}/send-receipt`,
+    // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari toko.
+    merchantCheckout: "/api/order/merchant-checkout",
   },
   payment: {
     charge: "/api/payments/charge",

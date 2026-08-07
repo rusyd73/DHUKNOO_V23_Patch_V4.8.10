@@ -1,6 +1,6 @@
-// App.tsx
+// src/app/App.tsx
 import React, { useState, useEffect, Suspense } from 'react';
-import { socket, connectSocket, joinRoom } from "../services/socket";
+import { socket, connectSocket } from "../services/socket";
 import { formatRupiah } from '@obama/shared-utils';
 import { playBellRingSound, startRingLoop, stopRingLoop } from '../utils/audio';
 import { 
@@ -9,53 +9,85 @@ import {
 import { 
   QueryClient, 
   QueryClientProvider, 
+  useQuery, 
+  useMutation,
+  useQueryClient
 } from '@tanstack/react-query';
 import { 
   ShieldAlert, 
   User, 
   Bike, 
   Store,
+  ShoppingBag,
+  Key, 
+  RefreshCw, 
+  MapPin, 
+  Navigation, 
+  Wallet, 
+  Lock, 
+  CheckCircle, 
+  LogOut, 
+  Smartphone, 
+  Sparkles, 
+  Type, 
+  Sun,
+  Moon,
   ChevronRight,
   Info,
-  Sparkles,
-  Type,
-  LogOut,
+  DollarSign,
+  ClipboardList,
+  AlertTriangle,
+  UserCheck,
+  UserX,
+  History,
+  Send,
+  PlusCircle,
+  TrendingUp,
+  Settings,
+  Percent,
+  Map as MapIcon,
+  Power,
+  MessageCircle,
+  Camera,
+  QrCode,
+  Copy,
+  FileSpreadsheet,
+  FileText,
+  Clock,
+  XCircle,
+  Calendar,
+  Users,
+  BarChart2,
+  Search,
+  PhoneCall,
+  ExternalLink
 } from 'lucide-react';
 
-// PERBAIKAN: Lazy load apps
+// ============================================
+// LAZY LOADED COMPONENTS
+// ============================================
 const CustomerApp = React.lazy(() => import('../pages/CustomerApp'));
 const DriverApp = React.lazy(() => import('../pages/DriverApp'));
 const AdminApp = React.lazy(() => import('../pages/AdminApp'));
 const MerchantApp = React.lazy(() => import('../pages/MerchantApp'));
 
-// ============================================================
-// QUERY CLIENT - Single instance
-// ============================================================
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 5 * 60 * 1000, // 5 menit
-      retry: 1,
-      refetchOnWindowFocus: false,
-    },
-  },
-});
+const queryClient = new QueryClient();
 
-// ============================================================
-// FALLBACK LOADING
-// ============================================================
+// ============================================
+// LOADING FALLBACK
+// ============================================
 function AppLoadingFallback() {
   return (
     <div className="min-h-screen flex flex-col items-center justify-center gap-3 bg-[#06170E]">
-      <div className="w-10 h-10 border-4 border-[#23583E] border-t-[#00E575] rounded-full animate-spin" />
+      <div className="w-10 h-10 border-4 border-[#23583E] border-t-[#22C55E] rounded-full animate-spin" />
       <span className="text-xs text-[#A5C9B8] animate-pulse">Memuat halaman...</span>
     </div>
   );
 }
 
-// ============================================================
-// MAIN APP
-// ============================================================
+// ============================================
+// MAIN APP COMPONENT
+// ============================================
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
@@ -64,9 +96,9 @@ export default function App() {
   );
 }
 
-// ============================================================
-// APP SHELL
-// ============================================================
+// ============================================
+// MAIN APP SHELL
+// ============================================
 function DhuknooMainAppShell() {
   const {
     currentRole,
@@ -76,8 +108,12 @@ function DhuknooMainAppShell() {
     toggleFontFamily,
     increaseFontScale,
     logout,
-    user
+    user,
+    theme,
+    setTheme
   } = useAuthStore();
+
+  const queryClient = useQueryClient();
 
   const [notification, setNotification] = useState<string | null>(null);
 
@@ -86,6 +122,29 @@ function DhuknooMainAppShell() {
     setTimeout(() => setNotification(null), 4000);
   };
 
+  // ============================================
+  // SOCKET CONNECTION
+  // ============================================
+  useEffect(() => {
+    if (user?.id) {
+      connectSocket(user.id);
+      // PERBAIKAN: room pribadi user SUDAH otomatis di-join backend saat
+      // connect (`socket.join(\`user_${user.id}\`)` — lihat backend
+      // src/websocket/socket.ts). joinRoom(user.id) sebelumnya mencoba
+      // join room bernama ID mentah (tanpa prefix "user_"), yang selalu
+      // ditolak canJoinRoom (fail-closed default) dan cuma menghasilkan
+      // error di console tanpa manfaat apa pun.
+    }
+    return () => {
+      if (socket) {
+        socket.disconnect();
+      }
+    };
+  }, [user?.id]);
+
+  // ============================================
+  // FONT STYLE
+  // ============================================
   const fontStyle = {
     fontFamily: useSerifFont
       ? '"Times New Roman", Times, serif'
@@ -93,31 +152,57 @@ function DhuknooMainAppShell() {
     fontSize: `${fontScale * 100}%`,
   };
 
+  // ============================================
+  // THEME CLASSES
+  // ============================================
+  const isLight = theme === 'light';
+  const bgClass = isLight ? 'bg-[#F5F9F7]' : 'bg-[#06170E]';
+  const textClass = isLight ? 'text-[#0A2B1D]' : 'text-[#E4F3EC]';
+  const headerBgClass = isLight 
+    ? 'bg-white/90 backdrop-blur-md border-b border-[#D2E5DB]' 
+    : 'bg-[#0B2318]/90 backdrop-blur-md border-b border-[#1A4533]';
+  const footerBgClass = isLight 
+    ? 'bg-[#E8F3ED] border-t border-[#D2E5DB]' 
+    : 'bg-[#05110A] border-t border-[#23583E]/50';
+
   return (
     <div 
       style={fontStyle} 
-      className="min-h-screen bg-[#06170E] text-[#E4F3EC] flex flex-col transition-all duration-300 relative selection:bg-[#00E575] selection:text-[#071F14]"
+      className={`min-h-screen ${bgClass} ${textClass} flex flex-col transition-all duration-300 relative selection:bg-[#22C55E] selection:text-[#071F14]`}
     >
-      {/* Toast Notification */}
+      {/* ==========================================
+          TOAST NOTIFICATION
+          ========================================== */}
       {notification && (
         <div className="fixed top-6 left-1/2 transform -translate-x-1/2 z-50 w-full max-w-md px-4 animate-bounce">
-          <div className="bg-[#00E575] text-[#071F14] px-6 py-4 rounded-2xl shadow-2xl font-bold flex items-center gap-3 border-2 border-[#FFD700]">
+          <div className="bg-[#22C55E] text-[#071F14] px-6 py-4 rounded-2xl shadow-2xl font-bold flex items-center gap-3 border-2 border-[#F59E0B]">
             <Sparkles className="w-5 h-5 shrink-0 animate-spin" />
             <span>{notification}</span>
           </div>
         </div>
       )}
 
-      {/* Header */}
-      <header className="bg-[#0D2E1F] border-b border-[#23583E] py-4 px-6 sticky top-0 z-40">
+      {/* ==========================================
+          HEADER
+          ========================================== */}
+      <header className={`${headerBgClass} py-3.5 px-6 sticky top-0 z-40 transition-all`}>
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setRole(null)}>
-            <div className="w-10 h-10 bg-[#FFD700] rounded-xl flex items-center justify-center font-bold text-xl text-[#071F14]">
+          <div className="flex items-center gap-3 cursor-pointer group" onClick={() => setRole(null)}>
+            <div className={`w-10 h-10 ${isLight ? 'bg-[#22C55E]/20 border-[#22C55E]/40' : 'bg-gradient-to-br from-[#103D27] to-[#0B2318] border-[#22C55E]/30'} border rounded-xl flex items-center justify-center font-bold text-xl shadow-lg group-hover:scale-105 transition-transform`}>
               🍏
             </div>
             <div>
-              <span className="text-xl font-black text-[#FFD700]">DHUKNOO <span className="text-[#00E575]">Platform</span></span>
-              <span className="hidden sm:inline text-xs text-[#A5C9B8]/80 block -mt-1 font-semibold">Ojek Batu - Malang Raya</span>
+              <div className="flex items-center gap-2">
+                <span className={`text-xl font-black tracking-tight font-heading ${isLight ? 'text-[#0A2B1D]' : 'text-white'}`}>
+                  DHUKNOO <span className="text-[#22C55E]">Platform</span>
+                </span>
+                <span className={`${isLight ? 'bg-[#22C55E]/15 text-[#22C55E] border-[#22C55E]/30' : 'bg-[#22C55E]/15 text-[#22C55E] border-[#22C55E]/30'} text-[10px] font-bold px-2 py-0.5 rounded-full border`}>
+                  Ojek & Merchant
+                </span>
+              </div>
+              <span className={`hidden sm:block text-xs ${isLight ? 'text-[#38604E]/70' : 'text-[#A5C9B8]/70'} font-medium`}>
+                Batu - Malang Raya
+              </span>
             </div>
           </div>
 
@@ -125,11 +210,13 @@ function DhuknooMainAppShell() {
             {user && (
               <div className="hidden md:flex flex-col items-end text-right">
                 <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-[#00E575] animate-pulse"></span>
-                  <span className="text-xs font-bold text-white">{user.fullName || user.name}</span>
+                  <span className="w-2 h-2 rounded-full bg-[#22C55E] animate-pulse"></span>
+                  <span className={`text-xs font-bold ${isLight ? 'text-[#0A2B1D]' : 'text-white'}`}>
+                    {user.fullName}
+                  </span>
                 </div>
-                <span className="text-[10px] text-[#00E575] font-semibold bg-[#00E575]/10 px-1.5 py-0.5 rounded border border-[#00E575]/30 mt-0.5">
-                  🔒 {currentRole || 'No Role'}
+                <span className={`${isLight ? 'bg-[#22C55E]/10 text-[#22C55E] border-[#22C55E]/30' : 'bg-[#22C55E]/10 text-[#22C55E] border-[#22C55E]/30'} text-[10px] font-semibold px-2 py-0.5 rounded-md border mt-0.5`}>
+                  🔒 Sesi Aktif ({user.role})
                 </span>
               </div>
             )}
@@ -137,7 +224,7 @@ function DhuknooMainAppShell() {
               <button
                 onClick={() => {
                   const confirmLogout = window.confirm(
-                    `🔒 KONFIRMASI KELUAR SESI:\n\nSesi ${user?.fullName || user?.name || 'Akun'} saat ini dijaga tetap log-in.\n\nApakah Anda yakin ingin keluar dari dashboard sekarang?`
+                    `🔒 KONFIRMASI KELUAR SESI:\n\nSesi ${user?.fullName || 'Akun'} saat ini dijaga tetap log-in untuk memastikan kelancaran proses penyelesaian order & konfirmasi transaksi pembayaran.\n\nApakah Anda yakin ingin membatalkan/keluar dari sesi dashboard sekarang?`
                   );
                   if (confirmLogout) {
                     logout();
@@ -145,7 +232,7 @@ function DhuknooMainAppShell() {
                     triggerToast('Sesi ditutup. Kembali ke Launcher Hub.');
                   }
                 }}
-                className="flex items-center gap-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs font-bold py-2 px-3 rounded-xl border border-red-500/30 transition-all cursor-pointer"
+                className="flex items-center gap-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs font-bold py-2 px-3.5 rounded-xl border border-red-500/30 transition-all cursor-pointer hover:shadow-lg active:scale-95"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 <span>Ganti Akun</span>
@@ -155,20 +242,22 @@ function DhuknooMainAppShell() {
         </div>
       </header>
 
-      {/* MAIN CONTENT */}
+      {/* ==========================================
+          MAIN CONTENT
+          ========================================== */}
       <main className="flex-1 flex flex-col">
         {!currentRole ? (
           <LauncherHub 
             onSelectRole={(role) => {
-              // Hapus logout() karena akan mereset state
-              // Kita hanya set role saja
+              logout();
               setRole(role);
-              triggerToast(`🔄 Beralih ke portal ${role}`);
             }}
             useSerifFont={useSerifFont}
             fontScale={fontScale}
             onToggleFont={toggleFontFamily}
             onIncreaseFont={increaseFontScale}
+            theme={theme}
+            setTheme={setTheme}
           />
         ) : (
           <Suspense fallback={<AppLoadingFallback />}>
@@ -188,28 +277,35 @@ function DhuknooMainAppShell() {
         )}
       </main>
 
-      {/* Footer */}
-      <footer className="bg-[#05110A] border-t border-[#23583E]/50 py-6 text-center text-xs text-[#A5C9B8]/60">
+      {/* ==========================================
+          FOOTER
+          ========================================== */}
+      <footer className={`${footerBgClass} py-6 text-center text-xs ${isLight ? 'text-[#38604E]/60' : 'text-[#A5C9B8]/60'}`}>
         <div className="max-w-4xl mx-auto px-4 flex flex-col gap-2">
-          <div className="font-semibold text-[#00E575] flex items-center justify-center gap-2">
+          <div className={`font-semibold ${isLight ? 'text-[#22C55E]' : 'text-[#22C55E]'} flex items-center justify-center gap-2`}>
             <Info className="w-4 h-4" />
-            <span>DHUKNOO Platform - Single Backend API, Multi-Client Portals</span>
+            <span>Arsitektur DHUKNOO: Single Backend API - Multi-Client Portals (Customer, Driver, Merchant, Admin)</span>
           </div>
+          <p className="leading-relaxed">
+            Dipisahkan secara penuh berdasarkan **Otorisasi Role**, **Hak Akses Permission**, **Endpoint API Mandiri**, dan **Antarmuka Layar Screen** untuk mengeliminasi kebocoran otentikasi data antar user.
+          </p>
         </div>
       </footer>
     </div>
   );
 }
 
-// ============================================================
-// LAUNCHER HUB
-// ============================================================
+// ============================================
+// LAUNCHER HUB (Dashboard Utama)
+// ============================================
 interface LauncherProps {
   onSelectRole: (role: 'CUSTOMER' | 'DRIVER' | 'MERCHANT' | 'ADMIN') => void;
   useSerifFont: boolean;
   fontScale: number;
   onToggleFont: () => void;
   onIncreaseFont: () => void;
+  theme: 'light' | 'dark';
+  setTheme: (theme: 'light' | 'dark') => void;
 }
 
 function LauncherHub({ 
@@ -217,13 +313,22 @@ function LauncherHub({
   useSerifFont, 
   fontScale, 
   onToggleFont, 
-  onIncreaseFont 
+  onIncreaseFont,
+  theme,
+  setTheme
 }: LauncherProps) {
   const [adminAccessRevealed, setAdminAccessRevealed] = useState(
     () => new URLSearchParams(window.location.search).get('portal') === 'admin'
   );
   const logoClickCountRef = React.useRef(0);
   const logoClickTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const isLight = theme === 'light';
+  const cardBgClass = isLight ? 'bg-white/80' : 'glass-card';
+  const cardBorderClass = isLight ? 'border-[#D2E5DB]' : 'border-[#23583E]/60';
+  const cardHoverBorderClass = isLight ? 'hover:border-[#22C55E]' : 'hover:border-[#22C55E]/80';
+  const textMutedClass = isLight ? 'text-[#38604E]' : 'text-[#A5C9B8]';
+  const textMutedLightClass = isLight ? 'text-[#38604E]/80' : 'text-[#A5C9B8]/80';
 
   const handleLogoClick = () => {
     logoClickCountRef.current += 1;
@@ -238,51 +343,108 @@ function LauncherHub({
   };
 
   return (
-    <div className="w-full max-w-5xl mx-auto px-4 py-8 md:py-16 flex flex-col gap-10 flex-1 justify-center">
-      {/* Brand Header */}
-      <div className="text-center flex flex-col items-center gap-4">
-        <div className="relative" onClick={handleLogoClick}>
-          <div className="w-24 h-24 bg-[#FFD700] border-4 border-[#00E575] rounded-3xl flex items-center justify-center shadow-2xl text-5xl transform hover:rotate-12 transition-transform duration-300 cursor-pointer select-none">
+    <div className="w-full max-w-6xl mx-auto px-4 py-8 md:py-14 flex flex-col gap-10 flex-1 justify-center">
+      {/* ==========================================
+          BRAND HEADER
+          ========================================== */}
+      <div className="text-center flex flex-col items-center gap-4 relative">
+        <div className="relative cursor-pointer group" onClick={handleLogoClick}>
+          <div className={`w-20 h-20 md:w-24 md:h-24 ${isLight ? 'bg-[#22C55E]/20 border-[#22C55E]/40' : 'bg-gradient-to-br from-[#1B4D33] via-[#103D27] to-[#0A2318] border-[#22C55E]/40'} border-2 rounded-3xl flex items-center justify-center shadow-2xl text-4xl md:text-5xl transform group-hover:scale-105 group-hover:rotate-6 transition-all duration-300 select-none`}>
             🍏
           </div>
-          <span className="absolute -top-2 -right-2 bg-red-500 text-white font-black text-[10px] px-2 py-0.5 rounded-full uppercase tracking-widest animate-pulse border border-white">
-            V2
+          <span className="absolute -top-2 -right-3 bg-gradient-to-r from-[#22C55E] to-[#16A34A] text-[#05110A] font-black text-[10px] px-2.5 py-0.5 rounded-full uppercase tracking-wider shadow-md border border-[#22C55E]/50">
+            v2.5 Live
           </span>
         </div>
         <div>
-          <h1 className="text-4xl md:text-6xl font-black tracking-tight text-[#FFD700]">
-            DHUKNOO <span className="text-[#00E575]">Ride</span>
+          <h1 className={`text-4xl md:text-6xl font-black tracking-tight ${isLight ? 'text-[#0A2B1D]' : 'text-white'} font-heading`}>
+            DHUKNOO <span className="text-[#22C55E]">Ride</span>
           </h1>
-          <p className="text-[#A5C9B8] font-bold text-xl mt-1">Ojek Batu - Malang Raya Terpadu</p>
+          <p className={`${textMutedClass} font-bold text-lg md:text-xl mt-1 tracking-wide`}>
+            Ojek & Merchant Batu — Malang Raya
+          </p>
         </div>
+        <p className={`max-w-2xl text-xs md:text-sm ${textMutedLightClass} leading-relaxed`}>
+          Platform layanan ojek, pesan antar makanan merchant, dan armada pengiriman barang. Didukung Arsitektur Unified Multi-Role API & Realtime Socket.IO dispatching.
+        </p>
       </div>
 
-      {/* Accessibility Controls */}
-      <div className="bg-[#0D2E1F] border border-[#23583E] rounded-3xl p-6 shadow-2xl flex flex-col gap-4">
-        <div className="flex items-center gap-2 text-[#FFD700]">
-          <Type className="w-5 h-5" />
-          <h2 className="font-bold text-lg">Pengaturan Tampilan</h2>
+      {/* ==========================================
+          ACCESSIBILITY CONTROLS (HANYA DI DASHBOARD UTAMA)
+          ========================================== */}
+      <div className={`${cardBgClass} rounded-3xl p-6 shadow-xl flex flex-col gap-4 border ${cardBorderClass}`}>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-[#22C55E]">
+            <Type className="w-5 h-5" />
+            <h2 className={`font-bold text-base md:text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} font-heading`}>
+              Pengaturan Tampilan & Aksesibilitas
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`text-xs font-bold px-3 py-1.5 rounded-full border flex items-center gap-1.5 shrink-0 ${
+              isLight 
+                ? 'bg-amber-500/10 text-amber-600 border-amber-500/30' 
+                : 'bg-[#22C55E]/10 text-[#22C55E] border-[#22C55E]/30'
+            }`}>
+              {isLight ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+              <span>Mode {isLight ? 'Terang' : 'Gelap'}</span>
+            </span>
+          </div>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <p className={`text-xs ${textMutedLightClass} -mt-2`}>
+          Sesuaikan mode tema tampilan (gelap/terang), jenis huruf, dan perbesaran teks untuk kenyamanan navigasi di layar smartphone maupun komputer.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-1">
+          {/* Theme Switcher */}
           <div className="flex flex-col gap-2">
-            <span className="text-xs font-bold text-[#A5C9B8]">Jenis Huruf</span>
+            <span className={`text-xs font-semibold ${textMutedClass}`}>Mode Tampilan (Theme)</span>
+            <div className="grid grid-cols-2 gap-2">
+              <button 
+                onClick={() => setTheme('dark')}
+                className={`py-2.5 px-3 rounded-xl border text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  !isLight 
+                    ? `${isLight ? 'bg-[#103826] border-[#22C55E] text-[#22C55E]' : 'bg-[#103826] border-[#22C55E] text-[#22C55E]'} shadow-md` 
+                    : `${isLight ? 'bg-[#F5F9F7] border-[#D2E5DB] text-[#38604E]' : 'bg-[#06170E] border-[#1F4A34] text-[#A5C9B8]'} hover:border-[#22C55E]/50`
+                }`}
+              >
+                <Moon className="w-4 h-4" />
+                <span>Mode Gelap</span>
+              </button>
+              <button 
+                onClick={() => setTheme('light')}
+                className={`py-2.5 px-3 rounded-xl border text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  isLight 
+                    ? 'bg-amber-500/15 border-amber-500 text-amber-500 shadow-md' 
+                    : `${isLight ? 'bg-[#F5F9F7] border-[#D2E5DB] text-[#38604E]' : 'bg-[#06170E] border-[#1F4A34] text-[#A5C9B8]'} hover:border-amber-500/50`
+                }`}
+              >
+                <Sun className="w-4 h-4" />
+                <span>Mode Terang</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Font Type Selection */}
+          <div className="flex flex-col gap-2">
+            <span className={`text-xs font-semibold ${textMutedClass}`}>Jenis Huruf (Typography)</span>
             <div className="grid grid-cols-2 gap-2">
               <button 
                 onClick={onToggleFont}
-                className={`py-2.5 px-3 rounded-xl border text-sm font-bold transition-all ${
+                className={`py-2.5 px-3 rounded-xl border text-xs font-bold transition-all cursor-pointer ${
                   !useSerifFont 
-                    ? 'bg-[#23583E] border-[#00E575] text-[#00E575]' 
-                    : 'bg-[#06170E] border-[#23583E] text-[#A5C9B8] hover:border-[#00E575]'
+                    ? `${isLight ? 'bg-[#22C55E]/20 border-[#22C55E] text-[#22C55E]' : 'bg-[#103826] border-[#22C55E] text-[#22C55E]'} shadow-md` 
+                    : `${isLight ? 'bg-[#F5F9F7] border-[#D2E5DB] text-[#38604E]' : 'bg-[#06170E] border-[#1F4A34] text-[#A5C9B8]'} hover:border-[#22C55E]/50`
                 }`}
               >
                 Sans-Serif
               </button>
               <button 
                 onClick={onToggleFont}
-                className={`py-2.5 px-3 rounded-xl border text-sm font-bold transition-all ${
+                className={`py-2.5 px-3 rounded-xl border text-xs font-bold transition-all cursor-pointer ${
                   useSerifFont 
-                    ? 'bg-[#23583E] border-[#00E575] text-[#00E575]' 
-                    : 'bg-[#06170E] border-[#23583E] text-[#A5C9B8] hover:border-[#00E575]'
+                    ? `${isLight ? 'bg-[#22C55E]/20 border-[#22C55E] text-[#22C55E]' : 'bg-[#103826] border-[#22C55E] text-[#22C55E]'} shadow-md` 
+                    : `${isLight ? 'bg-[#F5F9F7] border-[#D2E5DB] text-[#38604E]' : 'bg-[#06170E] border-[#1F4A34] text-[#A5C9B8]'} hover:border-[#22C55E]/50`
                 }`}
                 style={{ fontFamily: 'Georgia, serif' }}
               >
@@ -290,129 +452,128 @@ function LauncherHub({
               </button>
             </div>
           </div>
-          <div className="flex flex-col gap-2">
-            <span className="text-xs font-bold text-[#A5C9B8]">Ukuran Font</span>
-            <div className="flex items-center justify-between bg-[#06170E] border border-[#23583E] rounded-xl px-4 py-2">
-              <span className="text-xs text-[#A5C9B8]/80">{Math.round(fontScale * 100)}%</span>
+
+          {/* Font Size Scaling */}
+          <div className="flex flex-col gap-2 justify-between">
+            <span className={`text-xs font-semibold ${textMutedClass}`}>Ukuran Teks (Font Scale)</span>
+            <div className={`flex items-center justify-between ${isLight ? 'bg-[#F5F9F7] border-[#D2E5DB]' : 'bg-[#06170E] border-[#1F4A34]'} border rounded-xl px-4 py-2`}>
+              <span className={`text-xs ${textMutedClass} font-mono`}>Skala: {Math.round(fontScale * 100)}%</span>
               <button 
                 onClick={onIncreaseFont}
-                className="bg-[#00E575] text-[#071F14] px-4 py-1.5 rounded-lg text-xs font-black hover:bg-[#00ff80] transition-all"
+                className="bg-[#22C55E] hover:bg-[#16A34A] text-[#05110A] px-3.5 py-1.5 rounded-lg text-xs font-black transition-all transform active:scale-95 cursor-pointer shadow-md"
               >
-                +10%
+                Ubah Skala
               </button>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Portal Grid */}
+      {/* ==========================================
+          ROLE CARDS GRID
+          ========================================== */}
       <div className="flex flex-col gap-4">
-        <h3 className="font-bold text-lg text-[#FFD700] px-1">Pilih Portal</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <h3 className={`font-bold text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} font-heading px-1 text-center sm:text-left flex items-center gap-2`}>
+          <span>Pilih Portal Client</span>
+          <span className={`text-xs font-normal ${textMutedLightClass}`}>(Sesuai Otorisasi Akses)</span>
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
           
-          {/* Customer */}
-          <PortalCard
-            icon={<User className="w-6 h-6" />}
-            title="Customer"
-            subtitle="Android/Web"
-            color="#FFD700"
-            description="Portal ojek & pengiriman. Top up dompet, pesan perjalanan."
+          {/* Card Customer */}
+          <div 
             onClick={() => onSelectRole('CUSTOMER')}
-          />
+            className={`${cardBgClass} p-6 rounded-3xl cursor-pointer transition-all hover:-translate-y-1.5 flex flex-col justify-between gap-6 border ${cardBorderClass} ${cardHoverBorderClass} group`}
+          >
+            <div>
+              <div className={`w-12 h-12 bg-[#22C55E]/10 text-[#22C55E] rounded-2xl flex items-center justify-center mb-4 border border-[#22C55E]/20 group-hover:scale-110 transition-transform`}>
+                <User className="w-6 h-6" />
+              </div>
+              <h4 className={`font-black text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} flex items-center justify-between gap-2 font-heading`}>
+                <span>Customer</span>
+                <span className="bg-[#22C55E]/20 text-[#22C55E] text-[10px] font-bold px-2 py-0.5 rounded-full border border-[#22C55E]/30">Web / App</span>
+              </h4>
+              <p className={`text-xs ${textMutedClass} mt-2 leading-relaxed`}>
+                Pesan perjalanan ojek/mobil, kirim paket, belanja produk merchant, top-up dompet digital & lacak pesanan aktif.
+              </p>
+            </div>
+            <div className={`flex items-center justify-between text-xs font-bold text-[#22C55E] pt-4 border-t ${isLight ? 'border-[#D2E5DB]/60' : 'border-[#1F4A34]/60'} group-hover:translate-x-1 transition-transform`}>
+              <span>Masuk Customer</span>
+              <ChevronRight className="w-4 h-4" />
+            </div>
+          </div>
 
-          {/* Driver */}
-          <PortalCard
-            icon={<Bike className="w-6 h-6" />}
-            title="Driver"
-            subtitle="Android"
-            color="#00E575"
-            description="Portal mitra pengemudi. Lacak order, terima pesanan."
+          {/* Card Driver */}
+          <div 
             onClick={() => onSelectRole('DRIVER')}
-          />
+            className={`${cardBgClass} p-6 rounded-3xl cursor-pointer transition-all hover:-translate-y-1.5 flex flex-col justify-between gap-6 border ${cardBorderClass} ${cardHoverBorderClass} group`}
+          >
+            <div>
+              <div className={`w-12 h-12 bg-[#22C55E]/10 text-[#22C55E] rounded-2xl flex items-center justify-center mb-4 border border-[#22C55E]/20 group-hover:scale-110 transition-transform`}>
+                <Bike className="w-6 h-6" />
+              </div>
+              <h4 className={`font-black text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} flex items-center justify-between gap-2 font-heading`}>
+                <span>Mitra Driver</span>
+                <span className="bg-[#22C55E]/20 text-[#22C55E] text-[10px] font-bold px-2 py-0.5 rounded-full border border-[#22C55E]/30">Driver App</span>
+              </h4>
+              <p className={`text-xs ${textMutedClass} mt-2 leading-relaxed`}>
+                Portal pengemudi. Terima orderan ojek/delivery realtime, atur status ketersediaan online, dan kelola dompet deposit.
+              </p>
+            </div>
+            <div className={`flex items-center justify-between text-xs font-bold text-[#22C55E] pt-4 border-t ${isLight ? 'border-[#D2E5DB]/60' : 'border-[#1F4A34]/60'} group-hover:translate-x-1 transition-transform`}>
+              <span>Masuk Portal Driver</span>
+              <ChevronRight className="w-4 h-4" />
+            </div>
+          </div>
 
-          {/* Merchant */}
-          <PortalCard
-            icon={<Store className="w-6 h-6" />}
-            title="Merchant"
-            subtitle="Web/Android"
-            color="#FF6B6B"
-            description="Portal mitra warung. Kelola produk, terima pesanan."
+          {/* Card Merchant */}
+          <div 
             onClick={() => onSelectRole('MERCHANT')}
-          />
+            className={`${cardBgClass} p-6 rounded-3xl cursor-pointer transition-all hover:-translate-y-1.5 flex flex-col justify-between gap-6 border ${cardBorderClass} hover:border-[#F59E0B]/80 group`}
+          >
+            <div>
+              <div className={`w-12 h-12 bg-[#F59E0B]/10 text-[#F59E0B] rounded-2xl flex items-center justify-center mb-4 border border-[#F59E0B]/20 group-hover:scale-110 transition-transform`}>
+                <Store className="w-6 h-6" />
+              </div>
+              <h4 className={`font-black text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} flex items-center justify-between gap-2 font-heading`}>
+                <span>Mitra Merchant</span>
+                <span className="bg-[#F59E0B]/20 text-[#F59E0B] text-[9px] font-bold px-2 py-0.5 rounded-full border border-[#F59E0B]/30">Toko / Kuliner</span>
+              </h4>
+              <p className={`text-xs ${textMutedClass} mt-2 leading-relaxed`}>
+                Portal merchant. Kelola katalog menu/produk, terima pesanan masuk dari customer, pantau pendapatan toko, dan jam operasional.
+              </p>
+            </div>
+            <div className={`flex items-center justify-between text-xs font-bold text-[#F59E0B] pt-4 border-t ${isLight ? 'border-[#D2E5DB]/60' : 'border-[#1F4A34]/60'} group-hover:translate-x-1 transition-transform`}>
+              <span>Masuk Portal Merchant</span>
+              <ChevronRight className="w-4 h-4" />
+            </div>
+          </div>
 
-          {/* Admin - Hidden */}
+          {/* Card Admin - Hidden unless revealed */}
           {adminAccessRevealed && (
-            <PortalCard
-              icon={<ShieldAlert className="w-6 h-6" />}
-              title="Admin"
-              subtitle="Web Panel"
-              color="#EF4444"
-              description="Panel kontrol. Audit finansial, verifikasi mitra."
-              onClick={() => onSelectRole('ADMIN')}
-            />
+          <div 
+            onClick={() => onSelectRole('ADMIN')}
+            className={`${cardBgClass} p-6 rounded-3xl cursor-pointer transition-all hover:-translate-y-1.5 flex flex-col justify-between gap-6 border ${cardBorderClass} hover:border-[#EF4444]/80 group`}
+          >
+            <div>
+              <div className={`w-12 h-12 bg-red-500/10 text-red-400 rounded-2xl flex items-center justify-center mb-4 border border-red-500/20 group-hover:scale-110 transition-transform`}>
+                <ShieldAlert className="w-6 h-6" />
+              </div>
+              <h4 className={`font-black text-lg ${isLight ? 'text-[#0A2B1D]' : 'text-white'} flex items-center justify-between gap-2 font-heading`}>
+                <span>Dhuknoo Admin</span>
+                <span className="bg-red-500/20 text-red-400 text-[9px] font-bold px-2 py-0.5 rounded-full border border-red-500/30">Admin Panel</span>
+              </h4>
+              <p className={`text-xs ${textMutedClass} mt-2 leading-relaxed`}>
+                Panel kontrol administrasi platform. Audit laporan keuangan, verifikasi dokumen driver, kelola komisi & log sistem terpusat.
+              </p>
+            </div>
+            <div className={`flex items-center justify-between text-xs font-bold text-red-400 pt-4 border-t ${isLight ? 'border-[#D2E5DB]/60' : 'border-[#1F4A34]/60'} group-hover:translate-x-1 transition-transform`}>
+              <span>Masuk Admin Panel</span>
+              <ChevronRight className="w-4 h-4" />
+            </div>
+          </div>
           )}
 
         </div>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================
-// PORTAL CARD COMPONENT
-// ============================================================
-interface PortalCardProps {
-  icon: React.ReactNode;
-  title: string;
-  subtitle: string;
-  color: string;
-  description: string;
-  onClick: () => void;
-}
-
-function PortalCard({ icon, title, subtitle, color, description, onClick }: PortalCardProps) {
-  return (
-    <div 
-      onClick={onClick}
-      className="bg-[#0D2E1F] border border-[#23583E] hover:border-[color] hover:shadow-[0_0_15px_rgba(color,0.15)] p-6 rounded-3xl cursor-pointer transition-all hover:-translate-y-1.5 flex flex-col justify-between gap-6"
-      style={{ 
-        '--color': color,
-        borderColor: 'var(--color, #23583E)',
-      } as React.CSSProperties}
-    >
-      <div>
-        <div 
-          className="w-12 h-12 rounded-2xl flex items-center justify-center mb-4 border"
-          style={{
-            backgroundColor: `${color}10`,
-            color: color,
-            borderColor: `${color}20`,
-          }}
-        >
-          {icon}
-        </div>
-        <h4 className="font-black text-xl text-white flex items-center gap-2">
-          <span>Dhuknoo {title}</span>
-          <span 
-            className="text-[9px] px-1.5 py-0.5 rounded-md"
-            style={{
-              backgroundColor: `${color}20`,
-              color: color,
-            }}
-          >
-            {subtitle}
-          </span>
-        </h4>
-        <p className="text-xs text-[#A5C9B8] mt-2 leading-relaxed">
-          {description}
-        </p>
-      </div>
-      <div 
-        className="flex items-center justify-between text-xs font-bold pt-4 border-t border-[#23583E]/50"
-        style={{ color }}
-      >
-        <span>Buka Portal</span>
-        <ChevronRight className="w-4 h-4" />
       </div>
     </div>
   );

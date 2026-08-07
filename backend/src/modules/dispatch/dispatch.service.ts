@@ -189,14 +189,15 @@ export class DispatchService {
           // Sebelumnya semua driver online ditawari order apa pun tanpa
           // pengecekan jenis layanan sama sekali.
           //
-          // PENGECUALIAN: order layanan SEND (kirim barang) TIDAK memakai
-          // klasifikasi -- siapa saja driver yang online/aktif (toggle ON)
-          // berhak menerima publikasi order SEND, terlepas dari serviceType
-          // profil driver tsb (BIKE/CAR/SEND semua bisa dapat tawaran SEND).
+          // PENGECUALIAN: order layanan SEND (kirim barang) DAN MART
+          // (belanja/pesan-antar dari Merchant) TIDAK memakai klasifikasi --
+          // siapa saja driver yang online/aktif (toggle ON) berhak menerima
+          // publikasi order ini, terlepas dari serviceType profil driver
+          // tsb (BIKE/CAR/SEND semua bisa dapat tawaran SEND/MART).
           .filter(
 
             driver => {
-              if (request.order.serviceType === "SEND") {
+              if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") {
                 return true;
               }
 
@@ -605,6 +606,14 @@ export class DispatchService {
       async()=>{
 
 
+        // PERBAIKAN: sebelumnya driver yang offer-nya kadaluwarsa (tidak
+        // merespons dalam OFFER_TIMEOUT_SECONDS) tidak pernah diberi tahu
+        // -- dispatch diam-diam pindah ke kandidat berikutnya sementara
+        // ring/bell di HP driver itu terus berbunyi tanpa henti sampai
+        // mereka pindah halaman. Kirim 'order_timeout' supaya frontend
+        // (DriverApp.tsx) bisa menghentikan ring loop untuk driver ini.
+        SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId });
+
         if (
 
           DispatchState.hasAccepted(
@@ -790,6 +799,11 @@ export class DispatchService {
         SocketService.emitToUser((order as any).customer.userId, "order_accepted", {
           orderId,
           driverId,
+          driver: {
+            fullName: (driverProfile as any)?.user?.fullName,
+            vehicleModel: (driverProfile as any)?.vehicleModel,
+            vehiclePlate: (driverProfile as any)?.vehiclePlate,
+          },
         });
         if (driverProfile?.userId) {
           SocketService.emitToUser(driverProfile.userId, DISPATCH_CONSTANTS.ORDER_ACCEPTED_EVENT, { orderId });
