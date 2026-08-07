@@ -427,7 +427,10 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 <Wallet className="w-5 h-5" />
                 <span className="font-bold text-sm tracking-wider uppercase">Saldo Dompet DHUKNOO</span>
               </div>
+              {/* 🆕 Nama customer — ditampilkan tepat di atas ID Dompet/saldo,
+                  mengisi ruang kosong sejajar dengan status saldo di atasnya. */}
               <div>
+                <span className="text-[10px] text-[#A5C9B8] block">Nama: {profileData?.fullName || 'Memuat...'}</span>
                 <span className="text-[10px] text-[#A5C9B8] block">ID Dompet: {profileData?.wallet?.id || 'Memuat...'}</span>
                 <span className="text-4xl font-black text-white">
                   {formatRupiah(Number(profileData?.wallet?.balance || 0))}

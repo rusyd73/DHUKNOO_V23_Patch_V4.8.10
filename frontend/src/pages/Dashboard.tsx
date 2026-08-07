@@ -199,7 +199,13 @@ export function MerchantDashboard({ onNavigateTab, triggerToast }: MerchantDashb
         {/* 🆕 Status Toggle Button (Enhanced from File 2 with toast) */}
         <div className="flex items-center gap-3">
           <div className="flex flex-col items-end">
-            <span className="text-[10px] text-[#A5C9B8] font-semibold">Status Layanan</span>
+            {/* 🆕 Nama pemilik toko — identitas akun yang sedang login, beda
+                dari nama toko di atas, ditampilkan tepat di atas status
+                Buka/Tutup (ruang kosong pojok kanan atas). */}
+            <span className="text-[10px] text-[#A5C9B8] font-semibold">
+              {merchant?.owner?.fullName || 'Pemilik Toko'}
+            </span>
+            <span className="text-[10px] text-[#A5C9B8]/70 font-semibold">Status Layanan</span>
             <span className={`text-xs font-bold ${merchant?.isOpen ? 'text-[#22C55E]' : 'text-red-400'}`}>
               {merchant?.isOpen ? '🟢 Toko Buka' : '🔴 Toko Tutup'}
             </span>

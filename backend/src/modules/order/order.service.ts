@@ -334,6 +334,15 @@ export class OrderService {
     const deliveryFee = Math.round(8000 + distanceKm * 2500);
     const totalPayable = itemsSubtotal + deliveryFee;
 
+    // 🆕 Platform fee dari MERCHANT — dikunci pada saat checkout (sama seperti
+    // commissionRate driver dikunci lewat PricingHistory), supaya tidak berubah
+    // retroaktif walau Admin mengubah rate-nya sebelum order ini dibayar/selesai.
+    // Komisi driver TETAP hanya dihitung dari ongkir (deliveryFee), BUKAN dari
+    // nilai barang (itemsSubtotal) — nilai barang adalah hak merchant.
+    const merchantFeeRate = await this.tariffEngine.getMerchantPlatformFeeRate();
+    const merchantFeeAmount = Math.round(itemsSubtotal * merchantFeeRate);
+    const { rate: driverCommissionRateOnDelivery } = await this.tariffEngine.resolveCommissionRate(deliveryFee);
+
     // 🔒 Validasi saldo — sama seperti order biasa.
     const customerWallet = await prisma.wallet.findUnique({ where: { userId } });
     if (!customerWallet) {
@@ -382,10 +391,36 @@ export class OrderService {
       orderItems: { create: orderItemsData },
     } as any);
 
+    // 🆕 Kunci breakdown MART (platform fee merchant + komisi driver atas ongkir)
+    // ke PricingHistory, supaya PaymentService memakai rate yang SAMA persis
+    // dengan yang berlaku saat checkout, bukan rate terbaru saat pembayaran.
+    await this.tariffEngine.recordPricingHistory(order.id, {
+      baseFare: 0,
+      pickupFee: 0,
+      distanceFee: deliveryFee,
+      waitFee: 0,
+      tollFee: 0,
+      parkingFee: 0,
+      weatherSurcharge: 0,
+      holidaySurcharge: 0,
+      promoDiscount: 0,
+      finalFare: totalPayable,
+      commissionRate: driverCommissionRateOnDelivery,
+      commissionAmount: Math.round(deliveryFee * driverCommissionRateOnDelivery),
+      driverEarning: deliveryFee - Math.round(deliveryFee * driverCommissionRateOnDelivery),
+      tariffVersionId: null,
+      zoneId: null,
+      orderType: 'MART',
+      itemsSubtotal,
+      merchantFeeRate,
+      merchantFeeAmount,
+      merchantEarning: itemsSubtotal - merchantFeeAmount,
+    });
+
     await AuditLogger.log(
       userId,
       'CREATE_MERCHANT_ORDER',
-      `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item)`
+      `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item, ongkir Rp${deliveryFee}, platform fee merchant ${(merchantFeeRate * 100).toFixed(1)}% = Rp${merchantFeeAmount})`
     );
 
     // Realtime & Dispatch — pipeline SAMA dengan order BIKE/CAR/SEND, plus

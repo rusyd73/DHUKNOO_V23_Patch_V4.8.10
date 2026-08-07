@@ -30,6 +30,17 @@ export interface TariffBreakdown {
   driverEarning: number;
   tariffVersionId: string | null;
   zoneId: string | null;
+  // 🆕 Field khusus order MART (checkout dari toko/Merchant). Order BIKE/CAR/SEND
+  // biasa tidak mengisi field ini (tetap undefined), supaya struktur lama tidak
+  // berubah. Disimpan di sini (bukan kolom baru di tabel Order) supaya nilainya
+  // TERKUNCI pada saat checkout — persis seperti commissionRate driver — dan
+  // tidak berubah retroaktif walau Admin mengubah rate platform fee merchant
+  // di kemudian hari.
+  orderType?: 'MART';
+  itemsSubtotal?: number; // total harga barang (belum termasuk ongkir)
+  merchantFeeRate?: number; // platform fee dari merchant, mis. 0.1 = 10%
+  merchantFeeAmount?: number; // itemsSubtotal * merchantFeeRate
+  merchantEarning?: number; // itemsSubtotal - merchantFeeAmount (masuk ke wallet merchant)
 }
 
 /**
@@ -150,5 +161,23 @@ export class TariffEngineService {
     if (!config) return 20000;
     const parsed = Number(config.value);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 20000;
+  }
+
+  /**
+   * 🆕 Platform fee yang dipotong dari MERCHANT (bukan driver) untuk setiap
+   * penjualan barang lewat checkout MART — sebelumnya belum ada sama sekali
+   * di ekosistem tarif engine ini (hanya ada komisi driver dari TariffVersion).
+   * Nilainya berupa rate 0..1 (mis. 0.1 = 10%), diatur Admin lewat endpoint
+   * PlatformConfig yang sama seperti MINIMUM_DRIVER_DEPOSIT (key:
+   * "MERCHANT_PLATFORM_FEE_RATE"), tanpa perlu rilis aplikasi baru. Kalau
+   * Admin belum pernah mengatur, jatuh ke default aman 10% (bukan 0%),
+   * supaya platform tidak pernah kehilangan pendapatan dari sisi merchant
+   * hanya karena belum sempat dikonfigurasi.
+   */
+  async getMerchantPlatformFeeRate(): Promise<number> {
+    const config = await this.tariffRepo.getConfig('MERCHANT_PLATFORM_FEE_RATE');
+    if (!config) return 0.1;
+    const parsed = Number(config.value);
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.1;
   }
 }

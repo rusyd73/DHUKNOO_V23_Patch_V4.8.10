@@ -34,6 +34,7 @@ enum TransactionType {
   TOPUP       // Isi saldo oleh user
   PAYMENT     // Pembayaran order (keluar dari wallet customer)
   EARNING     // Pendapatan order (masuk ke wallet driver)
+  MERCHANT_EARNING // 🆕 Pendapatan penjualan barang MART (masuk ke wallet merchant, setelah dipotong platform fee merchant)
   PLATFORM_FEE // Potongan komisi platform
   REFUND      // Pengembalian dana
 }

@@ -4,7 +4,7 @@ export class PaymentRepository {
   findOrderById(orderId: string) {
     return prisma.order.findUnique({
       where: { id: orderId },
-      include: { customer: true, driver: true },
+      include: { customer: true, driver: true, merchant: true, orderItems: true },
     });
   }
 
@@ -26,7 +26,7 @@ export class PaymentRepository {
   findPaymentProofById(id: string) {
     return prisma.paymentProof.findUnique({
       where: { id },
-      include: { order: { include: { customer: true, driver: true } } },
+      include: { order: { include: { customer: true, driver: true, merchant: true, orderItems: true } } },
     });
   }
 

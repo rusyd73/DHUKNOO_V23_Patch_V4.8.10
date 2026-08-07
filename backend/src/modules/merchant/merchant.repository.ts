@@ -61,6 +61,11 @@ export class MerchantRepository {
         products: {
           orderBy: { name: 'asc' },
         },
+        // 🆕 nama pemilik akun (identitas login), beda dari nama toko —
+        // dipakai untuk menampilkan "Nama Pemilik" di dashboard merchant.
+        owner: {
+          select: { fullName: true, email: true },
+        },
       },
     });
   }

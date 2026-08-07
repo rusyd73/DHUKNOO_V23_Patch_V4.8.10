@@ -454,6 +454,16 @@ export default function DriverApp({ onBack, triggerToast }: PortalProps) {
                 </div>
               </div>
 
+              {/* 🆕 Nama driver — ditampilkan tepat di atas Plat Nomor/Tipe
+                  Kendaraan, sejajar dengan status ONLINE/OFFLINE di atasnya,
+                  mengisi ruang kosong pojok atas kartu ini. */}
+              <div className="text-xs text-[#A5C9B8]">
+                <div className="flex justify-between border-b border-[#23583E]/50 pb-1">
+                  <span>Nama Driver:</span>
+                  <span className="font-bold text-white">{profileData?.fullName || 'Memuat...'}</span>
+                </div>
+              </div>
+
               <div className="text-xs text-[#A5C9B8]">
                 <div className="flex justify-between border-b border-[#23583E]/50 pb-1">
                   <span>Plat Nomor:</span>
