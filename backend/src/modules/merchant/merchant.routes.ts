@@ -3,6 +3,15 @@ import express from 'express';
 import { MerchantController } from './merchant.controller';
 // ✅ IMPORT YANG BENAR - auth.middleware.ts
 import { authenticateToken, authorizeRoles } from '../../core/middleware/auth.middleware';
+import { validateBody } from '../../core/middleware/validation.middleware';
+import {
+  registerMerchantSchema,
+  createMerchantByAdminSchema,
+  updateMerchantSchema,
+  addMenuItemSchema,
+  bulkAddMenuItemsSchema,
+  updateMenuItemSchema,
+} from '../../core/validation/schemas';
 import { logger } from '../../config/logger';
 
 const router = express.Router();
@@ -27,7 +36,11 @@ router.get('/search', merchantController.search);
 router.get('/popular', merchantController.getPopular);
 router.get('/:id', merchantController.getDetail);
 router.get('/:id/products', merchantController.listProducts);
-router.post('/register', merchantController.register);
+// 🆕 AUDIT KEAMANAN: sebelumnya route registrasi merchant PUBLIK ini (tidak
+// perlu login) sama sekali tidak divalidasi -- payload apa pun (email tidak
+// valid, password kosong, koordinat di luar jangkauan) langsung diteruskan
+// ke service yang membuat akun User + Merchant baru di DB.
+router.post('/register', validateBody(registerMerchantSchema), merchantController.register);
 router.get('/products/search', merchantController.searchProducts);
 
 // ============================================================
@@ -42,19 +55,19 @@ router.get('/my/merchant', authorizeRoles('MERCHANT'), merchantController.getMin
 // ini tidak punya `:id` sama sekali, jadi SELALU gagal "Merchant tidak
 // ditemukan!" untuk pemilik toko manapun. Sekarang pakai varian "My*" yang
 // menyelesaikan merchant lewat token login (req.user.id), bukan URL param.
-router.put('/my/merchant', authorizeRoles('MERCHANT'), merchantController.updateMyMerchant);
+router.put('/my/merchant', authorizeRoles('MERCHANT'), validateBody(updateMerchantSchema), merchantController.updateMyMerchant);
 router.patch('/my/merchant/toggle', authorizeRoles('MERCHANT'), merchantController.toggleMyMerchantStatus);
 router.get('/my/stats', authorizeRoles('MERCHANT'), merchantController.getMyStats);
 // 🆕 (Link Merchant <-> Order): pesanan yang masuk ke toko sendiri.
 router.get('/my/orders', authorizeRoles('MERCHANT'), merchantController.getMyOrders);
-router.post('/my/products', authorizeRoles('MERCHANT'), merchantController.addMenuItem);
-router.post('/my/products/bulk', authorizeRoles('MERCHANT'), merchantController.bulkAddProducts);
-router.put('/my/products/:itemId', authorizeRoles('MERCHANT'), merchantController.updateMenuItem);
+router.post('/my/products', authorizeRoles('MERCHANT'), validateBody(addMenuItemSchema), merchantController.addMenuItem);
+router.post('/my/products/bulk', authorizeRoles('MERCHANT'), validateBody(bulkAddMenuItemsSchema), merchantController.bulkAddProducts);
+router.put('/my/products/:itemId', authorizeRoles('MERCHANT'), validateBody(updateMenuItemSchema), merchantController.updateMenuItem);
 router.delete('/my/products/:itemId', authorizeRoles('MERCHANT'), merchantController.deleteMenuItem);
 
 // Admin
-router.post('/', authorizeRoles('ADMIN'), merchantController.create);
-router.put('/:id', authorizeRoles('ADMIN'), merchantController.update);
+router.post('/', authorizeRoles('ADMIN'), validateBody(createMerchantByAdminSchema), merchantController.create);
+router.put('/:id', authorizeRoles('ADMIN'), validateBody(updateMerchantSchema), merchantController.update);
 // ✅ Ganti 'delete' menjadi 'removeMerchant'
 router.delete('/:id', authorizeRoles('ADMIN'), merchantController.removeMerchant);
 router.patch('/:id/toggle', authorizeRoles('ADMIN'), merchantController.toggleStatus);

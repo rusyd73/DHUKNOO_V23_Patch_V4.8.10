@@ -230,12 +230,54 @@ export const addMenuItemSchema = z.object({
   imageUrl: z.string().url('imageUrl harus berupa URL yang valid!').optional(),
 });
 
+// 🆕 SEBELUMNYA TIDAK PERNAH DIPAKAI: merchant.routes.ts punya 22 endpoint
+// dan SATU PUN tidak divalidasi Zod, termasuk endpoint yang menulis data
+// (registrasi toko baru, tambah produk, ubah harga) -- payload apa pun
+// (harga negatif, koordinat di luar jangkauan, field kosong) lolos begitu
+// saja ke service layer.
+export const registerMerchantSchema = z.object({
+  name: z.string().min(3, 'Nama merchant minimal 3 karakter!'),
+  category: z.string().min(1, 'Kategori wajib diisi!'),
+  address: z.string().min(3, 'Alamat minimal 3 karakter!'),
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  phone: z.string().optional(),
+  ownerEmail: z.string().email('Email owner tidak valid!'),
+  ownerPassword: z.string().min(6, 'Password owner minimal 6 karakter!'),
+  ownerFullName: z.string().min(3, 'Nama owner minimal 3 karakter!'),
+  ownerPhone: z.string().optional(),
+  isOpen: z.boolean().optional(),
+});
+
+// 🆕 Dipakai admin.create — sama seperti registerMerchantSchema tapi field
+// owner boleh datang lewat alias email/password/fullName/phone (lihat
+// MerchantController.create yang me-remap-nya sebelum memanggil service).
+export const createMerchantByAdminSchema = registerMerchantSchema
+  .omit({ ownerEmail: true, ownerPassword: true, ownerFullName: true, ownerPhone: true })
+  .extend({
+    email: z.string().email().optional(),
+    ownerEmail: z.string().email().optional(),
+    password: z.string().min(6).optional(),
+    ownerPassword: z.string().min(6).optional(),
+    fullName: z.string().min(3).optional(),
+    ownerFullName: z.string().min(3).optional(),
+    phone: z.string().optional(),
+    ownerPhone: z.string().optional(),
+  })
+  .refine((v) => v.email || v.ownerEmail, { message: 'Email owner wajib diisi!', path: ['ownerEmail'] })
+  .refine((v) => v.password || v.ownerPassword, { message: 'Password owner wajib diisi!', path: ['ownerPassword'] })
+  .refine((v) => v.fullName || v.ownerFullName, { message: 'Nama owner wajib diisi!', path: ['ownerFullName'] });
+
 export const updateMenuItemSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().optional(),
   price: z.number().min(0).optional(),
   imageUrl: z.string().url().optional(),
   isAvailable: z.boolean().optional(),
+});
+
+export const bulkAddMenuItemsSchema = z.object({
+  products: z.array(addMenuItemSchema).min(1, 'Minimal 1 produk wajib diisi!').max(200, 'Maksimal 200 produk sekaligus!'),
 });
 
 // ── Tariff Engine (Admin) ──────────────────────────────────────────────
