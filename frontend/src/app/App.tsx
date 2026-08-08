@@ -71,7 +71,34 @@ const DriverApp = React.lazy(() => import('../pages/DriverApp'));
 const AdminApp = React.lazy(() => import('../pages/AdminApp'));
 const MerchantApp = React.lazy(() => import('../pages/MerchantApp'));
 
-const queryClient = new QueryClient();
+// 🆕 OPTIMASI PERFORMA: sebelumnya `new QueryClient()` tanpa config sama
+// sekali, artinya staleTime default 0 -- SETIAP kali komponen mount/
+// remount (mis. pindah tab lalu balik lagi), React Query langsung
+// refetch walau datanya baru saja diambil beberapa detik lalu. Karena app
+// ini sudah punya socket-driven `invalidateQueries()` untuk update
+// realtime (order diterima, order baru, dst -- lihat DriverApp/
+// MerchantApp/CustomerApp), staleTime 0 jadi mubazir: query yang sama
+// bisa fetch ulang lewat network padahal datanya sudah pasti fresh dari
+// event socket. `mutations.retry: 0` sengaja BUKAN default (yang bernilai
+// 0 juga secara default, tapi dipertegas di sini) -- retry otomatis pada
+// mutasi (create order, charge payment, dst) BERBAHAYA: kalau request
+// pertama sebenarnya berhasil di server tapi response-nya tidak sampai ke
+// client (timeout jaringan), retry otomatis bisa menyebabkan aksi
+// terkirim dua kali (order dobel, pembayaran dobel).
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000, // data dianggap fresh 30 detik sebelum refetch otomatis
+      gcTime: 5 * 60_000, // cache disimpan 5 menit setelah tidak dipakai (default)
+      refetchOnWindowFocus: true,
+      retry: 2,
+      retryDelay: (attempt: number) => Math.min(1000 * 2 ** attempt, 10_000),
+    },
+    mutations: {
+      retry: 0,
+    },
+  },
+});
 
 // ============================================
 // LOADING FALLBACK
@@ -117,10 +144,24 @@ function DhuknooMainAppShell() {
 
   const [notification, setNotification] = useState<string | null>(null);
 
-  const triggerToast = (msg: string) => {
+  // 🆕 OPTIMASI PERFORMA: useCallback supaya referensi fungsi ini STABIL
+  // antar render. Sebelumnya didefinisikan ulang setiap render
+  // DhuknooMainAppShell (root shell yang sering re-render karena socket
+  // event, notifikasi, dll) dan diteruskan sebagai prop ke SEMUA halaman
+  // role (CustomerApp/DriverApp/MerchantApp/AdminApp) -- kalau halaman-
+  // halaman itu dibungkus React.memo(), referensi prop yang selalu
+  // berubah ini akan tetap memicu re-render setiap kali, meniadakan
+  // manfaat memo. Dependency array kosong karena hanya memakai `setState`
+  // (stabil dari React, tidak perlu di-declare).
+  const triggerToast = React.useCallback((msg: string) => {
     setNotification(msg);
     setTimeout(() => setNotification(null), 4000);
-  };
+  }, []);
+
+  // 🆕 Sama seperti triggerToast di atas — dulu `() => setRole(null)` ditulis
+  // inline di setiap `<XxxApp onBack={...} />` di bawah, jadi referensi baru
+  // setiap render walau perilakunya selalu sama.
+  const handleBackToLauncher = React.useCallback(() => setRole(null), [setRole]);
 
   // ============================================
   // SOCKET CONNECTION
@@ -262,16 +303,16 @@ function DhuknooMainAppShell() {
         ) : (
           <Suspense fallback={<AppLoadingFallback />}>
             {currentRole === 'CUSTOMER' && (
-              <CustomerApp onBack={() => setRole(null)} triggerToast={triggerToast} />
+              <CustomerApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
             )}
             {currentRole === 'DRIVER' && (
-              <DriverApp onBack={() => setRole(null)} triggerToast={triggerToast} />
+              <DriverApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
             )}
             {currentRole === 'MERCHANT' && (
-              <MerchantApp onBack={() => setRole(null)} triggerToast={triggerToast} />
+              <MerchantApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
             )}
             {currentRole === 'ADMIN' && (
-              <AdminApp onBack={() => setRole(null)} triggerToast={triggerToast} />
+              <AdminApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
             )}
           </Suspense>
         )}

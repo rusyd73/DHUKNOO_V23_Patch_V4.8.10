@@ -17,7 +17,7 @@ interface MerchantAppProps {
 
 type Tab = 'dashboard' | 'products' | 'orders' | 'settings';
 
-export default function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
+function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
   const { login, user } = useAuthStore();
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
   const [orderCount, setOrderCount] = useState(0);
@@ -169,3 +169,8 @@ export default function MerchantApp({ onBack, triggerToast }: MerchantAppProps) 
     </div>
   );
 }
+
+// 🆕 OPTIMASI PERFORMA: lihat komentar yang sama di CustomerApp.tsx --
+// mencegah seluruh MerchantApp re-render setiap kali parent re-render
+// karena alasan tidak terkait (mis. toast global).
+export default React.memo(MerchantApp);

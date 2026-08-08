@@ -269,8 +269,12 @@ export class PaymentService {
     }
   }
 
-  listPendingProofs() {
-    return this.paymentRepo.listPendingPaymentProofs();
+  async listPendingProofs() {
+    const [proofs, totalPending] = await Promise.all([
+      this.paymentRepo.listPendingPaymentProofs(),
+      this.paymentRepo.countPendingPaymentProofs(),
+    ]);
+    return { proofs, totalPending, truncated: totalPending > proofs.length };
   }
 
   /**

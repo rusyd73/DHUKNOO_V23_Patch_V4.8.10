@@ -57,9 +57,26 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
   const { data: documentsData } = useQuery({ queryKey: ['pendingDriverDocuments'], queryFn: AdminAPI.getPendingDriverDocuments });
   const { data: topupRequestsData } = useQuery({ queryKey: ['pendingTopups'], queryFn: AdminAPI.getPendingTopupRequests });
 
-  const proofs = proofsData?.proofs || [];
-  const documents = documentsData?.documents || [];
-  const topups = topupRequestsData?.topupRequests || [];
+  // 🆕 useMemo: array turunan ini di-rebuild ulang setiap render (termasuk
+  // render yang dipicu state lain seperti `tab`/`previewImageUrl`/toast) --
+  // dibungkus useMemo supaya hanya dihitung ulang saat data query-nya
+  // sendiri berubah.
+  const proofs = React.useMemo(() => proofsData?.proofs || [], [proofsData]);
+  const documents = React.useMemo(() => documentsData?.documents || [], [documentsData]);
+  const topups = React.useMemo(() => topupRequestsData?.topupRequests || [], [topupRequestsData]);
+
+  // 🆕 Backend sekarang membatasi antrean review ke 100 item terlama (lihat
+  // admin.routes.ts / payment.repository.ts) supaya tidak me-render ratusan
+  // kartu (dengan thumbnail gambar) sekaligus tanpa virtualisasi. Kalau
+  // antrean sungguhan lebih panjang dari itu, tampilkan peringatan supaya
+  // Admin tahu masih ada yang belum kelihatan, bukan mengira antrean sudah
+  // benar-benar kosong/selesai.
+  const proofsTruncated = proofsData?.truncated;
+  const proofsTotalPending = proofsData?.totalPending;
+  const documentsTruncated = documentsData?.truncated;
+  const documentsTotalPending = documentsData?.totalPending;
+  const topupsTruncated = topupRequestsData?.truncated;
+  const topupsTotalPending = topupRequestsData?.totalPending;
 
   const reviewProofMutation = useMutation({
     mutationFn: ({ proofId, status }: { proofId: string; status: 'APPROVED' | 'REJECTED' }) =>
@@ -131,6 +148,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
 
       {tab === 'proofs' && (
         <div className="flex flex-col gap-3">
+          {proofsTruncated && (
+            <div className="text-[10px] text-[#FFD700] bg-[#FFD700]/10 border border-[#FFD700]/30 rounded-lg px-3 py-2">
+              ⚠️ Menampilkan {proofs.length} dari {proofsTotalPending} bukti bayar yang menunggu (terlama duluan). Tinjau yang ada untuk memunculkan sisanya.
+            </div>
+          )}
           {proofs.length === 0 ? (
             <div className="text-center text-[10px] text-[#A5C9B8]/60 py-6 border border-dashed border-[#23583E] rounded-xl">Tidak ada bukti bayar order yang menunggu.</div>
           ) : proofs.map((p: any) => (
@@ -160,6 +182,8 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   >
                     <img
                       src={p.proofImageUrl}
+                      loading="lazy"
+                      decoding="async"
                       alt="Bukti Bayar Order"
                       className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105"
                     />
@@ -224,6 +248,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
 
       {tab === 'topups' && (
         <div className="flex flex-col gap-3">
+          {topupsTruncated && (
+            <div className="text-[10px] text-[#FFD700] bg-[#FFD700]/10 border border-[#FFD700]/30 rounded-lg px-3 py-2">
+              ⚠️ Menampilkan {topups.length} dari {topupsTotalPending} permintaan top-up yang menunggu (terlama duluan). Tinjau yang ada untuk memunculkan sisanya.
+            </div>
+          )}
           {topups.length === 0 ? (
             <div className="text-center text-[10px] text-[#A5C9B8]/60 py-6 border border-dashed border-[#23583E] rounded-xl">Tidak ada permintaan top-up deposit yang menunggu.</div>
           ) : topups.map((t: any) => (
@@ -282,7 +311,9 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={t.proofImageUrl} 
+                      src={t.proofImageUrl}
+                      loading="lazy"
+                      decoding="async" 
                       alt="Bukti Bayar Topup" 
                       className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105" 
                     />
@@ -352,6 +383,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
 
       {tab === 'documents' && (
         <div className="flex flex-col gap-3">
+          {documentsTruncated && (
+            <div className="text-[10px] text-[#FFD700] bg-[#FFD700]/10 border border-[#FFD700]/30 rounded-lg px-3 py-2">
+              ⚠️ Menampilkan {documents.length} dari {documentsTotalPending} dokumen yang menunggu (terlama duluan). Tinjau yang ada untuk memunculkan sisanya.
+            </div>
+          )}
           {documents.length === 0 ? (
             <div className="text-center text-[10px] text-[#A5C9B8]/60 py-6 border border-dashed border-[#23583E] rounded-xl">Tidak ada dokumen driver yang menunggu verifikasi.</div>
           ) : documents.map((d: any) => (
@@ -373,7 +409,9 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={d.imageUrl} 
+                      src={d.imageUrl}
+                      loading="lazy"
+                      decoding="async" 
                       alt="Dokumen Driver" 
                       className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105" 
                     />
@@ -1268,7 +1306,7 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
   );
 }
 
-export default function AdminApp({ onBack, triggerToast }: PortalProps) {
+function AdminApp({ onBack, triggerToast }: PortalProps) {
   const { login, logout, user } = useAuthStore();
   const queryClient = useQueryClient();
   const [selectedDriverDocsModal, setSelectedDriverDocsModal] = useState<any | null>(null);
@@ -1677,3 +1715,9 @@ export default function AdminApp({ onBack, triggerToast }: PortalProps) {
     </div>
   );
 }
+
+// 🆕 OPTIMASI PERFORMA: lihat komentar yang sama di CustomerApp.tsx --
+// mencegah seluruh AdminApp (termasuk ReviewPanel/TariffPanel/
+// AdminRecapSection di dalamnya) re-render setiap kali parent re-render
+// karena alasan tidak terkait (mis. toast global).
+export default React.memo(AdminApp);

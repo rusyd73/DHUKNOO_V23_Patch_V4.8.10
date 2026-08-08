@@ -44,7 +44,7 @@ interface PortalProps {
   triggerToast: (m: string) => void;
 }
 
-export default function DriverApp({ onBack, triggerToast }: PortalProps) {
+function DriverApp({ onBack, triggerToast }: PortalProps) {
   const { login, logout, user } = useAuthStore();
   const queryClient = useQueryClient();
 
@@ -905,3 +905,8 @@ export default function DriverApp({ onBack, triggerToast }: PortalProps) {
     </div>
   );
 }
+// 🆕 OPTIMASI PERFORMA: lihat komentar yang sama di CustomerApp.tsx --
+// mencegah seluruh DriverApp (peta, ring loop, listener socket, dst)
+// re-render setiap kali parent re-render karena alasan tidak terkait
+// (mis. toast global).
+export default React.memo(DriverApp);

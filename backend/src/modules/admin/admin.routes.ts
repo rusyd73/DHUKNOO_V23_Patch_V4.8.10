@@ -326,26 +326,42 @@ router.get(
   authorizeRoles('ADMIN') as any,
   async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const topupRequests = await prisma.topupRequest.findMany({
-        where: { status: 'PENDING_REVIEW' },
-        include: {
-          user: {
-            select: {
-              id: true,
-              fullName: true,
-              email: true,
-              role: true,
-              // User tidak punya kolom telepon sendiri — nomor telepon disimpan di
-              // level profile (CustomerProfile/DriverProfile). Request top-up bisa
-              // datang dari salah satu role, jadi ambil dari yang mana pun yang ada.
-              customerProfile: { select: { phoneNumber: true } },
-              driverProfile: { select: { phoneNumber: true } },
+      // 🆕 OPTIMASI PERFORMA: sebelumnya query ini TIDAK DIBATASI sama sekali
+      // -- kalau antrean top-up yang belum direview menumpuk (mis. CS libur,
+      // lonjakan promo), semuanya dikirim ke browser sekaligus dan di-render
+      // sebagai kartu (dengan thumbnail gambar) tanpa virtualisasi -- berat
+      // dan lambat. Dibatasi 100 terlama (FIFO, paling butuh direview
+      // duluan), dengan flag `truncated` supaya Admin tahu masih ada
+      // antrean di belakangnya walau tidak semuanya tampil sekaligus.
+      const TAKE_LIMIT = 100;
+      const [topupRequests, totalPending] = await Promise.all([
+        prisma.topupRequest.findMany({
+          where: { status: 'PENDING_REVIEW' },
+          include: {
+            user: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+                role: true,
+                // User tidak punya kolom telepon sendiri — nomor telepon disimpan di
+                // level profile (CustomerProfile/DriverProfile). Request top-up bisa
+                // datang dari salah satu role, jadi ambil dari yang mana pun yang ada.
+                customerProfile: { select: { phoneNumber: true } },
+                driverProfile: { select: { phoneNumber: true } },
+              },
             },
           },
-        },
-        orderBy: { createdAt: 'asc' },
+          orderBy: { createdAt: 'asc' },
+          take: TAKE_LIMIT,
+        }),
+        prisma.topupRequest.count({ where: { status: 'PENDING_REVIEW' } }),
+      ]);
+      return res.status(200).json({
+        topupRequests,
+        totalPending,
+        truncated: totalPending > TAKE_LIMIT,
       });
-      return res.status(200).json({ topupRequests });
     } catch (err: any) {
       return res.status(500).json({ error: err.message || 'Gagal mengambil daftar permintaan top-up.' });
     }
@@ -411,14 +427,19 @@ router.get(
   authorizeRoles('ADMIN') as any,
   async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const documents = await prisma.driverDocument.findMany({
-        where: { status: 'PENDING_REVIEW' },
-        include: {
-          driver: { include: { user: { select: { fullName: true, email: true } } } },
-        },
-        orderBy: { createdAt: 'asc' },
-      });
-      return res.status(200).json({ documents });
+      const TAKE_LIMIT = 100;
+      const [documents, totalPending] = await Promise.all([
+        prisma.driverDocument.findMany({
+          where: { status: 'PENDING_REVIEW' },
+          include: {
+            driver: { include: { user: { select: { fullName: true, email: true } } } },
+          },
+          orderBy: { createdAt: 'asc' },
+          take: TAKE_LIMIT,
+        }),
+        prisma.driverDocument.count({ where: { status: 'PENDING_REVIEW' } }),
+      ]);
+      return res.status(200).json({ documents, totalPending, truncated: totalPending > TAKE_LIMIT });
     } catch (err: any) {
       return res.status(500).json({ error: err.message || 'Gagal mengambil daftar dokumen.' });
     }

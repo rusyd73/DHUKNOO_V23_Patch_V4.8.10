@@ -49,7 +49,7 @@ interface PortalProps {
   triggerToast: (m: string) => void;
 }
 
-export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
+function CustomerApp({ onBack, triggerToast }: PortalProps) {
   const { login, logout, user } = useAuthStore();
   const queryClient = useQueryClient();
 
@@ -1085,3 +1085,12 @@ export default function CustomerApp({ onBack, triggerToast }: PortalProps) {
     </div>
   );
 }
+
+// 🆕 OPTIMASI PERFORMA: React.memo -- halaman ini hanya berisi SATU
+// instance yang di-mount (user hanya bisa jadi satu role dalam satu waktu),
+// tapi parent (DhuknooMainAppShell di App.tsx) bisa re-render sering (mis.
+// tiap kali toast notifikasi muncul/hilang). Tanpa memo, SELURUH pohon
+// CustomerApp (termasuk peta, listener socket, dll) ikut re-render setiap
+// kali itu terjadi walau props (onBack/triggerToast, sekarang stabil lewat
+// useCallback di App.tsx) tidak benar-benar berubah.
+export default React.memo(CustomerApp);

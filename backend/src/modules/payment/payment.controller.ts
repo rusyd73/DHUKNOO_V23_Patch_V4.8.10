@@ -86,8 +86,8 @@ export class PaymentController {
 
   listPendingProofs = async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const proofs = await this.paymentService.listPendingProofs();
-      return res.status(200).json({ proofs });
+      const result = await this.paymentService.listPendingProofs();
+      return res.status(200).json(result);
     } catch (err: any) {
       logger.error('PaymentController.listPendingProofs error: %s', err.message);
       return res.status(500).json({ error: 'Gagal mengambil daftar bukti bayar.' });

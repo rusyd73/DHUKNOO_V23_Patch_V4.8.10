@@ -31,6 +31,7 @@ export class PaymentRepository {
   }
 
   listPendingPaymentProofs() {
+    const TAKE_LIMIT = 100;
     return prisma.paymentProof.findMany({
       where: { status: 'PENDING_REVIEW' },
       include: {
@@ -42,7 +43,12 @@ export class PaymentRepository {
         },
       },
       orderBy: { createdAt: 'asc' },
+      take: TAKE_LIMIT,
     });
+  }
+
+  countPendingPaymentProofs() {
+    return prisma.paymentProof.count({ where: { status: 'PENDING_REVIEW' } });
   }
 
   /** Upsert supaya bisa upload ulang setelah bukti sebelumnya ditolak (1 order = maksimal 1 baris proof). */
