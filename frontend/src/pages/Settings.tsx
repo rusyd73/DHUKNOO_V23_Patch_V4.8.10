@@ -1,5 +1,5 @@
 // src/pages/Settings.tsx
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { useAuthStore } from '../store/useAuthStore';
 import { merchantApi } from '../api/merchant.api';
 import { playBellRingSound } from '../utils/audio';
@@ -10,6 +10,11 @@ import {
   Clock, Mail, User, Settings as SettingsIcon,
   VolumeX, Volume1
 } from 'lucide-react';
+
+// 🆕 Lazy-load LocationPicker (leaflet) — sama seperti pola yang sudah
+// dipakai di CustomerApp/DriverApp, supaya leaflet tidak ikut ter-bundle
+// ke halaman yang tidak butuh peta.
+const LocationPicker = React.lazy(() => import('../components/map/LocationPicker'));
 
 // ============================================
 // INTERFACES
@@ -22,6 +27,8 @@ interface StoreFormData {
   name: string;
   category: string;
   address: string;
+  latitude: number | null;
+  longitude: number | null;
   phone: string;
   imageUrl: string;
   isOpen: boolean;
@@ -45,6 +52,8 @@ export function MerchantSettings({ triggerToast }: MerchantSettingsProps = {}) {
     name: '',
     category: 'Kuliner',
     address: '',
+    latitude: null,
+    longitude: null,
     phone: '',
     imageUrl: '',
     isOpen: true,
@@ -99,6 +108,8 @@ export function MerchantSettings({ triggerToast }: MerchantSettingsProps = {}) {
             name: data.name || '',
             category: data.category || 'Kuliner',
             address: data.address || '',
+            latitude: typeof data.latitude === 'number' ? data.latitude : null,
+            longitude: typeof data.longitude === 'number' ? data.longitude : null,
             phone: data.phone || '',
             imageUrl: data.imageUrl || '',
             isOpen: data.isOpen ?? true,
@@ -127,6 +138,18 @@ export function MerchantSettings({ triggerToast }: MerchantSettingsProps = {}) {
       return;
     }
 
+    // 🆕 PERBAIKAN: sebelumnya lokasi (latitude/longitude) toko TIDAK PERNAH
+    // bisa diatur lewat UI mana pun -- baik saat registrasi (nilai default
+    // hardcode Malang untuk SEMUA merchant) maupun di sini. Akibatnya jarak
+    // dari toko ke titik antar (dasar hitung ongkir per-km & platform fee di
+    // tarif engine) SELALU salah untuk hampir semua merchant, dan titik
+    // jemput di peta driver juga ikut salah. Sekarang wajib set lokasi lewat
+    // peta/GPS sebelum bisa simpan.
+    if (storeForm.latitude === null || storeForm.longitude === null) {
+      notify('Titik lokasi toko di peta wajib diatur (klik peta atau pakai GPS) — ini menentukan perhitungan ongkir & titik jemput driver!', true);
+      return;
+    }
+
     setSavingStore(true);
     setError(null);
     
@@ -135,6 +158,8 @@ export function MerchantSettings({ triggerToast }: MerchantSettingsProps = {}) {
         name: storeForm.name.trim(),
         category: storeForm.category.trim() || undefined,
         address: storeForm.address.trim(),
+        latitude: storeForm.latitude,
+        longitude: storeForm.longitude,
         phone: storeForm.phone.trim() || undefined,
         imageUrl: storeForm.imageUrl.trim() || undefined,
         isOpen: storeForm.isOpen,
@@ -294,6 +319,37 @@ export function MerchantSettings({ triggerToast }: MerchantSettingsProps = {}) {
               onChange={(e) => setStoreForm({ ...storeForm, address: e.target.value })}
               className="w-full bg-[#05110A] border border-[#1F4A34] rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-[#22C55E]"
             />
+          </div>
+
+          {/* 🆕 Titik Lokasi Toko di Peta — WAJIB diisi. Ini basis perhitungan
+              jarak/ongkir per-km & platform fee di tarif engine, dan titik
+              jemput yang muncul di peta driver saat menerima order. */}
+          <div>
+            <label className="text-xs font-bold text-[#A5C9B8] block mb-1">
+              Titik Lokasi Toko di Peta <span className="text-red-400">*</span>
+            </label>
+            <Suspense
+              fallback={
+                <div className="h-[200px] flex items-center justify-center bg-[#06170E] border border-[#23583E] rounded-2xl text-[10px] text-[#A5C9B8] animate-pulse">
+                  Memuat peta...
+                </div>
+              }
+            >
+              <LocationPicker
+                label="Lokasi Toko"
+                initialCenter={{ lat: storeForm.latitude ?? -7.9666, lng: storeForm.longitude ?? 112.6326 }}
+                value={storeForm.latitude !== null && storeForm.longitude !== null ? { lat: storeForm.latitude, lng: storeForm.longitude } : null}
+                onChange={(pos) => setStoreForm((prev) => ({ ...prev, latitude: pos.lat, longitude: pos.lng }))}
+                address={storeForm.address}
+                onAddressChange={(addr) => setStoreForm((prev) => ({ ...prev, address: addr }))}
+                markerColor="green"
+              />
+            </Suspense>
+            {storeForm.latitude === null && (
+              <p className="text-[10px] text-amber-400 mt-1.5">
+                ⚠️ Lokasi belum diatur — klik peta di atas atau tekan "Gunakan Lokasi Saya Saat Ini (GPS)" sebelum menyimpan.
+              </p>
+            )}
           </div>
 
           {/* Image URL */}
