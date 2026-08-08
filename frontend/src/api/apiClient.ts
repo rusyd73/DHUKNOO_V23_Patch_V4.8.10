@@ -17,7 +17,7 @@ export const api = createApiClient(
   () => {
     const token = useAuthStore.getState().token;
     if (!token || token === "null" || token === "undefined") {
-      return undefined;
+      return null;
     }
     return token;
   },

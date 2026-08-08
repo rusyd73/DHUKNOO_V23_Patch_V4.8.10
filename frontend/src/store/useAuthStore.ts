@@ -1,6 +1,7 @@
 // frontend/src/store/useAuthStore.ts
 import { create } from 'zustand';
 import { connectSocket, disconnectSocket } from '../services/socket';
+import { AuthAPI } from '../api/auth.api';
 
 // ✅ Tipe Role yang benar (tanpa backtick)
 type Role = 'CUSTOMER' | 'DRIVER' | 'MERCHANT' | 'ADMIN' | null;
@@ -64,6 +65,14 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
+    // 🆕 Cabut refresh token di server juga (bukan cuma hapus di client).
+    // Fire-and-forget + catch diam-diam: logout LOKAL harus tetap berhasil
+    // walau request ini gagal (mis. user sedang offline saat menekan
+    // "Keluar") -- jangan sampai user "terjebak" tidak bisa logout hanya
+    // karena tidak ada koneksi internet.
+    AuthAPI.logout().catch(() => {
+      // Diabaikan dengan sengaja — lihat komentar di atas.
+    });
     localStorage.removeItem('dhuknoo_token');
     localStorage.removeItem('dhuknoo_refresh_token');
     localStorage.removeItem('dhuknoo_user');

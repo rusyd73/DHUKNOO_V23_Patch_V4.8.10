@@ -15,11 +15,6 @@
 
     "strict": true,
     "baseUrl": ".",
-    "paths": {
-      "@obama/shared-api": ["src/shared-packages/shared-api.ts"],
-      "@obama/shared-utils": ["src/shared-packages/shared-utils.ts"],
-      "@obama/shared-types": ["src/shared-packages/shared-types.ts"]
-    },
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true

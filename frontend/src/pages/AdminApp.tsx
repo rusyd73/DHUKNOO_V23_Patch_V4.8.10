@@ -1,11 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, Suspense } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { formatRupiah } from '@obama/shared-utils';
 import { sendAdminThankYouChat, openWhatsAppMessage } from '../utils/whatsapp';
 import { useAuthStore } from '../store/useAuthStore';
 import { AdminAPI, PaymentAPI, TariffAPI } from '../api';
 import AuthFlow from '../components/auth/AuthFlow';
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, Cell } from 'recharts';
 import {
   BarChart2,
   ClipboardList,
@@ -35,6 +34,14 @@ import {
 // charting "recharts" yang cukup berat dan HANYA dipakai di sini. Dipisah
 // ke file sendiri supaya bisa di-lazy-load lewat React.lazy(): kode admin
 // (dan recharts) sekarang hanya diunduh browser saat role admin dipilih.
+//
+// 🆕 OPTIMASI LEBIH LANJUT: `recharts` sendiri (~366KB) DIKELUARKAN dari
+// import statis di sini, dipindah ke CommissionAuditBarChart.tsx yang di
+// bawah ini di-load lewat React.lazy() -- supaya admin yang hanya membuka
+// tab Rules/Zones/Policies/Config (tidak butuh grafik) tidak ikut mengunduh
+// recharts sama sekali. recharts baru diunduh saat tab "commissionAudit"
+// (Audit Komisi) dibuka.
+const CommissionAuditBarChart = React.lazy(() => import('../components/admin/CommissionAuditBarChart'));
 
 interface PortalProps {
   onBack: () => void;
@@ -880,52 +887,15 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
               </div>
             ) : (
               <div className="w-full h-64 pt-2">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={auditData?.dailyData || []} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#23583E" vertical={false} />
-                    <XAxis
-                      dataKey="dayLabel"
-                      stroke="#A5C9B8"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={{ stroke: '#23583E' }}
-                    />
-                    <YAxis
-                      stroke="#A5C9B8"
-                      fontSize={10}
-                      tickLine={false}
-                      axisLine={{ stroke: '#23583E' }}
-                      tickFormatter={(val: number) => `Rp${(val / 1000).toFixed(0)}k`}
-                    />
-                    <Tooltip
-                      content={({ active, payload, label }: any) => {
-                        if (active && payload && payload.length) {
-                          const item = payload[0].payload;
-                          return (
-                            <div className="bg-[#0D2E1F] border border-[#00E575] p-3 rounded-xl shadow-xl text-xs flex flex-col gap-1">
-                              <span className="font-black text-[#FFD700]">{label}</span>
-                              <div className="text-white font-bold">
-                                Komisi: <span className="text-[#00E575]">{formatRupiah(item.totalCommission)}</span>
-                              </div>
-                              <div className="text-[#A5C9B8] text-[10px]">
-                                Order Selesai: <strong className="text-white">{item.orderCount}</strong>
-                              </div>
-                            </div>
-                          );
-                        }
-                        return null;
-                      }}
-                    />
-                    <Bar dataKey="totalCommission" radius={[6, 6, 0, 0]}>
-                      {(auditData?.dailyData || []).map((entry: any, index: number) => (
-                        <Cell
-                          key={`cell-${index}`}
-                          fill={entry.totalCommission > 0 ? '#00E575' : '#1e3e2d'}
-                        />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                <Suspense
+                  fallback={
+                    <div className="h-full flex items-center justify-center text-xs text-[#A5C9B8] animate-pulse">
+                      Memuat komponen grafik...
+                    </div>
+                  }
+                >
+                  <CommissionAuditBarChart dailyData={auditData?.dailyData || []} />
+                </Suspense>
               </div>
             )}
           </div>

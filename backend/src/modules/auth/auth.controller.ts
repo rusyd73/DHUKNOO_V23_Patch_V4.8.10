@@ -50,21 +50,12 @@ export class AuthController {
     }
   };
 
-  // ✅ PERBAIKAN 2: Login dengan debug log
   login = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { email, password } = req.body;
 
-      // ✅ Debug log
-      logger.info('🔍 LOGIN ATTEMPT:');
-      logger.info('  Raw email:', email);
-      logger.info('  Email length:', email?.length);
-      logger.info('  Email char codes:', email ? [...email].map(c => c.charCodeAt(0)) : 'null');
-      logger.info('  User-Agent:', req.headers['user-agent']);
-
       // ✅ Normalize email
       const normalizedEmail = email?.toLowerCase().trim();
-      logger.info('  Normalized email:', normalizedEmail);
 
       // ✅ Validasi input
       if (!normalizedEmail || !password) {
@@ -76,7 +67,7 @@ export class AuthController {
       // ✅ Panggil service dengan email yang sudah dinormalisasi
       const result = await this.authService.loginUser(normalizedEmail, password);
 
-      logger.info('✅ Login successful for user:', result.user.id);
+      logger.info(`✅ Login successful: userId=${result.user.id} role=${result.user.role}`);
 
       // Write Audit Log
       await AuditLogger.log(result.user.id, 'USER_LOGIN', `User ${normalizedEmail} masuk sistem.`);
@@ -84,7 +75,6 @@ export class AuthController {
       return res.status(200).json(result);
     } catch (err: any) {
       logger.error('❌ Login controller error: %s', err.message);
-      logger.error('  Stack:', err.stack);
       const status = err instanceof AppError ? err.statusCode : 401;
       return res.status(status).json({ error: err.message });
     }
@@ -152,6 +142,22 @@ export class AuthController {
       logger.error('Confirm password reset controller error: %s', err.message);
       const status = err instanceof AppError ? err.statusCode : 400;
       return res.status(status).json({ error: err.message });
+    }
+  };
+
+  // 🆕 LOGOUT — cabut refresh token server-side.
+  logout = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user?.id;
+      if (!userId) {
+        return res.status(401).json({ error: 'Pengguna tidak terautentikasi!' });
+      }
+      const result = await this.authService.logout(userId);
+      await AuditLogger.log(userId, 'USER_LOGOUT', 'User keluar dari sesi.');
+      return res.status(200).json(result);
+    } catch (err: any) {
+      logger.error('Logout controller error: %s', err.message);
+      return res.status(500).json({ error: 'Gagal keluar dari sesi.' });
     }
   };
 

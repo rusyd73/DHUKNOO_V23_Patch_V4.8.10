@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
+import helmet from 'helmet';
 import swaggerUi from 'swagger-ui-express';
 import { logger } from './config/logger';
 import { ENV } from './config/env';
@@ -70,6 +71,22 @@ if (process.env.NODE_ENV !== 'test') {
 // 2. Register Global Middlewares
 // CORS dibatasi ke ALLOWED_ORIGINS (env, comma-separated). Kalau belum diset,
 // fallback ke "*" supaya development tetap mudah — TAPI wajib diisi di production.
+// 🆕 AUDIT KEAMANAN: helmet menambahkan header keamanan standar (X-Frame-Options,
+// X-Content-Type-Options: nosniff, X-DNS-Prefetch-Control, Strict-Transport-Security
+// saat HTTPS, dll) yang SEBELUMNYA sama sekali tidak ada. contentSecurityPolicy
+// dimatikan secara eksplisit di sini (bukan lupa) karena server ini juga
+// menyajikan SPA frontend-nya sendiri (lihat bagian "Serve Vite frontend" di
+// bawah) -- CSP default Helmet akan memblokir script/style yang di-inject Vite
+// tanpa audit sumber daya yang teliti dulu. crossOriginResourcePolicy diset
+// cross-origin karena foto KTP/STNK/bukti bayar di /uploads perlu bisa dimuat
+// dari origin frontend yang berbeda (mis. app.dhuknoo.id memuat gambar dari
+// api.dhuknoo.id).
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
 app.use(
   cors({
     origin: ENV.ALLOWED_ORIGINS.length > 0 ? ENV.ALLOWED_ORIGINS : '*',

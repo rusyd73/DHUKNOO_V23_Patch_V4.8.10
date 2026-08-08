@@ -19,6 +19,7 @@ export default defineConfig({
           leaflet: ['leaflet', 'react-leaflet'],
           query: ['@tanstack/react-query'],
           icons: ['lucide-react'],
+          charts: ['recharts'],
         },
       },
     },

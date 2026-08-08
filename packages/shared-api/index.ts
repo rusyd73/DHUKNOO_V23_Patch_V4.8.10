@@ -69,6 +69,11 @@ export const API_ENDPOINTS = {
     // 🆕 PERBAIKAN #1: Lupa/Reset Password
     requestPasswordReset: '/api/auth/reset-password-request',
     confirmPasswordReset: '/api/auth/reset-password-confirm',
+    // 🆕 Logout server-side: mencabut refresh token (lihat
+    // backend/src/modules/auth/auth.routes.ts POST /api/auth/logout).
+    // Sebelumnya tidak ada endpoint ini sama sekali -- "logout" hanya
+    // menghapus token di client, refresh token lama tetap valid di server.
+    logout: '/api/auth/logout',
   },
   // Alias historis yang tetap dipertahankan backend untuk kompatibilitas mundur.
   // Untuk kode baru, lebih baik pakai `order` dan `wallet` di bawah — keduanya

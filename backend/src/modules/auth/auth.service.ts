@@ -270,11 +270,39 @@ export class AuthService {
         { expiresIn: '15m' }
       );
 
-      return { accessToken };
+      // 🆕 ROTASI refresh token: keluarkan token BARU dan simpan ke DB,
+      // gantikan yang lama. SEBELUMNYA refresh token yang sama dipakai
+      // ulang selama 7 hari penuh -- kalau bocor (mis. lewat XSS atau
+      // penyimpanan client yang tidak aman), penyerang bisa memakainya
+      // berkali-kali sampai kedaluwarsa sendiri. Dengan rotasi, setiap
+      // refresh token hanya valid SEKALI PAKAI; refresh token lama yang
+      // dipakai ulang (baik oleh user asli maupun penyerang) akan otomatis
+      // ditolak di pengecekan `user.refreshToken !== token` di atas pada
+      // permintaan berikutnya.
+      const newRefreshToken = jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        ENV.JWT_REFRESH_SECRET,
+        { expiresIn: '7d' }
+      );
+      await this.authRepository.updateRefreshToken(user.id, newRefreshToken);
+
+      return { accessToken, refreshToken: newRefreshToken };
     } catch (err) {
       logger.error('Error during token refresh exchange: %s', (err as Error).message || err);
       throw new AppError('Autentikasi gagal. Sesi Anda kedaluwarsa!', 401);
     }
+  }
+
+  // 🆕 LOGOUT — sebelumnya tidak ada endpoint ini sama sekali, artinya tidak
+  // ada cara server-side untuk mencabut refresh token seseorang (mis. saat
+  // HP hilang/dicuri, atau user menekan tombol "Keluar"). "Logout" client
+  // hanya menghapus token dari local storage, tapi refresh token-nya TETAP
+  // valid sampai 7 hari kalau ada yang menyalinnya. Sekarang refreshToken
+  // di DB langsung di-null-kan, jadi permintaan /refresh berikutnya dengan
+  // token lama akan ditolak (lihat pengecekan di handleRefreshToken di atas).
+  async logout(userId: string) {
+    await this.authRepository.updateRefreshToken(userId, null);
+    return { message: 'Berhasil keluar dari sesi ini.' };
   }
 
   async changePassword(userId: string, oldPlain: string, newPlain: string) {

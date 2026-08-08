@@ -11,6 +11,9 @@ export const AuthAPI = {
   refresh: async (refreshToken: string) =>
     (await api.post(API_ENDPOINTS.auth.refresh, { refreshToken })).data,
 
+  // 🆕 Cabut refresh token server-side saat user benar-benar logout.
+  logout: async () => (await api.post(API_ENDPOINTS.auth.logout)).data,
+
   getProfile: async () =>
     (await api.get(API_ENDPOINTS.auth.profile)).data,
 

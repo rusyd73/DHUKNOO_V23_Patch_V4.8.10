@@ -37,6 +37,7 @@ router.post(
 
 // Protected routes
 router.get('/profile', authenticateToken as any, authController.getProfile as any);
+router.post('/logout', authenticateToken as any, authController.logout as any);
 router.post('/change-password', authenticateToken as any, authRateLimiter, validateBody(changePasswordSchema), authController.changePassword as any);
 
 export const authRouter = router;
