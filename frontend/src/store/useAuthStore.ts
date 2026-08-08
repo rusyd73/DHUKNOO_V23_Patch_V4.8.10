@@ -65,14 +65,24 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
-    // 🆕 Cabut refresh token di server juga (bukan cuma hapus di client).
-    // Fire-and-forget + catch diam-diam: logout LOKAL harus tetap berhasil
-    // walau request ini gagal (mis. user sedang offline saat menekan
-    // "Keluar") -- jangan sampai user "terjebak" tidak bisa logout hanya
-    // karena tidak ada koneksi internet.
-    AuthAPI.logout().catch(() => {
-      // Diabaikan dengan sengaja — lihat komentar di atas.
-    });
+    // 🆕 Guard anti-reentrant: kalau logout() sudah pernah dipanggil dan
+    // token sudah kosong, jangan panggil AuthAPI.logout() lagi (tidak ada
+    // gunanya — tidak ada sesi untuk dicabut — dan mencegah request
+    // berulang kalau logout() ternyata terpanggil dari beberapa tempat
+    // hampir bersamaan).
+    const alreadyLoggedOut = !useAuthStore.getState().token && !useAuthStore.getState().refreshToken;
+    if (!alreadyLoggedOut) {
+      // Cabut refresh token di server juga (bukan cuma hapus di client).
+      // Fire-and-forget + catch diam-diam: logout LOKAL harus tetap berhasil
+      // walau request ini gagal (mis. user sedang offline saat menekan
+      // "Keluar") -- jangan sampai user "terjebak" tidak bisa logout hanya
+      // karena tidak ada koneksi internet. Request ini sendiri DIKECUALIKAN
+      // dari alur refresh-otomatis di apiClient.ts, jadi kalaupun gagal
+      // 401, TIDAK akan memicu logout() lagi (lihat komentar di sana).
+      AuthAPI.logout().catch(() => {
+        // Diabaikan dengan sengaja — lihat komentar di atas.
+      });
+    }
     localStorage.removeItem('dhuknoo_token');
     localStorage.removeItem('dhuknoo_refresh_token');
     localStorage.removeItem('dhuknoo_user');
