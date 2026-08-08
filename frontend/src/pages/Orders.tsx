@@ -9,6 +9,8 @@
 // ✅ TAMBAHAN: Auto-refresh realtime via socket event (merchant_new_order, order_status_changed, order_paid — lihat MerchantApp.tsx)
 import React, { useEffect, useState } from 'react';
 import { merchantApi } from '../api/merchant.api';
+import { SkeletonList } from '../components/common/Skeleton';
+import { QueryErrorState } from '../components/common/QueryErrorState';
 import { Loader2, Package, User, Bike, RefreshCw, Bell, CheckCircle, XCircle, Truck } from 'lucide-react';
 
 interface OrderItemRow {
@@ -198,15 +200,9 @@ export function MerchantOrders() {
           LOADING STATE
           ========================================== */}
       {loading && !isRefreshing ? (
-        <div className="flex items-center justify-center py-16 text-[#A5C9B8] gap-2">
-          <Loader2 className="w-5 h-5 animate-spin text-[#22C55E]" /> 
-          <span>Memuat pesanan...</span>
-        </div>
+        <SkeletonList count={4} />
       ) : error ? (
-        <div className="bg-red-500/10 border border-red-500/30 text-red-300 rounded-2xl p-4 text-sm flex items-center gap-2">
-          <XCircle className="w-4 h-4 flex-shrink-0" />
-          <span>{error}</span>
-        </div>
+        <QueryErrorState message={error} onRetry={() => loadOrders(false)} />
       ) : orders.length === 0 ? (
         <div className="text-center py-16 bg-[#0D2E1F] rounded-3xl border border-[#23583E]">
           <Package className="w-12 h-12 text-[#23583E] mx-auto mb-3" />

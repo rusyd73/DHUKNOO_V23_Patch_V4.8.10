@@ -1,6 +1,8 @@
 // src/app/App.tsx
 import React, { useState, useEffect, Suspense } from 'react';
 import { socket, connectSocket } from "../services/socket";
+import { ErrorBoundary } from "../components/common/ErrorBoundary";
+import { OfflineBanner } from "../components/common/OfflineBanner";
 import { formatRupiah } from '@obama/shared-utils';
 import { playBellRingSound, startRingLoop, stopRingLoop } from '../utils/audio';
 import { 
@@ -118,7 +120,10 @@ function AppLoadingFallback() {
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <DhuknooMainAppShell />
+      <ErrorBoundary boundaryName="Aplikasi DHUKNOO">
+        <OfflineBanner />
+        <DhuknooMainAppShell />
+      </ErrorBoundary>
     </QueryClientProvider>
   );
 }
@@ -303,16 +308,24 @@ function DhuknooMainAppShell() {
         ) : (
           <Suspense fallback={<AppLoadingFallback />}>
             {currentRole === 'CUSTOMER' && (
-              <CustomerApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              <ErrorBoundary boundaryName="Dashboard Customer">
+                <CustomerApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              </ErrorBoundary>
             )}
             {currentRole === 'DRIVER' && (
-              <DriverApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              <ErrorBoundary boundaryName="Dashboard Driver">
+                <DriverApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              </ErrorBoundary>
             )}
             {currentRole === 'MERCHANT' && (
-              <MerchantApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              <ErrorBoundary boundaryName="Dashboard Merchant">
+                <MerchantApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              </ErrorBoundary>
             )}
             {currentRole === 'ADMIN' && (
-              <AdminApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              <ErrorBoundary boundaryName="Dashboard Admin">
+                <AdminApp onBack={handleBackToLauncher} triggerToast={triggerToast} />
+              </ErrorBoundary>
             )}
           </Suspense>
         )}

@@ -8,6 +8,8 @@ import { DriverAPI, UploadAPI, WalletAPI, PaymentAPI, LocationAPI } from '../api
 import { OrderChatBox } from '../components/chat/OrderChatBox';
 import { TopupModal } from '../components/modals/SharedModals';
 import AuthFlow from '../components/auth/AuthFlow';
+import { SkeletonList } from '../components/common/Skeleton';
+import { QueryErrorState } from '../components/common/QueryErrorState';
 import {
   AlertTriangle,
   ClipboardList,
@@ -56,7 +58,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
   });
 
   // Fetch active available jobs
-  const { data: jobsData, isLoading: isJobsLoading, refetch: refetchJobs } = useQuery({
+  const { data: jobsData, isLoading: isJobsLoading, isError: isJobsError, refetch: refetchJobs } = useQuery({
     queryKey: ['driverJobs'],
     queryFn: DriverAPI.getJobs,
     enabled: !!user,
@@ -741,7 +743,9 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 Silakan nyalakan status harian Anda ke **ONLINE** terlebih dahulu untuk mendeteksi lowongan pesanan aktif.
               </div>
             ) : isJobsLoading ? (
-              <div className="text-xs text-[#A5C9B8] text-center py-4">Memindai koordinat...</div>
+              <SkeletonList count={3} />
+            ) : isJobsError ? (
+              <QueryErrorState message="Gagal memuat daftar order. Periksa koneksi internet Anda." onRetry={() => refetchJobs()} />
             ) : !jobsData?.jobs || jobsData.jobs.filter((j: any) => j.status === 'PENDING').length === 0 ? (
               <div className="p-8 bg-[#06170E] border border-dashed border-[#23583E] rounded-2xl text-center text-xs text-[#A5C9B8]/70">
                 Belum ada pesanan masuk saat ini di wilayah Malang Raya. Menunggu orderan baru...

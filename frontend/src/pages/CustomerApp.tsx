@@ -7,6 +7,8 @@ import { CustomerAPI, UploadAPI, OrderAPI, PaymentAPI } from '../api';
 import { OrderChatBox } from '../components/chat/OrderChatBox';
 import { TopupModal, QrisCameraScannerModal } from '../components/modals/SharedModals';
 import AuthFlow from '../components/auth/AuthFlow';
+import { SkeletonList } from '../components/common/Skeleton';
+import { QueryErrorState } from '../components/common/QueryErrorState';
 import MerchantOrderModal from '../components/customer/MerchantOrderModal';
 import {
   Camera,
@@ -82,7 +84,7 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   });
 
   // Fetch customer orders
-  const { data: ordersData, isLoading: isOrdersLoading, refetch: refetchOrders } = useQuery({
+  const { data: ordersData, isLoading: isOrdersLoading, isError: isOrdersError, refetch: refetchOrders } = useQuery({
     queryKey: ['customerOrders'],
     queryFn: CustomerAPI.getOrders,
     enabled: !!user,
@@ -905,7 +907,9 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
             </span>
 
             {isOrdersLoading ? (
-              <div className="text-xs text-[#A5C9B8] text-center py-6">Memuat riwayat...</div>
+              <SkeletonList count={3} />
+            ) : isOrdersError ? (
+              <QueryErrorState message="Gagal memuat riwayat order. Periksa koneksi internet Anda." onRetry={() => refetchOrders()} />
             ) : !ordersData?.orders || ordersData.orders.length === 0 ? (
               <div className="text-xs text-[#A5C9B8]/60 text-center py-8 border border-dashed border-[#23583E] rounded-xl bg-[#06170E]">
                 Belum ada perjalanan dipesan di akun ini.
