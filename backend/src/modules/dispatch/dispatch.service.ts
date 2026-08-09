@@ -16,6 +16,7 @@ import { DISPATCH_CONSTANTS } from "./dispatch.constants";
 
 import { prisma } from "../../config/prisma";
 import { logger } from "../../config/logger";
+import { driverEligibilityService } from "../driver/driver-eligibility.service";
 
 import {
   DispatchCandidate,
@@ -169,7 +170,7 @@ export class DispatchService {
 
 
 
-      const candidates: DispatchCandidate[] =
+      let candidates: DispatchCandidate[] =
 
 
         nearestDrivers
@@ -194,15 +195,16 @@ export class DispatchService {
           // siapa saja driver yang online/aktif (toggle ON) berhak menerima
           // publikasi order ini, terlepas dari serviceType profil driver
           // tsb (BIKE/CAR/SEND semua bisa dapat tawaran SEND/MART).
+          //
+          // 🆕 SATUKAN ELIGIBILITY: aturan ini sekarang dari
+          // DriverEligibilityService.matchesServiceType() -- sumber
+          // kebenaran yang sama dipakai Auto-Accept & manual accept, supaya
+          // tidak ada lagi kasus driver ditawari order MART di sini tapi
+          // ditolak salah saat mencoba klaim manual order MART serupa.
           .filter(
-
             driver => {
-              if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") {
-                return true;
-              }
-
               const profile = availableMap.get(driver.driverId);
-              return profile && (profile as any).serviceType === request.order.serviceType;
+              return driverEligibilityService.matchesServiceType(request.order.serviceType, (profile as any)?.serviceType);
             }
 
           )
@@ -270,6 +272,13 @@ export class DispatchService {
 
           );
 
+      // 🆕 GERBANG DEPOSIT: sebelumnya Dispatch Engine TIDAK PERNAH mengecek
+      // saldo deposit driver sama sekali -- driver dengan saldo di bawah
+      // minimum (bahkan Rp0) tetap ditawari order lewat jalur ini, padahal
+      // jalur manual accept akan menolak mereka. Sekarang konsisten dengan
+      // DriverEligibilityService yang sama dipakai Auto-Accept & manual
+      // accept (lihat driver-eligibility.service.ts).
+      candidates = await driverEligibilityService.filterByDeposit(candidates);
 
 
 
@@ -281,7 +290,7 @@ export class DispatchService {
       */
 
 
-      logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL setelah filter jarak+klasifikasi (serviceType=${request.order.serviceType}) -- ${candidates.length === 0 ? 'TIDAK ADA kandidat, dispatch akan berhenti di sini!' : candidates.map(c => `${c.driverId}(autoAccept=${c.autoAcceptEnabled})`).join(', ')}`);
+      logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL setelah filter jarak+klasifikasi+deposit (serviceType=${request.order.serviceType}) -- ${candidates.length === 0 ? 'TIDAK ADA kandidat, dispatch akan berhenti di sini!' : candidates.map(c => `${c.driverId}(autoAccept=${c.autoAcceptEnabled})`).join(', ')}`);
 
       DispatchState.create(
 

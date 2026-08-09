@@ -10,8 +10,8 @@ import { AuditLogger } from "../../../core/logging/audit.logger";
 import { SocketService } from "../../../websocket/socket";
 import { updateOrderStatusSchema } from "../../../core/validation/schemas";
 import { OrderStatus } from "@prisma/client";
-import { TariffEngineService } from "../../tariff/tariff.service";
 import { PaymentService } from "../../payment/payment.service";
+import { driverEligibilityService } from "../driver-eligibility.service";
 
 const paymentService = new PaymentService();
 
@@ -139,11 +139,12 @@ router.post(
       }
 
       // Gerbang deposit: saldo di bawah minimum tidak boleh menerima order.
-      const driverWallet = await prisma.wallet.findUnique({ where: { userId } });
-      const minimumDeposit = await new TariffEngineService().getMinimumDriverDeposit();
-      const currentBalance = Number(driverWallet?.balance ?? 0);
+      // 🆕 SATUKAN ELIGIBILITY: sekarang dari DriverEligibilityService yang
+      // sama dipakai Dispatch Engine & Auto-Accept (lihat
+      // driver-eligibility.service.ts) -- bukan lagi logika terpisah di sini.
+      const { eligible: hasEnoughDeposit, currentBalance, minimumDeposit } = await driverEligibilityService.checkDeposit(userId);
 
-      if (currentBalance < minimumDeposit) {
+      if (!hasEnoughDeposit) {
         return res.status(403).json({
           error:
             `Saldo deposit Anda (Rp${currentBalance.toLocaleString("id-ID")}) ` +
@@ -154,14 +155,18 @@ router.post(
       // KUNCI KLASIFIKASI: driver motor tidak boleh ambil order mobil, dsb —
       // dicek terhadap jenis layanan yang didaftarkan driver ini.
       //
-      // PENGECUALIAN: order layanan SEND (kirim barang) TIDAK memakai
-      // klasifikasi -- driver BIKE maupun CAR yang online boleh langsung
-      // menerima order SEND, tanpa perlu serviceType profil mereka SEND.
+      // 🆕 SATUKAN ELIGIBILITY (bug diperbaiki): sebelumnya HANYA order SEND
+      // yang dikecualikan dari klasifikasi di sini, padahal Dispatch Engine
+      // & Auto-Accept sama-sama mengecualikan SEND *dan* MART. Akibatnya
+      // driver bisa ditawari order MART lewat dispatch/auto-accept tapi
+      // ditolak SALAH di sini kalau mencoba klaim manual order MART serupa.
+      // Sekarang memakai aturan yang SAMA persis (matchesServiceType) di
+      // ketiga jalur -- lihat driver-eligibility.service.ts.
       const orderToClaim = await prisma.order.findUnique({ where: { id: orderId }, select: { serviceType: true } });
       if (!orderToClaim) {
         return res.status(404).json({ error: "Order tidak ditemukan!" });
       }
-      if (orderToClaim.serviceType !== "SEND" && orderToClaim.serviceType !== (driverProfile as any).serviceType) {
+      if (!driverEligibilityService.matchesServiceType(orderToClaim.serviceType, (driverProfile as any).serviceType)) {
         return res.status(403).json({
           error: `Order ini untuk layanan ${orderToClaim.serviceType}, sedangkan akun Anda terdaftar sebagai driver ${(driverProfile as any).serviceType}.`,
         });

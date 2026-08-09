@@ -1,13 +1,16 @@
 import { Router, Response } from 'express';
+import bcrypt from 'bcryptjs';
 import { authenticateToken, AuthenticatedRequest, authorizeRoles } from '../../core/middleware/auth.middleware';
 import { prisma } from '../../config/prisma';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { validateBody } from '../../core/middleware/validation.middleware';
-import { reviewDriverDocumentSchema } from '../../core/validation/schemas';
+import { reviewDriverDocumentSchema, createAdminSchema, adminWalletCreditSchema } from '../../core/validation/schemas';
 import { buildAdminRecap, RecapTimeframe } from './admin-recap.service';
 import { buildRecapExcel, buildRecapPdf } from './admin-export.service';
 import { SocketService } from '../../websocket/socket';
 import { RedisService } from '../../config/redis';
+import { AppError } from '../../core/errors/AppError';
+import { WalletRepository } from '../wallet/wallet.repository';
 
 const router = Router();
 
@@ -688,6 +691,117 @@ router.get(
   }
 );
 
+
+// 🆕 AUDIT KEAMANAN: satu-satunya jalur (selain seed database awal) untuk
+// membuat akun ADMIN baru, sekarang bahwa POST /api/auth/register publik
+// tidak lagi menerima role:'ADMIN' (lihat core/validation/schemas.ts
+// registerSchema). Dilindungi ganda: authenticateToken (harus login) DAN
+// authorizeRoles('ADMIN') (harus admin) -- hanya admin yang sudah ada yang
+// bisa membuat admin baru, mata rantai kepercayaan tetap terjaga sejak
+// admin pertama dari seed.
+router.post(
+  '/create-admin',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  validateBody(createAdminSchema) as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { email, password, fullName, phone } = req.body;
+      const normalizedEmail = email.toLowerCase().trim();
+
+      const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+      if (existing) {
+        throw new AppError('Email sudah terdaftar di sistem!', 400);
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const passwordHash = await bcrypt.hash(password, salt);
+
+      const newAdmin = await prisma.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          fullName,
+          phone,
+          role: 'ADMIN',
+        },
+        select: { id: true, email: true, fullName: true, role: true, createdAt: true },
+      });
+
+      // Wallet kosong untuk admin baru, konsisten dengan pola seed.ts.
+      await prisma.wallet.create({ data: { userId: newAdmin.id, balance: 0 } });
+
+      await AuditLogger.log(
+        req.user!.id,
+        'ADMIN_CREATE_ADMIN',
+        `Admin ${req.user!.id} membuat akun admin baru: ${normalizedEmail} (${newAdmin.id})`
+      );
+
+      return res.status(201).json({ admin: newAdmin });
+    } catch (err: any) {
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Gagal membuat akun admin.' });
+    }
+  }
+);
+
+// 🆕 AUDIT KEAMANAN: jalur SATU-SATUNYA yang sah bagi admin untuk menambah
+// saldo user LAIN secara langsung tanpa lewat antrean TopupRequest (mis.
+// kompensasi kesalahan sistem, refund manual di luar order). Menggantikan
+// bypass lama di POST /api/wallet/topup (role ADMIN) yang menyasar wallet
+// SENDIRI tanpa target eksplisit dan tanpa alasan tercatat -- itu celah
+// self-dealing (admin manapun bisa mencetak saldo sendiri tanpa batas).
+// Endpoint ini WAJIB target user lain (tidak bisa menyasar diri sendiri),
+// WAJIB alasan (untuk audit), dan dibatasi Rp50 juta per transaksi.
+router.post(
+  '/wallet/credit',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  validateBody(adminWalletCreditSchema) as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const adminId = req.user!.id;
+      const { targetUserId, amount, reason } = req.body;
+
+      if (targetUserId === adminId) {
+        throw new AppError('Admin tidak boleh menambah saldo wallet sendiri lewat endpoint ini!', 400);
+      }
+
+      const targetUser = await prisma.user.findUnique({ where: { id: targetUserId } });
+      if (!targetUser) {
+        throw new AppError('User tujuan tidak ditemukan!', 404);
+      }
+
+      const wallet = await prisma.wallet.upsert({
+        where: { userId: targetUserId },
+        create: { userId: targetUserId, balance: 0 },
+        update: {},
+      });
+
+      const walletRepo = new WalletRepository();
+      const result = await prisma.$transaction(async (tx) => {
+        return walletRepo.applyDelta(
+          tx,
+          wallet.id,
+          amount,
+          'TOPUP',
+          `Kredit manual oleh Admin: ${reason}`
+        );
+      });
+
+      await AuditLogger.log(
+        adminId,
+        'ADMIN_WALLET_CREDIT',
+        `Admin ${adminId} menambah saldo Rp${Number(amount).toLocaleString('id-ID')} ke wallet user ${targetUserId} (${targetUser.email}). Alasan: ${reason}`
+      );
+
+      return res.status(200).json({ wallet: result.wallet, transaction: result.transaction });
+    } catch (err: any) {
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Gagal menambah saldo wallet.' });
+    }
+  }
+);
 
 export const adminRouter = router;
 

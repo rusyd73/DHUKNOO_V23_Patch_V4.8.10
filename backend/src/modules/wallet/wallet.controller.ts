@@ -89,7 +89,6 @@ export class WalletController {
   topup = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
-      const role = req.user!.role;
       const { amount, method, proofImageUrl, note } = req.body;
       const parsedAmount = Number(amount);
 
@@ -97,19 +96,20 @@ export class WalletController {
         return res.status(400).json({ error: 'Nominal top-up minimal adalah Rp 5.000!' });
       }
 
-      // Jika yang melakukan topup adalah ADMIN, saldo langsung ditambahkan
-      if (role === 'ADMIN') {
-        const result = await this.walletService.topup(userId, parsedAmount);
-        await AuditLogger.log(userId, 'ADMIN_DIRECT_TOPUP', `Top-up langsung oleh Admin sebesar Rp${parsedAmount.toLocaleString('id-ID')}`);
-        return res.status(200).json({
-          message: 'Top-up saldo langsung berhasil!',
-          wallet: result.wallet,
-          transaction: result.transaction,
-        });
-      }
-
-      // Jika CUSTOMER atau DRIVER, buatkan TopupRequest (status PENDING_REVIEW).
-      // Saldo TIDAK BERTAMBAH OTOMATIS sampai disetujui Admin!
+      // 🆕 AUDIT KEAMANAN KRITIS: sebelumnya kalau yang memanggil endpoint ini
+      // berrole ADMIN, saldo WALLET MEREKA SENDIRI langsung ditambahkan tanpa
+      // review sama sekali (bypass total dari alur PENDING_REVIEW di bawah).
+      // Ini celah self-dealing yang serius: admin manapun (termasuk akun yang
+      // seharusnya tidak pernah ada, sebelum registrasi publik role ADMIN
+      // ditutup -- lihat schemas.ts registerSchema) bisa mencetak saldo
+      // sendiri tanpa batas hanya dengan memanggil endpoint ini langsung,
+      // tidak lewat UI mana pun. Tidak ada satu pun pemanggil frontend yang
+      // sah memakai jalur ini (hanya CUSTOMER/DRIVER lewat TopupModal). Semua
+      // permintaan top-up sekarang WAJIB lewat antrean review, siapa pun
+      // pemanggilnya -- kalau admin butuh menambah saldo user LAIN secara
+      // langsung (mis. kompensasi), pakai POST /api/admin/wallet/credit yang
+      // mewajibkan target userId eksplisit + alasan, dan tidak bisa
+      // menyasar diri sendiri (lihat admin.routes.ts).
       //
       // PAYMENT_LINK bukan nilai valid di enum PaymentMethod (schema.prisma) --
       // secara konsep gateway checkout link tetap sejenis TRANSFER, jadi

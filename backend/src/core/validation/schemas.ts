@@ -6,8 +6,17 @@ export const registerSchema = z
     password: z.string().min(4, 'Sandi minimal harus 4 karakter!'),
     fullName: z.string().min(3, 'Nama lengkap minimal harus 3 karakter!'),
     phone: z.string().min(8, 'Nomor HP / WhatsApp minimal harus 8 digit!').optional(),
-    role: z.enum(['CUSTOMER', 'DRIVER', 'ADMIN', 'MERCHANT'], {
-      errorMap: () => ({ message: 'Role harus CUSTOMER, DRIVER, ADMIN, atau MERCHANT!' }),
+    // 🆕 AUDIT KEAMANAN KRITIS: 'ADMIN' DIHAPUS dari daftar role yang boleh
+    // didaftarkan lewat endpoint publik ini (/api/auth/register, TANPA
+    // autentikasi). Sebelumnya siapa pun bisa mengirim { role: "ADMIN" } dan
+    // langsung mendapat akun administrator penuh -- akses approve
+    // pembayaran, verifikasi driver, ubah tarif, dst -- tanpa otorisasi
+    // apa pun. Akun admin sekarang HANYA bisa dibuat lewat: (1) seed
+    // database awal (prisma/seed.ts, operasi server-side terkontrol), atau
+    // (2) admin yang sudah ada memakai endpoint POST /api/admin/create-admin
+    // (lihat admin.routes.ts, dilindungi authenticateToken+authorizeRoles).
+    role: z.enum(['CUSTOMER', 'DRIVER', 'MERCHANT'], {
+      errorMap: () => ({ message: 'Role harus CUSTOMER, DRIVER, atau MERCHANT!' }),
     }),
     vehiclePlate: z.string().optional(),
     vehicleModel: z.string().optional(),
@@ -34,6 +43,29 @@ export const registerSchema = z
 export const loginSchema = z.object({
   email: z.string().email('Format email tidak valid!'),
   password: z.string().min(1, 'Password wajib diisi!'),
+});
+
+// 🆕 Dipakai POST /api/admin/create-admin — satu-satunya jalur lain (selain
+// seed database) untuk membuat akun ADMIN baru, dan HANYA bisa dipanggil
+// oleh admin yang sudah login (authenticateToken + authorizeRoles('ADMIN')
+// di admin.routes.ts).
+export const createAdminSchema = z.object({
+  email: z.string().email('Format email tidak valid!'),
+  password: z.string().min(8, 'Password admin minimal 8 karakter!'),
+  fullName: z.string().min(3, 'Nama lengkap minimal harus 3 karakter!'),
+  phone: z.string().min(8, 'Nomor HP / WhatsApp minimal harus 8 digit!').optional(),
+});
+
+// 🆕 Dipakai POST /api/admin/wallet/credit — jalur SATU-SATUNYA yang sah
+// bagi admin untuk menambah saldo user lain secara langsung tanpa lewat
+// antrean TopupRequest (mis. kompensasi kesalahan sistem, refund manual).
+// targetUserId WAJIB diisi & TIDAK BOLEH menyasar diri sendiri (dicek di
+// route handler) -- mencegah pola self-dealing yang sebelumnya ada di
+// endpoint /api/wallet/topup untuk role ADMIN.
+export const adminWalletCreditSchema = z.object({
+  targetUserId: z.string().uuid('targetUserId harus UUID yang valid!'),
+  amount: z.number().positive('Nominal harus lebih dari 0!').max(50_000_000, 'Nominal maksimal Rp50.000.000 per transaksi!'),
+  reason: z.string().min(5, 'Alasan wajib diisi, minimal 5 karakter (untuk audit)!'),
 });
 
 export const changePasswordSchema = z.object({

@@ -11,6 +11,7 @@ import { SocketService } from '../../websocket/socket';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { PaymentService } from '../payment/payment.service';
 import { logger } from '../../config/logger';
+import { driverEligibilityService } from '../driver/driver-eligibility.service';
 
 interface CreateOrderInput {
   serviceType: 'BIKE' | 'CAR' | 'SEND';
@@ -94,10 +95,28 @@ export class OrderService {
       throw new AppError('Dompet tidak ditemukan! Silakan hubungi customer service.', 404);
     }
 
+    // 🔒 AUDIT KEAMANAN KRITIS: JANGAN PERNAH percaya distanceKm dari client.
+    // Sebelumnya `input.distanceKm` (dikirim langsung oleh aplikasi customer)
+    // dipakai apa adanya untuk menghitung tarif -- customer nakal bisa
+    // mengirim distanceKm yang sangat kecil (bahkan 0) untuk perjalanan yang
+    // sebenarnya jauh, membayar hampir gratis, sementara driver tetap harus
+    // menempuh jarak sebenarnya dan menerima bayaran dari tarif yang sama-
+    // sama dipalsukan itu (earning driver dihitung dari tarif akhir yang
+    // sudah kena manipulasi). Jarak sekarang SELALU dihitung ulang di server
+    // dari koordinat pickup/dropoff (Haversine) -- sama seperti pola yang
+    // sudah benar dipakai di createMerchantOrder untuk order MART. Nilai
+    // dari client diabaikan sepenuhnya untuk perhitungan tarif.
+    const serverCalculatedDistanceKm = this.calculateHaversineDistance(
+      input.pickupLat,
+      input.pickupLng,
+      input.dropoffLat,
+      input.dropoffLng
+    );
+
     // 1. Hitung subtotal dulu (untuk validasi)
     const preDiscount = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
-      distanceKm: input.distanceKm,
+      distanceKm: serverCalculatedDistanceKm,
       zoneName: input.zoneName,
       waitMinutes: input.waitMinutes,
       hasToll: input.hasToll,
@@ -152,9 +171,11 @@ export class OrderService {
     logger.info(`  Metode: ${input.paymentMethod}`);
 
     // 4. Hitung ULANG breakdown final dengan promo
+    // 🔒 Tetap pakai serverCalculatedDistanceKm, BUKAN input.distanceKm --
+    // lihat komentar keamanan di langkah 1 di atas.
     const finalBreakdown = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
-      distanceKm: input.distanceKm,
+      distanceKm: serverCalculatedDistanceKm,
       zoneName: input.zoneName,
       waitMinutes: input.waitMinutes,
       hasToll: input.hasToll,
@@ -177,7 +198,10 @@ export class OrderService {
       dropoffAddress: input.dropoffAddress,
       dropoffLat: input.dropoffLat,
       dropoffLng: input.dropoffLng,
-      distanceKm: input.distanceKm,
+      // 🔒 Simpan jarak hasil hitung server, BUKAN klaim client -- supaya
+      // catatan historis (laporan, audit, tier komisi driver) konsisten
+      // dengan tarif yang sungguhan dikenakan.
+      distanceKm: serverCalculatedDistanceKm,
       paymentMethod: input.paymentMethod || 'WALLET',
       customer: { connect: { id: customerProfile.id } },
     });
@@ -474,21 +498,14 @@ export class OrderService {
    */
   private async tryAutoAcceptOnCreation(orderId: string, serviceType: string): Promise<boolean> {
     logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mengecek kandidat auto-accept untuk serviceType=${serviceType}...`);
+    // 🆕 SATUKAN ELIGIBILITY: where-clause dasar (online/verified/lat-lng/
+    // klasifikasi/freeze-cash) sekarang dari DriverEligibilityService yang
+    // sama dipakai Dispatch Engine & manual accept -- lihat
+    // driver-eligibility.service.ts untuk kenapa ini penting.
     const candidates = await prisma.driverProfile.findMany({
       where: {
-        isOnline: true,
-        isVerified: true,
+        ...driverEligibilityService.baseWhereClause(serviceType),
         autoAcceptEnabled: true,
-        ...(serviceType === 'SEND' || serviceType === 'MART' ? {} : { serviceType: serviceType as any }),
-        latitude: { not: null },
-        longitude: { not: null },
-        orders: {
-          none: {
-            status: 'COMPLETED',
-            paymentMethod: 'CASH',
-            isPaid: false,
-          },
-        },
       },
       select: { id: true, userId: true, latitude: true, longitude: true },
     });
@@ -498,16 +515,27 @@ export class OrderService {
       return false;
     }
 
+    // 🆕 GERBANG DEPOSIT: sebelumnya TIDAK ADA di jalur auto-accept sama
+    // sekali -- driver dengan saldo deposit di bawah minimum (bahkan Rp0)
+    // tetap bisa auto-menerima order di sini walau jalur manual accept
+    // akan menolak mereka. Sekarang konsisten: kandidat yang depositnya
+    // tidak cukup difilter di sini juga.
+    const depositEligibleCandidates = await driverEligibilityService.filterByDeposit(candidates);
+    if (depositEligibleCandidates.length === 0) {
+      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi semua deposit di bawah minimum -- lanjut ke Dispatch Engine biasa.`);
+      return false;
+    }
+
     const busyDriverIds = new Set(
       (
         await prisma.order.findMany({
-          where: { driverId: { in: candidates.map((c) => c.id) }, status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED'] } },
+          where: { driverId: { in: depositEligibleCandidates.map((c) => c.id) }, status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED'] } },
           select: { driverId: true },
         })
       ).map((o) => o.driverId)
     );
 
-    const freeCandidates = candidates.filter((c) => !busyDriverIds.has(c.id));
+    const freeCandidates = depositEligibleCandidates.filter((c) => !busyDriverIds.has(c.id));
     if (freeCandidates.length === 0) {
       logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi SEMUA sedang sibuk -- lanjut ke Dispatch Engine biasa.`);
       return false;
