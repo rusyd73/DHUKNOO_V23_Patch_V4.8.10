@@ -13,7 +13,6 @@ import {
 
 import {
     updateLocationSchema,
-
     searchAddressSchema,
     reverseGeocodeSchema,
     calculateDistanceSchema,
@@ -21,11 +20,9 @@ import {
     routePolylineSchema,
     nearestDriverSchema,
     geofenceSchema,
-
 } from "../../core/validation/schemas";
 
 const router = Router();
-
 const locationController = new LocationController();
 
 /*

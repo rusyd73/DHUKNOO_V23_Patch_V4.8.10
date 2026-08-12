@@ -40,10 +40,24 @@ export const registerSchema = z
     }
   );
 
-export const loginSchema = z.object({
-  email: z.string().email('Format email tidak valid!'),
-  password: z.string().min(1, 'Password wajib diisi!'),
-});
+// 🆕 FIX "Phone registration": sebelumnya `email` WAJIB & harus format
+// email valid (z.string().email()) -- SATU-SATUNYA cara login, padahal
+// backend (auth.service.ts loginUser) sudah dibuat mendukung login via
+// nomor HP juga (findByEmailOrPhone). Request login berbasis nomor HP
+// akan DITOLAK DI SINI (validateBody) sebelum sempat sampai ke
+// controller/service manapun. Sekarang menerima email ATAU phone ATAU
+// emailOrPhone, sama seperti requestPasswordResetSchema di bawah.
+export const loginSchema = z
+  .object({
+    email: z.string().optional(),
+    phone: z.string().optional(),
+    emailOrPhone: z.string().optional(),
+    password: z.string().min(1, 'Password wajib diisi!'),
+  })
+  .refine((data) => !!(data.email || data.phone || data.emailOrPhone), {
+    message: 'Email atau nomor HP wajib diisi!',
+    path: ['email'],
+  });
 
 // 🆕 Dipakai POST /api/admin/create-admin — satu-satunya jalur lain (selain
 // seed database) untuk membuat akun ADMIN baru, dan HANYA bisa dipanggil
@@ -66,6 +80,13 @@ export const adminWalletCreditSchema = z.object({
   targetUserId: z.string().uuid('targetUserId harus UUID yang valid!'),
   amount: z.number().positive('Nominal harus lebih dari 0!').max(50_000_000, 'Nominal maksimal Rp50.000.000 per transaksi!'),
   reason: z.string().min(5, 'Alasan wajib diisi, minimal 5 karakter (untuk audit)!'),
+  // 🆕 FIX IDEMPOTENCY: wajib diisi CLIENT (bukan digenerate server dari
+  // Date.now() seperti versi sebelumnya, yang berubah tiap milidetik dan
+  // sama sekali tidak mencegah double-klik/network retry mengkredit dua
+  // kali). Client (dashboard admin) harus generate satu UUID/nonce per
+  // "niat transaksi" dan kirim ulang key YANG SAMA persis kalau request
+  // di-retry (mis. karena timeout tapi sebenarnya sudah diproses server).
+  idempotencyKey: z.string().min(8, 'idempotencyKey minimal 8 karakter!').max(200).optional(),
 });
 
 export const changePasswordSchema = z.object({

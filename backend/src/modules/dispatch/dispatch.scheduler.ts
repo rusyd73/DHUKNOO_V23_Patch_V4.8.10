@@ -1,114 +1,34 @@
+// modules/dispatch/dispatch.scheduler.ts
+import { DispatchRedis } from './dispatch.redis';
+import { logger } from '../../config/logger';
+
 export class DispatchScheduler {
+  private static timeouts: Map<string, NodeJS.Timeout> = new Map();
 
-  private static timers =
-    new Map<string, NodeJS.Timeout>();
+  static async start(orderId: string, delaySeconds: number, callback: () => Promise<void>): Promise<void> {
+    await DispatchRedis.scheduleTimeout(orderId, delaySeconds);
 
-
-  /*
-  |--------------------------------------------------------------------------
-  | Start
-  |--------------------------------------------------------------------------
-  */
-
-  static start(
-
-    orderId: string,
-
-    timeoutSeconds: number,
-
-    onExpired: () => Promise<void>
-
-  ) {
-
-    this.cancel(orderId);
-
-    const timer =
-      setTimeout(
-
-        async () => {
-
-          this.timers.delete(orderId);
-
-          await onExpired();
-
-        },
-
-        timeoutSeconds * 1000
-
-      );
-
-    this.timers.set(
-
-      orderId,
-
-      timer
-
-    );
-
-  }
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | Cancel
-  |--------------------------------------------------------------------------
-  */
-
-  static cancel(
-
-    orderId: string
-
-  ) {
-
-    const timer =
-      this.timers.get(orderId);
-
-    if (!timer) {
-
-      return;
-
+    if (this.timeouts.has(orderId)) {
+      clearTimeout(this.timeouts.get(orderId)!);
     }
 
-    clearTimeout(timer);
+    const timeout = setTimeout(async () => {
+      const isPending = await DispatchRedis.checkTimeout(orderId);
+      if (!isPending) return;
 
-    this.timers.delete(orderId);
+      await callback();
+      await DispatchRedis.cancelTimeout(orderId);
+      this.timeouts.delete(orderId);
+    }, delaySeconds * 1000);
 
+    this.timeouts.set(orderId, timeout);
   }
 
-
-  /*
-  |--------------------------------------------------------------------------
-  | Running
-  |--------------------------------------------------------------------------
-  */
-
-  static isRunning(
-
-    orderId: string
-
-  ): boolean {
-
-    return this.timers.has(orderId);
-
+  static async cancel(orderId: string): Promise<void> {
+    if (this.timeouts.has(orderId)) {
+      clearTimeout(this.timeouts.get(orderId)!);
+      this.timeouts.delete(orderId);
+    }
+    await DispatchRedis.cancelTimeout(orderId);
   }
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | Clear
-  |--------------------------------------------------------------------------
-  */
-
-  static clear() {
-
-    this.timers.forEach(
-
-      timer => clearTimeout(timer)
-
-    );
-
-    this.timers.clear();
-
-  }
-
 }

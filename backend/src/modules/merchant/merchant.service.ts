@@ -90,19 +90,14 @@ export class MerchantService {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(ownerPassword, salt);
 
-    // 3. Buat user dengan role MERCHANT
+    // 3. Buat user dengan role MERCHANT (✅ TANPA CustomerProfile)
     const user = await prisma.user.create({
       data: {
         email: ownerEmail,
         passwordHash,
         fullName: ownerFullName,
         role: 'MERCHANT',
-        customerProfile: {
-          create: {
-            phoneNumber: ownerPhone,
-            isAppInstalled: true,
-          },
-        },
+        // ✅ TIDAK ADA customerProfile
       },
     });
 

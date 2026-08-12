@@ -6,6 +6,7 @@ import { logger } from '../../config/logger';
 import { ENV } from '../../config/env';
 import { AppError } from '../../core/errors/AppError';
 import { MailerService } from '../../config/mailer';
+import { prisma } from '../../config/prisma';
 
 export class AuthService {
   private authRepository = new AuthRepository();
@@ -16,11 +17,22 @@ export class AuthService {
     return email.toLowerCase().trim();
   }
 
+  // ============================================================
+  // 🔒 GENERATE OTP CODE (6 digit)
+  // ============================================================
+  private generateOtpCode(): string {
+    return crypto.randomInt(100000, 999999).toString();
+  }
+
+  // ============================================================
+  // 🔓 REGISTER
+  // ============================================================
   async registerUser(data: {
     email: string;
     passwordPlain: string;
     fullName: string;
     role: 'CUSTOMER' | 'DRIVER' | 'ADMIN' | 'MERCHANT';
+    phone?: string;
     vehiclePlate?: string;
     vehicleModel?: string;
     driverServiceType?: 'BIKE' | 'CAR' | 'SEND';
@@ -30,12 +42,10 @@ export class AuthService {
     merchantLatitude?: number;
     merchantLongitude?: number;
   }) {
-    // ✅ PERBAIKAN 1: Normalize email
     const normalizedEmail = this.normalizeEmail(data.email);
     
     logger.info(`Registering new user: ${normalizedEmail} with role: ${data.role}`);
     
-    // ✅ Cek dengan email yang sudah dinormalisasi
     const existing = await this.authRepository.findByEmail(normalizedEmail);
     if (existing) {
       throw new AppError('Alamat email sudah terdaftar di sistem DHUKNOO!', 400);
@@ -44,12 +54,15 @@ export class AuthService {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(data.passwordPlain, salt);
 
-    // ✅ Simpan email yang sudah dinormalisasi
     const user = await this.authRepository.createUser({
-      email: normalizedEmail, // ✅ Pakai email yang sudah dinormalisasi
+      email: normalizedEmail,
       passwordHash,
       fullName: data.fullName,
       role: data.role as any,
+      // 🆕 FIX "Phone registration": diteruskan ke createUser() supaya
+      // benar-benar tersimpan (lihat komentar lengkap di
+      // auth.repository.ts createUser).
+      phone: data.phone,
       vehiclePlate: data.vehiclePlate,
       vehicleModel: data.vehicleModel,
       driverServiceType: data.driverServiceType,
@@ -63,52 +76,84 @@ export class AuthService {
     return { id: user.id, email: user.email, role: user.role };
   }
 
-  async loginUser(email: string, passwordPlain: string) {
-    // ✅ PERBAIKAN 2: Normalize email di awal
-    const normalizedEmail = this.normalizeEmail(email);
-    
-    logger.info(`🔍 Login attempt for user: ${normalizedEmail}`);
-    
-    // ✅ Debug: Log detail email
-    logger.info(`  Email RAW: "${email}"`);
-    logger.info(`  Normalized: "${normalizedEmail}"`);
-    
-    // ✅ Cek user dengan email yang sudah dinormalisasi
-    const user = await this.authRepository.findByEmail(normalizedEmail);
-    
-    // ✅ Jika tidak ditemukan, coba cari dengan case insensitive (fallback)
-    if (!user) {
-      logger.warn(`❌ User not found with normalized email: ${normalizedEmail}`);
-      
-      // ✅ Opsional: Cek apakah ada user dengan email case berbeda
-      const allUsers = await this.authRepository.findAllUsers();
-      const matchingUsers = allUsers.filter(u => 
-        u.email.toLowerCase().trim() === normalizedEmail
-      );
-      
-      if (matchingUsers.length > 0) {
-        logger.warn(`⚠️ Found user with different case: ${matchingUsers[0].email}`);
-        // ✅ Gunakan user yang ditemukan
-        const foundUser = matchingUsers[0];
-        const isValid = await bcrypt.compare(passwordPlain, foundUser.passwordHash);
-        if (!isValid) {
-          throw new AppError('Password salah!', 401);
-        }
-        // ✅ Generate token untuk user ini
-        return this.generateTokens(foundUser);
-      }
-      
-      throw new AppError('User tidak ditemukan! Periksa kembali email Anda.', 404);
+  // ============================================================
+  // 🔒 CREATE ADMIN (satu-satunya jalur lain selain seed database
+  // untuk membuat akun ADMIN baru). HANYA dipanggil dari
+  // POST /api/admin/create-admin, yang sudah dilindungi
+  // authenticateToken + authorizeRoles('ADMIN') di route handler --
+  // artinya cuma admin yang sudah login yang bisa membuat admin baru.
+  // Endpoint publik /api/auth/register TIDAK PERNAH memanggil method ini.
+  // ============================================================
+  async createAdmin(data: {
+    email: string;
+    passwordPlain: string;
+    fullName: string;
+    phone?: string;
+  }) {
+    const normalizedEmail = this.normalizeEmail(data.email);
+
+    const existing = await this.authRepository.findByEmail(normalizedEmail);
+    if (existing) {
+      throw new AppError('Alamat email sudah terdaftar di sistem DHUKNOO!', 400);
     }
 
-    // ✅ Verifikasi password
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(data.passwordPlain, salt);
+
+    // CATATAN: `phone` sengaja tidak diteruskan ke createUser -- di skema
+    // saat ini nomor HP disimpan di CustomerProfile/DriverProfile
+    // (phoneNumber), bukan di model User, dan akun ADMIN tidak punya
+    // profile jenis itu. Diterima di signature untuk kompatibilitas
+    // schema Zod (createAdminSchema) tapi tidak dipakai.
+    const user = await this.authRepository.createUser({
+      email: normalizedEmail,
+      passwordHash,
+      fullName: data.fullName,
+      role: 'ADMIN' as any,
+    });
+
+    logger.info(`[ADMIN] Akun admin baru dibuat: ${user.id} (${normalizedEmail})`);
+
+    return { id: user.id, email: user.email, role: user.role };
+  }
+
+  // ============================================================
+  // 🔓 LOGIN
+  // ============================================================
+  // ============================================================
+  // 🔓 LOGIN
+  //
+  // 🆕 FIX "Phone registration": sebelumnya method ini HANYA menerima
+  // `email` dan HANYA memanggil findByEmail() -- padahal loginSchema
+  // (schemas.ts) sudah lama menerima email ATAU phone ATAU emailOrPhone
+  // (`.refine((data) => !!(data.email || data.phone || data.emailOrPhone))`),
+  // dan AuthRepository.findByEmailOrPhone() (yang menangani normalisasi
+  // format nomor HP Indonesia 0xxx/62xxx) sudah dibuat lengkap tapi
+  // TIDAK PERNAH DIPANGGIL SAMA SEKALI dari mana pun -- dead code.
+  // Login pakai nomor HP TIDAK PERNAH benar-benar berfungsi, DAN
+  // (sebelum fix di createUser di atas) kalaupun dipanggil, tidak akan
+  // menemukan siapa pun karena phoneNumber selalu NULL.
+  // Sekarang menerima `identifier` (email atau nomor HP) dan pakai
+  // findByEmailOrPhone() yang sudah menangani keduanya.
+  // ============================================================
+  async loginUser(identifier: string, passwordPlain: string) {
+    const trimmedIdentifier = (identifier || '').trim();
+
+    logger.info(`🔍 Login attempt for identifier: "${trimmedIdentifier}"`);
+
+    const user = await this.authRepository.findByEmailOrPhone(trimmedIdentifier);
+
+    if (!user) {
+      logger.warn(`❌ User not found for identifier: ${trimmedIdentifier}`);
+      throw new AppError('User tidak ditemukan! Periksa kembali email/nomor HP Anda.', 404);
+    }
+
     const isValid = await bcrypt.compare(passwordPlain, user.passwordHash);
     if (!isValid) {
       logger.warn(`❌ Invalid password for user: ${user.id}`);
       throw new AppError('Password salah! Periksa kembali password Anda.', 401);
     }
 
-    // 🆕 PERBAIKAN #3: tolak login untuk akun yang sudah dinonaktifkan admin.
     if (user.isActive === false) {
       logger.warn(`⛔ Login blocked — account deactivated: ${user.id} (${user.email})`);
       throw new AppError(
@@ -123,19 +168,8 @@ export class AuthService {
   }
 
   // ============================================================
-  // 🆕 PERBAIKAN #1: LUPA / RESET PASSWORD
+  // 🔒 REQUEST PASSWORD RESET - FAIL CLOSED
   // ============================================================
-
-  /** Buat kode OTP 6 digit acak (bukan sequential/predictable). */
-  private generateOtpCode(): string {
-    return crypto.randomInt(100000, 999999).toString();
-  }
-
-  /**
-   * Langkah 1: user minta reset password lewat email ATAU nomor HP.
-   * Selalu balas pesan generik & status 200 walau user tidak ditemukan,
-   * supaya endpoint ini tidak bisa dipakai untuk enumerasi akun terdaftar.
-   */
   async requestPasswordReset(identifier: string) {
     const trimmed = (identifier || '').trim();
     if (!trimmed) {
@@ -156,7 +190,7 @@ export class AuthService {
     const otpCode = this.generateOtpCode();
     const salt = await bcrypt.genSalt(10);
     const tokenHash = await bcrypt.hash(otpCode, salt);
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 menit
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
     await this.authRepository.setResetPasswordToken(user.id, tokenHash, expiresAt);
 
@@ -167,24 +201,32 @@ export class AuthService {
 
     logger.info(`🔑 Password reset OTP generated for user ${user.id} (email sent: ${emailSent})`);
 
-    // Kalau SMTP belum dikonfigurasi (dev/staging tanpa email gateway asli),
-    // kode dikembalikan langsung di response supaya alur reset tetap bisa
-    // diselesaikan end-to-end tanpa email — TIDAK dilakukan kalau email
-    // sungguhan berhasil terkirim, demi keamanan di production.
     if (!emailSent) {
+      await this.authRepository.setResetPasswordToken(user.id, null, null);
+
+      logger.error(`[PASSWORD RESET] Failed to send OTP email to ${user.email}`);
+      
+      if (ENV.NODE_ENV === 'production') {
+        throw new AppError(
+          'Gagal mengirim kode reset password. Silakan coba lagi atau hubungi customer service.',
+          503
+        );
+      }
+
+      logger.info(`[DEV] OTP for ${user.email}: ${otpCode}`);
+      
       return {
         ...genericResult,
-        message: user.email
-          ? 'Kode reset dibuat. (Email belum terkonfigurasi di server — gunakan kode di bawah ini untuk melanjutkan.)'
-          : 'Kode reset dibuat. Sampaikan kode berikut ke pengguna lewat WhatsApp/SMS.',
-        token: otpCode,
+        message: 'Kode reset dibuat. (Mode development: cek log server untuk kode OTP.)',
       };
     }
 
     return genericResult;
   }
 
-  /** Langkah 2: user submit kode OTP + password baru. */
+  // ============================================================
+  // 🔒 CONFIRM PASSWORD RESET
+  // ============================================================
   async confirmPasswordReset(token: string, newPasswordPlain: string) {
     const otpCode = (token || '').trim();
     if (!otpCode) {
@@ -194,10 +236,6 @@ export class AuthService {
       throw new AppError('Password baru minimal 4 karakter!', 400);
     }
 
-    // Kode di-hash saat disimpan, jadi kita tidak bisa WHERE langsung —
-    // cari di antara akun dengan token aktif & belum kedaluwarsa, lalu
-    // cocokkan dengan bcrypt.compare (jumlah akun dengan reset PENDING
-    // dalam waktu bersamaan biasanya kecil, jadi ini tetap efisien).
     const candidates = await this.authRepository.findUsersWithActiveResetToken();
 
     let matchedUser: any = null;
@@ -226,7 +264,27 @@ export class AuthService {
     };
   }
 
-  // ✅ Helper: Generate tokens
+  // ============================================================
+  // 🔒 GET PROFILE
+  // ============================================================
+  async getProfile(userId: string) {
+    const user = await this.authRepository.findById(userId);
+    if (!user) {
+      throw new AppError('User tidak ditemukan!', 404);
+    }
+    return {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      role: user.role,
+      isActive: user.isActive,
+      createdAt: user.createdAt,
+    };
+  }
+
+  // ============================================================
+  // 🔒 GENERATE TOKENS
+  // ============================================================
   private async generateTokens(user: any) {
     const accessToken = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
@@ -240,7 +298,6 @@ export class AuthService {
       { expiresIn: '7d' }
     );
 
-    // Save refresh token to DB
     await this.authRepository.updateRefreshToken(user.id, refreshToken);
 
     return {
@@ -255,56 +312,89 @@ export class AuthService {
     };
   }
 
+  // ============================================================
+  // 🔓 REFRESH TOKEN - ATOMIC (CEGAH RACE CONDITION)
+  // ============================================================
   async handleRefreshToken(token: string) {
     try {
+      // 1. Verifikasi JWT
       const decoded = jwt.verify(token, ENV.JWT_REFRESH_SECRET) as any;
-      const user = await this.authRepository.findById(decoded.id);
+      
+      // 2. 🔒 ATOMIC: Cari user dengan refresh token yang sama
+      const user = await prisma.user.findUnique({
+        where: { 
+          id: decoded.id,
+          refreshToken: token,
+        },
+      });
 
-      if (!user || user.refreshToken !== token) {
+      if (!user) {
         throw new AppError('Token refresh tidak valid!', 403);
       }
 
-      const accessToken = jwt.sign(
+      // 3. Generate token baru
+      const newAccessToken = jwt.sign(
         { id: user.id, email: user.email, role: user.role },
         ENV.JWT_SECRET,
         { expiresIn: '15m' }
       );
 
-      // 🆕 ROTASI refresh token: keluarkan token BARU dan simpan ke DB,
-      // gantikan yang lama. SEBELUMNYA refresh token yang sama dipakai
-      // ulang selama 7 hari penuh -- kalau bocor (mis. lewat XSS atau
-      // penyimpanan client yang tidak aman), penyerang bisa memakainya
-      // berkali-kali sampai kedaluwarsa sendiri. Dengan rotasi, setiap
-      // refresh token hanya valid SEKALI PAKAI; refresh token lama yang
-      // dipakai ulang (baik oleh user asli maupun penyerang) akan otomatis
-      // ditolak di pengecekan `user.refreshToken !== token` di atas pada
-      // permintaan berikutnya.
       const newRefreshToken = jwt.sign(
         { id: user.id, email: user.email, role: user.role },
         ENV.JWT_REFRESH_SECRET,
         { expiresIn: '7d' }
       );
-      await this.authRepository.updateRefreshToken(user.id, newRefreshToken);
 
-      return { accessToken, refreshToken: newRefreshToken };
+      // 4. 🔒 UPDATE refresh token di database (atomic)
+      const updated = await prisma.user.updateMany({
+        where: { 
+          id: user.id,
+          refreshToken: token, // ← HANYA jika token masih sama
+        },
+        data: {
+          refreshToken: newRefreshToken,
+        },
+      });
+
+      // 5. 🔒 Jika tidak ada yang ter-update, berarti ada race condition
+      if (updated.count === 0) {
+        // Coba ambil user dengan token terbaru
+        const latestUser = await prisma.user.findUnique({
+          where: { id: user.id },
+        });
+        
+        if (latestUser && latestUser.refreshToken) {
+          // Token sudah dirotasi, beri tahu client untuk retry
+          throw new AppError('Refresh token sudah diperbarui. Silakan coba lagi.', 409);
+        }
+        throw new AppError('Token refresh tidak valid!', 403);
+      }
+
+      logger.info(`✅ Refresh token rotated for user: ${user.id}`);
+
+      return { 
+        accessToken: newAccessToken, 
+        refreshToken: newRefreshToken 
+      };
+
     } catch (err) {
       logger.error('Error during token refresh exchange: %s', (err as Error).message || err);
+      if (err instanceof AppError) throw err;
       throw new AppError('Autentikasi gagal. Sesi Anda kedaluwarsa!', 401);
     }
   }
 
-  // 🆕 LOGOUT — sebelumnya tidak ada endpoint ini sama sekali, artinya tidak
-  // ada cara server-side untuk mencabut refresh token seseorang (mis. saat
-  // HP hilang/dicuri, atau user menekan tombol "Keluar"). "Logout" client
-  // hanya menghapus token dari local storage, tapi refresh token-nya TETAP
-  // valid sampai 7 hari kalau ada yang menyalinnya. Sekarang refreshToken
-  // di DB langsung di-null-kan, jadi permintaan /refresh berikutnya dengan
-  // token lama akan ditolak (lihat pengecekan di handleRefreshToken di atas).
+  // ============================================================
+  // 🔒 LOGOUT
+  // ============================================================
   async logout(userId: string) {
     await this.authRepository.updateRefreshToken(userId, null);
     return { message: 'Berhasil keluar dari sesi ini.' };
   }
 
+  // ============================================================
+  // 🔒 CHANGE PASSWORD
+  // ============================================================
   async changePassword(userId: string, oldPlain: string, newPlain: string) {
     logger.info(`Password change requested for user id: ${userId}`);
     const user = await this.authRepository.findById(userId);

@@ -1,6 +1,14 @@
 import client from 'prom-client';
 import express, { Request, Response, NextFunction } from 'express';
 import { logger } from './logger';
+import { ENV } from './env';
+
+// ============================================================
+// 🔒 METRICS - DENGAN AUTH TOKEN
+// ============================================================
+
+// 🔥 Metrics token untuk akses /metrics (set di env)
+const METRICS_TOKEN = process.env.METRICS_TOKEN || '';
 
 export class MetricsService {
   private static registry = new client.Registry();
@@ -20,12 +28,6 @@ export class MetricsService {
   });
 
   public static init() {
-    // Idempotency guard: prom-client MELEMPAR ERROR kalau metric dengan nama
-    // yang sama didaftarkan dua kali ke registry yang sama. init() bisa saja
-    // terpanggil lebih dari sekali dalam proses yang sama (mis. hot-reload
-    // dev server, atau kode caller yang keliru memanggilnya berulang) — guard
-    // ini memastikan panggilan kedua dst. cukup di-skip dengan aman, bukan
-    // menjatuhkan seluruh proses startup backend.
     if (this.isInitialized) {
       logger.warn('MetricsService.init() dipanggil lebih dari sekali — panggilan berikutnya diabaikan (aman).');
       return;
@@ -71,11 +73,58 @@ export class MetricsService {
   }
 
   /**
-   * Controller to output standard Prometheus scrapable metrics text
+   * 🔒 Controller to output standard Prometheus scrapable metrics text
+   * DENGAN AUTHENTICATION
    */
   public static async getMetrics(req: Request, res: Response) {
-    res.setHeader('Content-Type', MetricsService.registry.contentType);
-    const content = await MetricsService.registry.metrics();
-    res.send(content);
+    // ============================================================
+    // 🔒 AUTHENTIKASI - TOKEN ATAU IP INTERNAL
+    // ============================================================
+    const authHeader = req.headers.authorization;
+    const clientIp = req.ip || req.connection.remoteAddress || '';
+
+    // 🔥 Cek token
+    const hasValidToken = METRICS_TOKEN && authHeader === `Bearer ${METRICS_TOKEN}`;
+
+    // 🔥 Cek apakah dari internal network
+    const isInternal = 
+      clientIp.includes('127.0.0.1') || 
+      clientIp.includes('::1') || 
+      clientIp.includes('192.168.') || 
+      clientIp.includes('10.') ||
+      clientIp.includes('172.16.') ||
+      clientIp.includes('172.17.') ||
+      clientIp.includes('172.18.') ||
+      clientIp.includes('172.19.') ||
+      clientIp.includes('172.20.') ||
+      clientIp.includes('172.21.') ||
+      clientIp.includes('172.22.') ||
+      clientIp.includes('172.23.') ||
+      clientIp.includes('172.24.') ||
+      clientIp.includes('172.25.') ||
+      clientIp.includes('172.26.') ||
+      clientIp.includes('172.27.') ||
+      clientIp.includes('172.28.') ||
+      clientIp.includes('172.29.') ||
+      clientIp.includes('172.30.') ||
+      clientIp.includes('172.31.');
+
+    // 🔒 Tolak akses jika tidak valid
+    if (!hasValidToken && !isInternal) {
+      logger.warn(`[Metrics] Unauthorized access attempt from ${clientIp}`);
+      return res.status(401).json({ 
+        error: 'Unauthorized. Set METRICS_TOKEN in .env or access from internal network.' 
+      });
+    }
+
+    // 🔓 Kirim metrics
+    try {
+      res.setHeader('Content-Type', MetricsService.registry.contentType);
+      const content = await MetricsService.registry.metrics();
+      res.send(content);
+    } catch (err: any) {
+      logger.error('[Metrics] Failed to generate metrics:', err);
+      return res.status(500).json({ error: 'Failed to generate metrics' });
+    }
   }
 }

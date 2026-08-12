@@ -31,8 +31,8 @@ interface LocationPickerProps {
   markerColor?: 'green' | 'red';
 }
 
-// ✅ PERBAIKAN 1: Fallback coordinates
-const FALLBACK_COORDS: LatLng = { lat: -7.9666, lng: 112.6326 };
+// ✅ PERBAIKAN 1: Fallback coordinates - UBAH ke Malang/Batu area
+const FALLBACK_COORDS: LatLng = { lat: -7.8671, lng: 112.5239 };
 
 // ✅ PERBAIKAN 2: Fungsi validasi koordinat
 const isValidCoords = (coords: any): coords is LatLng => {
@@ -45,11 +45,27 @@ const isValidCoords = (coords: any): coords is LatLng => {
          coords.lng >= -180 && coords.lng <= 180;
 };
 
+// ✅ PERBAIKAN 3: Normalisasi nama kota untuk pencarian
+const normalizeCity = (query: string): string => {
+  const lower = query.toLowerCase().trim();
+  // Deteksi apakah query menyebutkan kota tertentu
+  const hasBatu = lower.includes('batu');
+  const hasMalang = lower.includes('malang');
+  const hasLowokwaru = lower.includes('lowokwaru');
+  
+  // Jika sudah ada nama kota, biarkan apa adanya
+  if (hasBatu || hasMalang || hasLowokwaru) {
+    return query;
+  }
+  
+  // Jika tidak ada, tambahkan ", Malang Raya" untuk konteks
+  return `${query}, Malang Raya`;
+};
+
 // Sub-component to handle map view updates (panning) when coordinates change
 function ChangeView({ center }: { center: LatLng | null }) {
   const map = useMap();
   useEffect(() => {
-    // ✅ PERBAIKAN 3: Validasi sebelum pakai
     if (center && isValidCoords(center)) {
       map.setView([center.lat, center.lng], map.getZoom());
     }
@@ -90,20 +106,28 @@ export default function LocationPicker({
 
   const isMapActionRef = useRef(false);
 
-  // Perform Geocoding
+  // ✅ PERBAIKAN 4: Perform Geocoding - Case INSENSITIVE + normalisasi
   const handleGeocode = async (queryToSearch: string) => {
     if (!queryToSearch || !queryToSearch.trim()) return;
     setIsSearching(true);
     isMapActionRef.current = false;
 
     try {
-      let formattedQuery = queryToSearch;
-      if (!formattedQuery.toLowerCase().includes('malang') && !formattedQuery.toLowerCase().includes('batu')) {
-        formattedQuery += ', Malang Raya';
+      // Normalisasi query (case insensitive + tambah konteks area)
+      const normalizedQuery = normalizeCity(queryToSearch.trim());
+      
+      // Coba cari dengan query yang sudah dinormalisasi
+      let formattedQuery = normalizedQuery;
+      
+      // Jika masih tidak ada nama kota, tambahkan "Malang Raya"
+      if (!formattedQuery.toLowerCase().includes('malang') && 
+          !formattedQuery.toLowerCase().includes('batu') &&
+          !formattedQuery.toLowerCase().includes('lowokwaru')) {
+        formattedQuery = `${formattedQuery}, Malang Raya`;
       }
 
       const response = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(formattedQuery)}&limit=1`
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(formattedQuery)}&limit=1&countrycodes=id&accept-language=id`
       );
       const data = await response.json();
 
@@ -111,9 +135,32 @@ export default function LocationPicker({
         const lat = parseFloat(data[0].lat);
         const lng = parseFloat(data[0].lon);
         onChange({ lat, lng });
-        onAddressChange(data[0].display_name);
+        
+        // ✅ PERBAIKAN 5: Bersihkan alamat dari "kecamatan" yang tidak perlu
+        let displayName = data[0].display_name;
+        // Hapus "Kecamatan" dan "Kelurahan" dari display_name
+        displayName = displayName.replace(/Kecamatan\s+/g, '').replace(/Kelurahan\s+/g, '');
+        
+        onAddressChange(displayName);
         skipNextAutoGeocodeRef.current = true;
-        setSearchQuery(data[0].display_name);
+        setSearchQuery(displayName);
+      } else {
+        // Jika tidak ditemukan, coba tanpa "Malang Raya"
+        if (formattedQuery.includes('Malang Raya')) {
+          const retryQuery = queryToSearch.trim();
+          const retryResponse = await fetch(
+            `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(retryQuery)}&limit=1&countrycodes=id&accept-language=id`
+          );
+          const retryData = await retryResponse.json();
+          if (retryData && retryData.length > 0) {
+            const lat = parseFloat(retryData[0].lat);
+            const lng = parseFloat(retryData[0].lon);
+            onChange({ lat, lng });
+            onAddressChange(retryData[0].display_name);
+            skipNextAutoGeocodeRef.current = true;
+            setSearchQuery(retryData[0].display_name);
+          }
+        }
       }
     } catch (err) {
       console.error('Error during geocoding:', err);
@@ -122,21 +169,25 @@ export default function LocationPicker({
     }
   };
 
-  // Perform Reverse Geocoding
+  // ✅ PERBAIKAN 6: Perform Reverse Geocoding dengan filter alamat
   const handleReverseGeocode = async (coords: LatLng) => {
     setIsReverseGeocoding(true);
     isMapActionRef.current = true;
 
     try {
       const response = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${coords.lat}&lon=${coords.lng}`
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${coords.lat}&lon=${coords.lng}&zoom=16&accept-language=id`
       );
       const data = await response.json();
 
       if (data && data.display_name) {
-        onAddressChange(data.display_name);
+        // ✅ PERBAIKAN 7: Bersihkan alamat dari "Kecamatan" dan "Kelurahan"
+        let displayName = data.display_name;
+        displayName = displayName.replace(/Kecamatan\s+/g, '').replace(/Kelurahan\s+/g, '');
+        
+        onAddressChange(displayName);
         skipNextAutoGeocodeRef.current = true;
-        setSearchQuery(data.display_name);
+        setSearchQuery(displayName);
       } else {
         const fallback = `Lokasi Map (${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)})`;
         onAddressChange(fallback);
@@ -155,7 +206,7 @@ export default function LocationPicker({
     handleReverseGeocode(coords);
   };
 
-  // Debounced auto-geocode
+  // Debounced auto-geocode - CASE INSENSITIVE
   useEffect(() => {
     if (skipNextAutoGeocodeRef.current) {
       skipNextAutoGeocodeRef.current = false;
@@ -212,11 +263,11 @@ export default function LocationPicker({
     iconAnchor: [10, 10],
   });
 
-  // ✅ PERBAIKAN 4: Pastikan mapCenter selalu valid
+  // ✅ PERBAIKAN 8: Pastikan mapCenter selalu valid
   const mapCenter = (value && isValidCoords(value)) ? value : 
                     (isValidCoords(initialCenter) ? initialCenter : FALLBACK_COORDS);
 
-  // ✅ PERBAIKAN 5: Pastikan marker position valid
+  // ✅ PERBAIKAN 9: Pastikan marker position valid
   const markerPosition = (value && isValidCoords(value)) ? value : null;
 
   return (
@@ -276,7 +327,6 @@ export default function LocationPicker({
 
       {/* Leaflet Map Box */}
       <div className="rounded-xl overflow-hidden border border-[#23583E] relative" style={{ height: 200 }}>
-        {/* ✅ PERBAIKAN 6: MapContainer selalu pakai koordinat valid */}
         <MapContainer
           center={[mapCenter.lat, mapCenter.lng]}
           zoom={14}
@@ -289,7 +339,6 @@ export default function LocationPicker({
           <ClickHandler onMapClick={handleMapClick} />
           <ChangeView center={value} />
           
-          {/* ✅ PERBAIKAN 7: Marker hanya render jika position valid */}
           {markerPosition && (
             <Marker position={[markerPosition.lat, markerPosition.lng]} icon={customIcon} />
           )}

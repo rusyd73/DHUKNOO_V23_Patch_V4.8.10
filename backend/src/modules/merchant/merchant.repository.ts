@@ -227,54 +227,68 @@ export class MerchantRepository {
     });
   }
 
-  // ============================================================
-  // 🔥 STATISTICS
-  // ============================================================
+// ============================================================
+// 🔥 STATISTICS
+// ============================================================
 
-  async getMerchantStats(merchantId: string) {
-    const productCount = await prisma.product.count({
-      where: { merchantId, isAvailable: true },
-    });
+async getMerchantStats(merchantId: string) {
+  // Count available products
+  const productCount = await prisma.product.count({
+    where: { merchantId, isAvailable: true },
+  });
 
-    const orderCount = await prisma.order.count({
-      where: {
-        status: 'COMPLETED',
-      },
-    });
+  // ✅ Count completed orders for this merchant ONLY
+  const orderCount = await prisma.order.count({
+    where: {
+      merchantId: merchantId,
+      status: 'COMPLETED',
+    },
+  });
 
-    const totalRevenue = await prisma.order.aggregate({
-      where: {
-        status: 'COMPLETED',
-        isPaid: true,
-      },
-      _sum: {
-        price: true,
-      },
-    });
+  // ✅ Calculate revenue for this merchant ONLY
+  const totalRevenue = await prisma.order.aggregate({
+    where: {
+      merchantId: merchantId,
+      status: 'COMPLETED',
+      isPaid: true,
+    },
+    _sum: {
+      price: true,
+    },
+  });
 
-    return {
-      productCount,
-      orderCount,
-      totalRevenue: totalRevenue._sum?.price || 0,
-    };
-  }
+  // ✅ Count pending orders for this merchant
+  const pendingOrders = await prisma.order.count({
+    where: {
+      merchantId: merchantId,
+      status: 'PENDING',
+    },
+  });
 
-  async getPopularMerchants(limit: number = 10) {
-    return prisma.merchant.findMany({
-      include: {
-        owner: {
-          select: {
-            fullName: true,
-            email: true,
-          },
+  return {
+    productCount,
+    orderCount,
+    totalRevenue: totalRevenue._sum?.price || 0,
+    pendingOrders,
+  };
+}
+
+async getPopularMerchants(limit: number = 10) {
+  return prisma.merchant.findMany({
+    include: {
+      owner: {
+        select: {
+          fullName: true,
+          email: true,
         },
       },
-      orderBy: {
-        createdAt: 'desc',
-      },
-      take: limit,
-    });
-  }
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+    take: limit,
+  });
+}
 
   // ============================================================
   // 🔥 SEARCH

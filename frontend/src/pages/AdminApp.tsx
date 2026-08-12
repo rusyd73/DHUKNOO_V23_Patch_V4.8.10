@@ -632,6 +632,7 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                 <option value="BIKE">BIKE</option>
                 <option value="CAR">CAR</option>
                 <option value="SEND">SEND</option>
+				<option value="MART">MART</option>
               </select>
             </div>
             <div className="flex flex-col gap-1">

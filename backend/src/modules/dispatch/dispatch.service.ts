@@ -1,443 +1,170 @@
 import { SocketService } from "../../websocket/socket";
-
 import { LocationService } from "../location/location.service";
-
 import { MAP_CONSTANTS } from "../location/map.constants";
-
 import { DispatchRepository } from "./dispatch.repository";
-
 import { DispatchScheduler } from "./dispatch.scheduler";
-
 import { DispatchState } from "./dispatch.state";
-
 import { DispatchLock } from "./dispatch.lock";
-
 import { DISPATCH_CONSTANTS } from "./dispatch.constants";
-
 import { prisma } from "../../config/prisma";
 import { logger } from "../../config/logger";
-import { driverEligibilityService } from "../driver/driver-eligibility.service";
-
+import { TariffEngineService } from "../tariff/tariff.service";
 import {
   DispatchCandidate,
   DispatchRequest,
   DispatchResult,
 } from "./dispatch.types";
 
-
 export class DispatchService {
-
-
-  private repository =
-    new DispatchRepository();
-
-
-  private locationService =
-    new LocationService();
-
-
-
+  private repository = new DispatchRepository();
+  private locationService = new LocationService();
+  private tariffEngine = new TariffEngineService();
 
   /*
   |--------------------------------------------------------------------------
   | Start Dispatch
   |--------------------------------------------------------------------------
   */
+  async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    const orderId = request.order.id;
 
-  async dispatch(
-
-    request: DispatchRequest
-
-  ): Promise<DispatchResult> {
-
-
-    const orderId =
-      request.order.id;
-
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Prevent duplicate dispatch
-    |--------------------------------------------------------------------------
-    */
-
-    const locked =
-      DispatchLock.acquire(
-        orderId
-      );
-
-
+    const locked = await DispatchLock.acquire(orderId);
     if (!locked) {
-
-
+      const current = await DispatchState.current(orderId);
       return {
-
         orderId,
-
         totalDrivers: 0,
-
-        currentDriverId:
-          DispatchState.current(orderId)
-            ?.driverId,
-
-
-        status:
-          "ALREADY_DISPATCHING",
-
-
+        currentDriverId: current?.driverId ?? undefined,
+        status: "ALREADY_DISPATCHING",
         candidates: [],
-
       };
-
     }
-
-
 
     try {
-
-
       logger.info(`[DISPATCH] Mulai dispatch order ${orderId} (serviceType=${request.order.serviceType})`);
 
-      /*
-      |--------------------------------------------------------------------------
-      | Find nearest drivers
-      |--------------------------------------------------------------------------
-      */
+      const nearestDrivers = await this.locationService.nearestDrivers(
+        {
+          latitude: request.order.pickupLat,
+          longitude: request.order.pickupLng,
+        },
+        DISPATCH_CONSTANTS.MAX_CANDIDATES
+      );
 
+      logger.info(`[DISPATCH] order ${orderId}: ${nearestDrivers.length} driver online terdekat ditemukan`);
 
-      const nearestDrivers =
+      const availableDrivers = await this.repository.getAvailableDrivers();
+      logger.info(`[DISPATCH] order ${orderId}: ${availableDrivers.length} driver lolos getAvailableDrivers`);
 
-        await this.locationService.nearestDrivers(
+      const availableMap = new Map(
+        availableDrivers.map((driver: any) => [driver.id, driver])
+      );
 
-          {
+      // ============================================================
+      // 🔒 STEP 3: Filter ELIGIBILITY (PAKAI SERVICE SAMA)
+      // ============================================================
+      const { DriverEligibilityService } = await import('../driver/services/driver-eligibility.service');
+      const eligibilityService = new DriverEligibilityService();
 
-            latitude:
-              request.order.pickupLat,
-
-
-            longitude:
-              request.order.pickupLng,
-
-
+      const eligibleDrivers: any[] = [];
+      for (const driver of availableDrivers) {
+        const eligibility = await eligibilityService.check({
+          driverId: driver.id,
+          order: {
+            serviceType: request.order.serviceType,
+            pickupLat: request.order.pickupLat,
+            pickupLng: request.order.pickupLng,
           },
-
-
-          DISPATCH_CONSTANTS.MAX_CANDIDATES
-
-        );
-
-
-      logger.info(`[DISPATCH] order ${orderId}: ${nearestDrivers.length} driver online terdekat ditemukan (belum difilter isVerified/klasifikasi/freeze)`);
-
-
-      /*
-      |--------------------------------------------------------------------------
-      | Available driver filter
-      |--------------------------------------------------------------------------
-      */
-
-
-      const availableDrivers =
-
-        await this.repository.getAvailableDrivers();
-
-
-      logger.info(`[DISPATCH] order ${orderId}: ${availableDrivers.length} driver lolos getAvailableDrivers (online+verified+lat/lng+bebas freeze CASH)`);
-
-
-
-
-      const availableMap =
-
-        new Map(
-
-          availableDrivers.map(
-
-            driver => [
-
-              driver.id,
-
-              driver
-
-            ]
-
-          )
-
-        );
-
-
-
-
-
-      let candidates: DispatchCandidate[] =
-
-
-        nearestDrivers
-
-          .filter(
-
-            driver =>
-
-              availableMap.has(
-                driver.driverId
-              )
-
-          )
-
-          // KUNCI KLASIFIKASI: hanya tawarkan order ke driver dengan
-          // serviceType YANG SAMA (BIKE order -> driver BIKE saja, dst).
-          // Sebelumnya semua driver online ditawari order apa pun tanpa
-          // pengecekan jenis layanan sama sekali.
-          //
-          // PENGECUALIAN: order layanan SEND (kirim barang) DAN MART
-          // (belanja/pesan-antar dari Merchant) TIDAK memakai klasifikasi --
-          // siapa saja driver yang online/aktif (toggle ON) berhak menerima
-          // publikasi order ini, terlepas dari serviceType profil driver
-          // tsb (BIKE/CAR/SEND semua bisa dapat tawaran SEND/MART).
-          //
-          // 🆕 SATUKAN ELIGIBILITY: aturan ini sekarang dari
-          // DriverEligibilityService.matchesServiceType() -- sumber
-          // kebenaran yang sama dipakai Auto-Accept & manual accept, supaya
-          // tidak ada lagi kasus driver ditawari order MART di sini tapi
-          // ditolak salah saat mencoba klaim manual order MART serupa.
-          .filter(
-            driver => {
-              const profile = availableMap.get(driver.driverId);
-              return driverEligibilityService.matchesServiceType(request.order.serviceType, (profile as any)?.serviceType);
-            }
-
-          )
-
-
-          .map(
-
-            driver => {
-
-
-              const profile =
-
-                availableMap.get(
-                  driver.driverId
-                )!;
-
-
-
-              return {
-
-
-                driverId:
-                  profile.id,
-
-
-                userId:
-                  profile.userId,
-
-
-                latitude:
-                  Number(profile.latitude),
-
-
-                longitude:
-                  Number(profile.longitude),
-
-
-                distanceMeters:
-                  driver.distanceMeters,
-
-
-
-                etaMinutes:
-                  Math.ceil(
-
-                    driver.distanceMeters /
-
-                    (
-
-                      MAP_CONSTANTS.BIKE_SPEED_KMH *
-                      1000 /
-                      60
-
-                    )
-
-                  ),
-
-                autoAcceptEnabled:
-                  Boolean((profile as any).autoAcceptEnabled),
-
-              };
-
-
-            }
-
-          );
-
-      // 🆕 GERBANG DEPOSIT: sebelumnya Dispatch Engine TIDAK PERNAH mengecek
-      // saldo deposit driver sama sekali -- driver dengan saldo di bawah
-      // minimum (bahkan Rp0) tetap ditawari order lewat jalur ini, padahal
-      // jalur manual accept akan menolak mereka. Sekarang konsisten dengan
-      // DriverEligibilityService yang sama dipakai Auto-Accept & manual
-      // accept (lihat driver-eligibility.service.ts).
-      candidates = await driverEligibilityService.filterByDeposit(candidates);
-
-
-
-
-      /*
-      |--------------------------------------------------------------------------
-      | Create Dispatch Session
-      |--------------------------------------------------------------------------
-      */
-
-
-      logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL setelah filter jarak+klasifikasi+deposit (serviceType=${request.order.serviceType}) -- ${candidates.length === 0 ? 'TIDAK ADA kandidat, dispatch akan berhenti di sini!' : candidates.map(c => `${c.driverId}(autoAccept=${c.autoAcceptEnabled})`).join(', ')}`);
-
-      DispatchState.create(
-
+          options: {
+            minimumDeposit: await this.tariffEngine.getMinimumDriverDeposit(),
+            maxDistanceKm: 5,
+            maxDailyOrders: 20,
+            checkLocationFreshness: true,
+            locationFreshnessMinutes: 5,
+          },
+        });
+
+        if (eligibility.isEligible) {
+          eligibleDrivers.push({
+            ...driver,
+            eligibilityScore: eligibility.score,
+            reasons: eligibility.reasons,
+          });
+        }
+      }
+
+      logger.info(`[DISPATCH] order ${orderId}: ${eligibleDrivers.length} driver lolos eligibility check`);
+
+      const eligibleMap = new Map(
+        eligibleDrivers.map((d: any) => [d.id, d])
+      );
+
+      const candidates: DispatchCandidate[] = nearestDrivers
+        .filter((driver: any) => eligibleMap.has(driver.driverId))
+        .filter((driver: any) => {
+          if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") {
+            return true;
+          }
+          const profile = eligibleMap.get(driver.driverId);
+          return profile && (profile as any).serviceType === request.order.serviceType;
+        })
+        .map((driver: any) => {
+          const profile = eligibleMap.get(driver.driverId)!;
+          return {
+            driverId: profile.id,
+            userId: profile.userId,
+            latitude: Number(profile.latitude),
+            longitude: Number(profile.longitude),
+            distanceMeters: driver.distanceMeters,
+            etaMinutes: Math.ceil(
+              driver.distanceMeters /
+              (MAP_CONSTANTS.BIKE_SPEED_KMH * 1000 / 60)
+            ),
+            autoAcceptEnabled: Boolean((profile as any).autoAcceptEnabled),
+          };
+        });
+
+      logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL`);
+
+      await DispatchState.create(
         orderId,
-
-        candidates.map(
-
-          driver =>
-            driver.driverId
-
-        )
-
+        candidates.map(driver => driver.driverId)
       );
 
+      await this.offerNextDriver(request, candidates);
 
-
-
-
-      /*
-      |--------------------------------------------------------------------------
-      | Offer Driver
-      |--------------------------------------------------------------------------
-      */
-
-
-      await this.offerNextDriver(
-
-        request,
-
-        candidates
-
-      );
-
-
-
-
+      const current = await DispatchState.current(orderId);
 
       return {
-
-
         orderId,
-
-
-        totalDrivers:
-          candidates.length,
-
-
-
-        currentDriverId:
-
-          DispatchState.current(orderId)
-            ?.driverId,
-
-
-
-        status:
-
-          candidates.length > 0
-
-            ? "DISPATCHING"
-
-            : "NO_DRIVER",
-
-
-
+        totalDrivers: candidates.length,
+        currentDriverId: current?.driverId ?? undefined,
+        status: candidates.length > 0 ? "DISPATCHING" : "NO_DRIVER",
         candidates,
-
-
       };
 
-
-
+    } finally {
+      await DispatchLock.release(orderId);
     }
-
-    finally {
-
-
-      DispatchLock.release(
-
-        orderId
-
-      );
-
-
-    }
-
-
   }
-
-
-
-
-
 
   /*
   |--------------------------------------------------------------------------
   | Sequential Driver Offer
   |--------------------------------------------------------------------------
   */
-
   private async offerNextDriver(
-
     request: DispatchRequest,
-
     candidates: DispatchCandidate[]
-
   ) {
-
-
-
-    const orderId =
-      request.order.id;
-
-
-
-
-    const current =
-
-      DispatchState.current(
-
-        orderId
-
-      );
-
-
-
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | No driver available
-    |--------------------------------------------------------------------------
-    */
-
+    const orderId = request.order.id;
+    const current = await DispatchState.current(orderId);
 
     if (!current) {
-
-      // PERBAIKAN: request.order.customerId adalah ID CustomerProfile, BUKAN
-      // ID User — SocketService.emitToUser() butuh User.id (room `user_<id>`
-      // yang di-auto-join tiap socket saat connect). Mengirim ke customerId
-      // berarti notifikasi "tidak ada driver ditemukan" ini TIDAK PERNAH
-      // sampai ke siapa pun, karena tidak ada socket yang join room itu.
       const customerProfile = await prisma.customerProfile.findUnique({
         where: { id: request.order.customerId },
         select: { userId: true },
       });
-
       if (customerProfile) {
         SocketService.emitToUser(
           customerProfile.userId,
@@ -445,359 +172,96 @@ export class DispatchService {
           { orderId }
         );
       }
-
       SocketService.emitToAdmins(DISPATCH_CONSTANTS.ORDER_EXPIRED_EVENT, { orderId });
-
       return;
-
     }
 
-
-
-
-
-    const driver =
-
-      candidates.find(
-
-        candidate =>
-
-          candidate.driverId ===
-          current.driverId
-
-      );
-
-
-
-
+    const driver = candidates.find(
+      candidate => candidate.driverId === current.driverId
+    );
 
     if (!driver) {
-
-
-      DispatchState.next(
-
-        orderId
-
-      );
-
-
-      return this.offerNextDriver(
-
-        request,
-
-        candidates
-
-      );
-
+      await DispatchState.next(orderId);
+      return this.offerNextDriver(request, candidates);
     }
-
-
 
     if (driver.autoAcceptEnabled) {
-
-      logger.info(`[DISPATCH] order ${orderId}: driver ${driver.driverId} punya autoAcceptEnabled=true, mencoba acceptOffer otomatis...`);
+      logger.info(`[DISPATCH] order ${orderId}: driver ${driver.driverId} autoAcceptEnabled=true, mencoba auto-accept...`);
 
       try {
-
         await this.acceptOffer(orderId, driver.driverId);
         logger.info(`[DISPATCH] order ${orderId}: AUTO-ACCEPT BERHASIL oleh driver ${driver.driverId}`);
-        return; // Sudah diterima otomatis -- tidak perlu lanjut ke offer manual.
-
+        return;
       } catch (err: any) {
-
-        // Race condition (mis. order sudah diambil driver lain di jalur manual
-        // sesaat sebelum auto-accept ini sempat jalan) -- lanjut ke kandidat
-        // berikutnya seperti biasa, JANGAN gagalkan seluruh proses dispatch.
-        //
-        // PERBAIKAN: sebelumnya error di sini DIBUANG TOTAL TANPA LOG --
-        // kalau acceptOffer gagal karena BUKAN race condition (mis. bug),
-        // tidak ada jejak sama sekali kenapa "auto accept gagal".
-        logger.error(`[DISPATCH] order ${orderId}: auto-accept driver ${driver.driverId} GAGAL: ${err?.message || err} -- lanjut ke kandidat berikutnya.`);
-        DispatchState.next(orderId);
+        logger.error(`[DISPATCH] order ${orderId}: auto-accept GAGAL: ${err?.message || err} -- lanjut ke kandidat berikutnya.`);
+        await DispatchState.next(orderId);
         return this.offerNextDriver(request, candidates);
-
       }
-
     }
 
-
-
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Emit offer
-    |--------------------------------------------------------------------------
-    */
-
-
     SocketService.emitToUser(
-
       driver.userId,
-
-
       DISPATCH_CONSTANTS.NEW_ORDER_EVENT,
-
-
       {
-
-
         orderId,
-
-
-        serviceType:
-          request.order.serviceType,
-
-
-        pickupAddress:
-          request.order.pickupAddress,
-
-
-        dropoffAddress:
-          request.order.dropoffAddress,
-
-
-        pickupLat:
-          request.order.pickupLat,
-
-
-        pickupLng:
-          request.order.pickupLng,
-
-
-        dropoffLat:
-          request.order.dropoffLat,
-
-
-        dropoffLng:
-          request.order.dropoffLng,
-
-
-        distanceKm:
-          request.order.distanceKm,
-
-
-        price:
-          request.order.price,
-
-
-        etaMinutes:
-          driver.etaMinutes,
-
-
-        distanceMeters:
-          driver.distanceMeters,
-
-
+        serviceType: request.order.serviceType,
+        pickupAddress: request.order.pickupAddress,
+        dropoffAddress: request.order.dropoffAddress,
+        pickupLat: request.order.pickupLat,
+        pickupLng: request.order.pickupLng,
+        dropoffLat: request.order.dropoffLat,
+        dropoffLng: request.order.dropoffLng,
+        distanceKm: request.order.distanceKm,
+        price: request.order.price,
+        etaMinutes: driver.etaMinutes,
+        distanceMeters: driver.distanceMeters,
       }
-
     );
 
-
-
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Offer Timeout
-    |--------------------------------------------------------------------------
-    */
-
-
-    DispatchScheduler.start(
-
+    await DispatchScheduler.start(
       orderId,
-
-
       DISPATCH_CONSTANTS.OFFER_TIMEOUT_SECONDS,
-
-
-      async()=>{
-
-
-        // PERBAIKAN: sebelumnya driver yang offer-nya kadaluwarsa (tidak
-        // merespons dalam OFFER_TIMEOUT_SECONDS) tidak pernah diberi tahu
-        // -- dispatch diam-diam pindah ke kandidat berikutnya sementara
-        // ring/bell di HP driver itu terus berbunyi tanpa henti sampai
-        // mereka pindah halaman. Kirim 'order_timeout' supaya frontend
-        // (DriverApp.tsx) bisa menghentikan ring loop untuk driver ini.
+      async () => {
         SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId });
 
-        if (
-
-          DispatchState.hasAccepted(
-
-            orderId
-
-          )
-
-        ) {
-
+        const hasAccepted = await DispatchState.hasAccepted(orderId);
+        if (hasAccepted) {
           return;
-
         }
 
-
-
-        DispatchState.next(
-
-          orderId
-
-        );
-
-
-
-        await this.offerNextDriver(
-
-          request,
-
-          candidates
-
-        );
-
-
+        await DispatchState.next(orderId);
+        await this.offerNextDriver(request, candidates);
       }
-
     );
-
-
   }
-
-
-
-
-
 
   /*
   |--------------------------------------------------------------------------
   | Accept Driver Offer
   |--------------------------------------------------------------------------
   */
-
-  async acceptOffer(
-
-    orderId:string,
-
-    driverId:string
-
-  ){
-
-
-
-    const current =
-
-      DispatchState.current(
-
-        orderId
-
-      );
-
-
-
-
-    if(!current){
-
-
-      throw new Error(
-        "Dispatch session tidak ditemukan"
-      );
-
-
+  async acceptOffer(orderId: string, driverId: string) {
+    const current = await DispatchState.current(orderId);
+    if (!current) {
+      throw new Error("Dispatch session tidak ditemukan");
     }
 
-
-
-
-
-    if(
-
-      current.driverId !== driverId
-
-    ){
-
-
-      throw new Error(
-        "Driver bukan penerima offer aktif"
-      );
-
-
+    if (current.driverId !== driverId) {
+      throw new Error("Driver bukan penerima offer aktif");
     }
 
-
-
-
-
-    const locked =
-
-      DispatchLock.acquire(
-
-        orderId
-
-      );
-
-
-
-    if(!locked){
-
-
-      throw new Error(
-        "Order sedang diproses"
-      );
-
-
+    const locked = await DispatchLock.acquire(orderId);
+    if (!locked) {
+      throw new Error("Order sedang diproses");
     }
-
-
-
-
 
     try {
+      await DispatchState.accept(orderId, driverId);
+      await DispatchScheduler.cancel(orderId);
 
+      const order = await this.repository.assignDriver(orderId, driverId);
+      await DispatchState.clear(orderId);
 
-
-      DispatchState.accept(
-
-        orderId,
-
-        driverId
-
-      );
-
-
-
-
-      DispatchScheduler.cancel(
-
-        orderId
-
-      );
-
-
-
-
-      const order =
-
-        await this.repository.assignDriver(
-
-          orderId,
-
-          driverId
-
-        );
-
-
-
-
-      DispatchState.clear(
-
-        orderId
-
-      );
-
-      // Realtime: sebelumnya jalur acceptOffer ini (penerimaan offer sequential
-      // dispatch, bukan job pool manual) TIDAK PERNAH memberi tahu customer
-      // sama sekali bahwa driver sudah menerima order — celah diam-diam yang
-      // membalikkan tujuan utama Dispatch Engine ini sendiri.
       try {
         const driverProfile = await this.repository.getDriver(driverId);
         SocketService.emitToOrder(orderId, "order_status_changed", {
@@ -820,87 +284,27 @@ export class DispatchService {
         SocketService.emitToDriversPool("order_taken", { orderId });
         SocketService.emitToAdmins("order_accepted", { orderId });
       } catch {
-        // Socket.IO belum siap — abaikan, order tetap berhasil di-assign.
+        // Socket.IO belum siap
       }
-
-
-
 
       return order;
 
-
-
+    } finally {
+      await DispatchLock.release(orderId);
     }
-
-    finally {
-
-
-      DispatchLock.release(
-
-        orderId
-
-      );
-
-
-    }
-
-
   }
-
-
-
-
-
 
   /*
   |--------------------------------------------------------------------------
   | Dispatch Status
   |--------------------------------------------------------------------------
   */
-
-  getStatus(
-
-    orderId:string
-
-  ){
-
-
-    const current =
-
-      DispatchState.current(
-
-        orderId
-
-      );
-
-
-
+  async getStatus(orderId: string) {
+    const current = await DispatchState.current(orderId);
     return {
-
-
       orderId,
-
-
-      currentDriverId:
-
-        current?.driverId ?? null,
-
-
-
-      hasActiveSession:
-
-        DispatchState.exists(
-
-          orderId
-
-        )
-
-
+      currentDriverId: current?.driverId ?? undefined,
+      hasActiveSession: await DispatchState.exists(orderId),
     };
-
-
   }
-
-
-
 }

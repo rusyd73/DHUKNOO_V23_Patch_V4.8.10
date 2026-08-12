@@ -72,4 +72,93 @@ export const AdminAPI = {
     link.remove();
     window.URL.revokeObjectURL(blobUrl);
   },
+
+  // ============================================================
+  // 🔒 TARIFF MANAGEMENT (Admin only)
+  // ============================================================
+
+  // Get all pricing rules (filter by serviceType optional)
+  getPricingRules: async (serviceType?: string) =>
+    (await api.get('/api/tariff/rules', { params: { serviceType } })).data,
+
+  // Create new pricing rule
+  createPricingRule: async (data: {
+    serviceType: string;
+    baseFare: number;
+    pickupFee?: number;
+    perKmFee: number;
+    perMinuteWaitFee?: number;
+    zoneId?: string;
+  }) =>
+    (await api.post('/api/tariff/rules', data)).data,
+
+  // Update existing pricing rule
+  updatePricingRule: async (id: string, data: any) =>
+    (await api.patch(`/api/tariff/rules/${id}`, data)).data,
+
+  // ============================================================
+  // 🔒 PRICING ZONE MANAGEMENT (Admin only)
+  // ============================================================
+
+  // Get all pricing zones
+  getPricingZones: async () =>
+    (await api.get('/api/tariff/zones')).data,
+
+  // Create new pricing zone
+  createPricingZone: async (name: string) =>
+    (await api.post('/api/tariff/zones', { name })).data,
+
+  // ============================================================
+  // 🔒 REGIONAL POLICY MANAGEMENT (Admin only)
+  // ============================================================
+
+  // Get all regional policies
+  getRegionalPolicies: async () =>
+    (await api.get('/api/tariff/regional-policies')).data,
+
+  // Create new regional policy
+  createRegionalPolicy: async (data: {
+    zoneId: string;
+    tollFee?: number;
+    parkingFee?: number;
+    weatherSurcharge?: number;
+    holidaySurcharge?: number;
+  }) =>
+    (await api.post('/api/tariff/regional-policies', data)).data,
+
+  // Update regional policy
+  updateRegionalPolicy: async (id: string, data: any) =>
+    (await api.patch(`/api/tariff/regional-policies/${id}`, data)).data,
+
+  // ============================================================
+  // 🔒 TARIFF VERSION MANAGEMENT (Admin only)
+  // ============================================================
+
+  // Get all tariff versions
+  getTariffVersions: async () =>
+    (await api.get('/api/tariff/versions')).data,
+
+  // Create new tariff version
+  createTariffVersion: async (data: {
+    versionName: string;
+    commissionTiers: Array<{ maxOrderValue: number | null; rate: number }>;
+    description?: string;
+  }) =>
+    (await api.post('/api/tariff/versions', data)).data,
+
+  // Activate tariff version
+  activateTariffVersion: async (id: string) =>
+    (await api.post(`/api/tariff/versions/${id}/activate`)).data,
+
+  // ============================================================
+  // 🔒 PLATFORM CONFIG MANAGEMENT (Admin only)
+  // ============================================================
+
+  // Get all platform configs
+  getPlatformConfigs: async () =>
+    (await api.get('/api/tariff/config')).data,
+
+  // Update platform config
+  updatePlatformConfig: async (key: string, value: string, description?: string) =>
+    (await api.put(`/api/tariff/config/${key}`, { value, description })).data,
 };

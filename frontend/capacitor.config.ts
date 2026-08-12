@@ -31,10 +31,12 @@ import type { CapacitorConfig } from '@capacitor/cli';
  *      c. `npx cap sync android`
  *      d. Buka folder `android/` di Android Studio, Build > Build APK
  *
- * 6. Kalau backend masih pakai HTTP biasa (bukan HTTPS) — WAJIB, karena
- *    Android sejak API 28 memblokir cleartext traffic secara default.
- *    Config `cleartext: true` di bawah sudah menangani ini untuk mode
- *    development. Untuk rilis produksi sungguhan, pakai HTTPS di backend.
+ * 6. Kalau backend masih pakai HTTP biasa (bukan HTTPS) — WAJIB set env
+ *    DHUKNOO_CLEARTEXT=true sebelum `npx cap sync android`, karena
+ *    Android sejak API 28 memblokir cleartext traffic secara default:
+ *      DHUKNOO_CLEARTEXT=true npx cap sync android
+ *    Untuk rilis produksi sungguhan, JANGAN di-set (default aman/false)
+ *    dan pakai HTTPS di backend.
  * ================================================================
  */
 const config: CapacitorConfig = {
@@ -42,9 +44,22 @@ const config: CapacitorConfig = {
   appName: 'DHUKNOO',
   webDir: 'dist',
   server: {
-    // WAJIB untuk testing lokal lewat HTTP (bukan HTTPS) -- Android API 28+
-    // memblokir cleartext traffic by default, ini yang membuka izinnya.
-    cleartext: true,
+    // 🆕 FIX "Android architecture" (audit lanjutan): SEBELUMNYA
+    // `cleartext: true` di-set TANPA SYARAT di sini -- artinya APK
+    // RILIS PRODUKSI (Mode B) JUGA ikut membawa izin cleartext traffic
+    // (HTTP polos, bukan HTTPS) permanen, bukan cuma build development.
+    // Ini memperlebar permukaan serangan produksi secara tidak perlu
+    // (WebView jadi bisa membuat request HTTP polos ke domain apa pun,
+    // rentan downgrade/MITM) walau backend produksi sungguhan sudah
+    // pakai HTTPS -- flag ini tidak akan pernah "otomatis mati sendiri"
+    // hanya karena URL yang dipakai kebetulan https.
+    //
+    // Sekarang: cleartext HANYA aktif kalau developer secara SADAR
+    // mengisi env DHUKNOO_CLEARTEXT=true sebelum menjalankan
+    // `npx cap sync android` (dipakai untuk testing lokal HTTP biasa,
+    // lihat panduan Mode A/B di atas). Default (tidak di-set) = false,
+    // aman untuk build production/rilis.
+    cleartext: process.env.DHUKNOO_CLEARTEXT === 'true',
 
     // MODE A (Live Reload) -- uncomment 2 baris di bawah & isi dengan IP LAN
     // komputer Anda + port Vite dev server (default 5173):

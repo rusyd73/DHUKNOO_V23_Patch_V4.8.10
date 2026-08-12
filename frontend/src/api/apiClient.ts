@@ -51,8 +51,17 @@ export const api = createApiClient(
 // terpakai dua kali.
 let refreshInFlight: Promise<{ accessToken: string; refreshToken: string }> | null = null;
 
-async function performTokenRefresh(rToken: string): Promise<{ accessToken: string; refreshToken: string }> {
-  const res = await api.post(API_ENDPOINTS.auth.refresh, { refreshToken: rToken });
+// 🆕 FIX "Refresh security" (audit lanjutan): rToken sekarang bisa
+// null/undefined DI WEB SETELAH RELOAD HALAMAN (refreshToken sengaja
+// TIDAK LAGI disimpan di localStorage sama sekali, lihat
+// store/useAuthStore.ts + lib/secureTokenStorage.ts -- httpOnly cookie
+// yang jadi satu-satunya pembawa refresh token di web). rToken hanya
+// dikirim di body kalau memang ADA (native, atau web yang baru saja
+// login di tab yang sama) -- kalau tidak ada, body dikirim kosong dan
+// backend tetap bisa membaca refresh token dari cookie httpOnly (lihat
+// auth.controller.ts: `req.cookies?.refreshToken || req.body?.refreshToken`).
+async function performTokenRefresh(rToken?: string | null): Promise<{ accessToken: string; refreshToken: string }> {
+  const res = await api.post(API_ENDPOINTS.auth.refresh, rToken ? { refreshToken: rToken } : {});
   const newAccessToken = res.data?.accessToken;
   const newRefreshToken = res.data?.refreshToken || rToken;
 
@@ -98,33 +107,32 @@ api.interceptors.response.use(
 
       const rToken = useAuthStore.getState().refreshToken;
 
-      // PERBAIKAN: sebelumnya kalau refreshToken ASLI tidak ada, dipakai
-      // refreshToken KARANGAN ("rtoken_<userId>") yang pasti ditolak backend,
-      // lalu kalau panggilan refresh itu gagal, fallback-nya malah mengarang
-      // ACCESS TOKEN palsu lagi supaya "sesi tetap terlihat aktif" — padahal
-      // sesi itu sudah tidak valid. Ini yang bikin app diam-diam mengira user
-      // masih login padahal semua request selanjutnya pasti 403 terus.
-      // Sekarang: kalau tidak ada refreshToken asli, atau refresh gagal,
-      // user di-logout beneran (bersih) supaya mereka login ulang dan dapat
-      // token asli yang valid, bukan dibiarkan "nyangkut" di sesi rusak.
-      if (rToken) {
-        try {
-          // Kalau sudah ada refresh yang sedang berjalan (dipicu request 401
-          // lain), tumpangi promise yang sama -- JANGAN mulai refresh baru.
-          if (!refreshInFlight) {
-            refreshInFlight = performTokenRefresh(rToken).finally(() => {
-              refreshInFlight = null;
-            });
-          }
-          const { accessToken: newAccessToken } = await refreshInFlight;
-
-          originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
-          return api(originalRequest);
-        } catch {
-          useAuthStore.getState().logout();
-          return Promise.reject(error);
+      // 🆕 FIX "Refresh security": SEBELUMNYA kalau `rToken` falsy,
+      // refresh TIDAK PERNAH dicoba sama sekali -- langsung logout.
+      // Itu benar SELAMA refreshToken selalu ada di localStorage. TAPI
+      // sekarang refreshToken SENGAJA tidak lagi disimpan di client di
+      // WEB (lihat komentar di atas performTokenRefresh) -- rToken
+      // akan SELALU null di web setelah reload halaman, PADAHAL cookie
+      // httpOnly-nya sendiri mungkin masih benar-benar valid. Kalau
+      // tetap langsung logout tanpa mencoba, user ter-logout paksa
+      // setiap reload halaman walau sesinya sebenarnya masih hidup.
+      // Sekarang SELALU dicoba refresh (rToken dikirim kalau ada,
+      // kosong kalau tidak -- backend tetap baca dari cookie) --
+      // logout HANYA terjadi kalau refresh-nya sendiri benar-benar
+      // gagal (cookie juga sudah tidak valid/kedaluwarsa).
+      try {
+        // Kalau sudah ada refresh yang sedang berjalan (dipicu request 401
+        // lain), tumpangi promise yang sama -- JANGAN mulai refresh baru.
+        if (!refreshInFlight) {
+          refreshInFlight = performTokenRefresh(rToken).finally(() => {
+            refreshInFlight = null;
+          });
         }
-      } else {
+        const { accessToken: newAccessToken } = await refreshInFlight;
+
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return api(originalRequest);
+      } catch {
         useAuthStore.getState().logout();
         return Promise.reject(error);
       }

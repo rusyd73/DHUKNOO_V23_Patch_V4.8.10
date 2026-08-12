@@ -1,0 +1,336 @@
+import { prisma } from '../../config/prisma';
+import { AppError } from '../../core/errors/AppError';
+import { logger } from '../../config/logger';
+import { AuditLogger } from '../../core/logging/audit.logger';
+import { SocketService } from '../../websocket/socket';
+import crypto from 'crypto';
+import { WalletRepository } from './wallet.repository';
+
+export class WalletAdminService {
+  private walletRepo = new WalletRepository();
+
+  // ============================================================
+  // 🔒 LIST PENDING REQUESTS
+  // ============================================================
+  async listPendingRequests() {
+    return prisma.topupRequest.findMany({
+      where: { status: 'PENDING_REVIEW' },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  // ============================================================
+  // 🔒 APPROVE TOPUP
+  // ============================================================
+  async approveTopup(
+    adminId: string,
+    requestId: string,
+    reviewNote?: string
+  ) {
+    const request = await prisma.topupRequest.findUnique({
+      where: { id: requestId },
+      include: { user: true },
+    });
+
+    if (!request) {
+      throw new AppError('Topup request not found', 404);
+    }
+
+    if (request.status !== 'PENDING_REVIEW') {
+      throw new AppError(`Request already ${request.status}`, 400);
+    }
+
+    if (!request.user.isActive) {
+      throw new AppError('User account is inactive', 400);
+    }
+
+    const requestAge = Date.now() - new Date(request.createdAt).getTime();
+    if (requestAge > 24 * 60 * 60 * 1000) {
+      await prisma.topupRequest.update({
+        where: { id: requestId },
+        data: {
+          status: 'REJECTED',
+          reviewNote: 'Request expired (24 hours)',
+          reviewedBy: adminId,
+          reviewedAt: new Date(),
+        },
+      });
+      throw new AppError('Request expired (24 hours)', 400);
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const updated = await tx.topupRequest.update({
+        where: { id: requestId },
+        data: {
+          status: 'APPROVED',
+          reviewNote: reviewNote || 'Approved by admin',
+          reviewedBy: adminId,
+          reviewedAt: new Date(),
+        },
+      });
+
+      let wallet = await tx.wallet.findUnique({
+        where: { userId: request.userId },
+      });
+
+      if (!wallet) {
+        wallet = await tx.wallet.create({
+          data: {
+            userId: request.userId,
+            balance: 0,
+          },
+        });
+      }
+
+      // 🆕 FIX "Wallet architecture": disatukan ke WalletRepository.applyDelta()
+      // (satu-satunya jalur mutasi wallet yang punya guard anti-saldo-negatif
+      // & representasi Transaction.amount bertanda konsisten) -- sebelumnya
+      // di sini pakai tx.wallet.update({increment}) manual + tx.transaction.create()
+      // terpisah, jalur berbeda dari applyDelta() yang dipakai payment.service.ts.
+      const { wallet: updatedWallet } = await this.walletRepo.applyDelta(
+        tx,
+        wallet.id,
+        Number(request.amount),
+        'TOPUP',
+        `Topup via ${request.method} - approved by admin`,
+        undefined,
+        `topup-${requestId}`
+      );
+
+      return { updated, updatedWallet };
+    });
+
+    await AuditLogger.log(
+      adminId,
+      'TOPUP_APPROVED',
+      `Approved topup Rp${request.amount} for user ${request.userId} (request: ${requestId})`
+    );
+
+    try {
+      SocketService.emitToUser(request.userId, 'topup_approved', {
+        requestId,
+        amount: request.amount,
+        newBalance: result.updatedWallet.balance,
+      });
+    } catch {
+      // Socket belum siap
+    }
+
+    logger.info(`[TOPUP] Approved: ${requestId} - User ${request.userId} - Rp${request.amount}`);
+
+    return result.updated;
+  }
+
+  // ============================================================
+  // 🔒 REJECT TOPUP
+  // ============================================================
+  async rejectTopup(
+    adminId: string,
+    requestId: string,
+    reason: string
+  ) {
+    const request = await prisma.topupRequest.findUnique({
+      where: { id: requestId },
+    });
+
+    if (!request) {
+      throw new AppError('Topup request not found', 404);
+    }
+
+    if (request.status !== 'PENDING_REVIEW') {
+      throw new AppError(`Request already ${request.status}`, 400);
+    }
+
+    const updated = await prisma.topupRequest.update({
+      where: { id: requestId },
+      data: {
+        status: 'REJECTED',
+        reviewNote: reason,
+        reviewedBy: adminId,
+        reviewedAt: new Date(),
+      },
+    });
+
+    await AuditLogger.log(
+      adminId,
+      'TOPUP_REJECTED',
+      `Rejected topup Rp${request.amount} for user ${request.userId} - Reason: ${reason}`
+    );
+
+    try {
+      SocketService.emitToUser(request.userId, 'topup_rejected', {
+        requestId,
+        reason,
+      });
+    } catch {
+      // Socket belum siap
+    }
+
+    logger.info(`[TOPUP] Rejected: ${requestId} - User ${request.userId} - Reason: ${reason}`);
+
+    return updated;
+  }
+
+  // ============================================================
+  // 🔒 CREDIT USER WALLET (SATU-SATUNYA JALUR SAH ADMIN MENAMBAH
+  // SALDO USER LAIN SECARA LANGSUNG, DI LUAR ANTREAN TopupRequest)
+  //
+  // Menggantikan bypass lama 'role===ADMIN' di POST /api/wallet/topup
+  // yang mengkredit wallet PEMANGGIL SENDIRI tanpa target eksplisit,
+  // tanpa alasan, tanpa batas nominal, dan tanpa jejak audit yang jelas.
+  //
+  // Aturan wajib di sini:
+  // - targetUserId WAJIB diisi (divalidasi UUID di schema)
+  // - TIDAK BOLEH menyasar diri sendiri (admin tidak bisa credit ke akunnya sendiri)
+  // - dibatasi Rp50.000.000 per transaksi (sudah divalidasi di adminWalletCreditSchema,
+  //   dicek ulang di sini sebagai defense-in-depth)
+  // - reason wajib diisi (untuk audit)
+  // - full audit log via AuditLogger + notifikasi socket ke target user
+  // ============================================================
+  async creditUserWallet(
+    adminId: string,
+    targetUserId: string,
+    amount: number,
+    reason: string,
+    idempotencyKey?: string
+  ) {
+    if (targetUserId === adminId) {
+      throw new AppError(
+        'Admin tidak boleh mengkredit saldo ke akunnya sendiri. Gunakan flow topup-request biasa jika perlu menambah saldo akun Anda sendiri.',
+        403
+      );
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new AppError('Nominal harus lebih dari 0!', 400);
+    }
+
+    const MAX_CREDIT_PER_TX = 50_000_000;
+    if (amount > MAX_CREDIT_PER_TX) {
+      throw new AppError(
+        `Nominal maksimal Rp${MAX_CREDIT_PER_TX.toLocaleString('id-ID')} per transaksi!`,
+        400
+      );
+    }
+
+    if (!reason || reason.trim().length < 5) {
+      throw new AppError('Alasan wajib diisi, minimal 5 karakter (untuk audit)!', 400);
+    }
+
+    const targetUser = await prisma.user.findUnique({ where: { id: targetUserId } });
+    if (!targetUser) {
+      throw new AppError('User target tidak ditemukan!', 404);
+    }
+    if (!targetUser.isActive) {
+      throw new AppError('User target tidak aktif!', 400);
+    }
+
+    // 🆕 FIX IDEMPOTENCY KRITIS: versi sebelumnya generate
+    // `admin-credit-${adminId}-${targetUserId}-${Date.now()}` -- key
+    // BERUBAH tiap milidetik, jadi @unique constraint di Transaction
+    // TIDAK PERNAH kena collision, dan double-klik tombol atau retry
+    // jaringan dari dashboard admin akan MENGKREDIT DUA KALI tanpa
+    // terdeteksi sama sekali.
+    //
+    // Sekarang: kalau client kirim idempotencyKey (disarankan --
+    // dashboard admin generate 1 UUID per klik tombol dan kirim ulang
+    // key yang SAMA kalau request di-retry), key itu dipakai apa
+    // adanya. Sebelum insert, dicek dulu apakah key ini SUDAH PERNAH
+    // dipakai -- kalau sudah, request dianggap REPLAY dari transaksi
+    // yang sama dan hasil transaksi ASLI dikembalikan (bukan dikredit
+    // ulang, dan bukan error generik yang bikin client retry lagi).
+    //
+    // Kalau client TIDAK kirim idempotencyKey sama sekali, server
+    // generate key acak (crypto.randomUUID) SEKALI per panggilan --
+    // ini tidak melindungi dari double-klik (server tidak tahu 2
+    // request berbeda itu "niat" yang sama atau bukan), makanya
+    // idempotencyKey di schema Zod sangat disarankan diisi client,
+    // bukan cuma opsional secara default di UI.
+    const key = idempotencyKey || `admin-credit-${adminId}-${targetUserId}-${crypto.randomUUID()}`;
+
+    if (idempotencyKey) {
+      const existing = await prisma.transaction.findUnique({
+        where: { idempotencyKey: key },
+        include: { wallet: true },
+      });
+      if (existing) {
+        logger.info(`[WALLET] Idempotent replay terdeteksi untuk key ${key} -- mengembalikan hasil transaksi asli, TIDAK mengkredit ulang.`);
+        return { updatedWallet: existing.wallet, transaction: existing, replayed: true };
+      }
+    }
+
+    let result;
+    try {
+      result = await prisma.$transaction(async (tx) => {
+        let wallet = await tx.wallet.findUnique({ where: { userId: targetUserId } });
+
+        if (!wallet) {
+          wallet = await tx.wallet.create({
+            data: { userId: targetUserId, balance: 0 },
+          });
+        }
+
+        // 🆕 FIX "Wallet architecture": disatukan ke applyDelta() (lihat
+        // catatan yang sama di approveTopupRequest di atas).
+        const { wallet: updatedWallet, transaction } = await this.walletRepo.applyDelta(
+          tx,
+          wallet.id,
+          amount,
+          'ADMIN_CREDIT',
+          `Kredit manual oleh Admin: ${reason}`,
+          undefined,
+          key
+        );
+
+        return { updatedWallet, transaction };
+      });
+    } catch (err: any) {
+      // Race: dua request dengan idempotencyKey sama nyaris bersamaan
+      // lolos pengecekan findUnique di atas tapi tabrakan di unique
+      // constraint DB -- P2002 dari Prisma. Ambil transaksi yang
+      // BERHASIL masuk duluan, jangan anggap ini error ke client.
+      if (err?.code === 'P2002' && idempotencyKey) {
+        const existing = await prisma.transaction.findUnique({
+          where: { idempotencyKey: key },
+          include: { wallet: true },
+        });
+        if (existing) {
+          logger.warn(`[WALLET] Race condition idempotency key ${key} -- mengembalikan transaksi yang menang race.`);
+          return { updatedWallet: existing.wallet, transaction: existing, replayed: true };
+        }
+      }
+      throw err;
+    }
+
+    await AuditLogger.log(
+      adminId,
+      'ADMIN_WALLET_CREDIT',
+      `Admin ${adminId} mengkredit Rp${amount.toLocaleString('id-ID')} ke user ${targetUserId}. Alasan: ${reason}`
+    );
+
+    try {
+      SocketService.emitToUser(targetUserId, 'wallet_credited_by_admin', {
+        amount,
+        reason,
+        newBalance: result.updatedWallet.balance,
+      });
+    } catch {
+      // Socket belum siap
+    }
+
+    logger.info(
+      `[WALLET] Admin ${adminId} credited Rp${amount} to user ${targetUserId}. Reason: ${reason}`
+    );
+
+    return result;
+  }
+}

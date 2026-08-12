@@ -1,6 +1,31 @@
 import axios from 'axios';
 
+// 🆕 FIX API DUPLICATION + ANDROID ARCHITECTURE + REFRESH COOKIE
+// INTEGRATION (audit lanjutan): file ini adalah SATU-SATUNYA implementasi
+// @obama/shared-api yang benar-benar dipakai app -- resolusi module
+// `@obama/shared-api` di frontend (npm workspaces, lihat root package.json
+// "workspaces": ["frontend","packages/*"] + packages/shared-api/package.json
+// name:"@obama/shared-api") SELALU jatuh ke sini, TIDAK PERNAH ke
+// frontend/src/shared-packages/shared-api.ts (file itu dead code -- tidak
+// ada satupun import yang memakainya, dan tidak ada resolve.alias di
+// vite.config.ts yang mengarahkan ke sana). Akibatnya: perbaikan
+// withCredentials/Android-baseURL/dst yang sebelumnya "sudah dikerjakan"
+// di file yang salah TIDAK PERNAH benar-benar berlaku di app sungguhan.
+// Sekarang dipindah & digabung ke sini, satu-satunya sumber kebenaran.
 export const getApiBaseUrl = () => {
+  // 🆕 FIX ANDROID: VITE_API_BASE_URL (dipakai README-ANDROID.md &
+  // capacitor.config.ts) sebelumnya TIDAK PERNAH dibaca di sini sama
+  // sekali -- hanya VITE_API_URL yang dicek, dan HANYA di cabang
+  // isLocalDev. Build production APK (bukan localhost) jatuh ke cabang
+  // "return window.location.origin" di bawah, yang di dalam WebView
+  // Capacitor adalah skema internal app ("capacitor://localhost" /
+  // "https://localhost") -- BUKAN alamat backend sungguhan. Semua
+  // request API & koneksi Socket.IO gagal total di HP untuk build APK
+  // mandiri manapun. Sekarang VITE_API_BASE_URL dicek PALING DULU,
+  // sebelum cabang lain apa pun, konsisten dengan dokumentasi Android.
+  const explicitBaseUrl = (import.meta as any)?.env?.VITE_API_BASE_URL;
+  if (explicitBaseUrl) return explicitBaseUrl;
+
   if (typeof window === 'undefined') return 'http://localhost:3000';
 
   const isLocalDev =
@@ -15,8 +40,10 @@ export const getApiBaseUrl = () => {
     return (import.meta as any).env?.VITE_API_URL || 'http://localhost:3000';
   }
 
-  // Production: asumsikan backend di-reverse-proxy di origin yang sama
-  // (mis. lewat Nginx), jadi tetap pakai origin apa adanya.
+  // Production web: asumsikan backend di-reverse-proxy di origin yang sama
+  // (mis. lewat Nginx), jadi tetap pakai origin apa adanya. (Build Android
+  // production HARUS mengisi VITE_API_BASE_URL -- ditangani di cabang
+  // paling atas fungsi ini, tidak akan pernah sampai baris ini.)
   return window.location.origin;
 };
 
@@ -29,6 +56,14 @@ export const createApiClient = (
     headers: {
       "Content-Type": "application/json",
     },
+    // 🆕 FIX REFRESH COOKIE INTEGRATION: tanpa withCredentials:true, axios
+    // TIDAK PERNAH mengirim ATAU menerima cookie sama sekali pada request
+    // cross-origin -- persis kondisi app Android/Capacitor, baseURL-nya
+    // memang selalu domain lain dari origin WebView, dan bahkan untuk web
+    // biasa kalau frontend & backend beda subdomain. Cookie httpOnly
+    // refreshToken yang di-set backend (lihat auth.controller.ts) tidak
+    // pernah benar-benar tersimpan di client tanpa ini.
+    withCredentials: true,
   });
 
   api.interceptors.request.use((config: any) => {
@@ -36,7 +71,14 @@ export const createApiClient = (
       const token = getToken();
 
       if (token && config.headers) {
-        console.log("Authorization =", `Bearer ${token}`);
+        // 🆕 FIX HARDCODED SECRETS / TOKEN LEAK: baris
+        // `console.log("Authorization =", \`Bearer ${token}\`)` yang
+        // sebelumnya ada di sini MENCETAK ACCESS TOKEN JWT MENTAH ke
+        // console browser di SETIAP request -- gampang terekam oleh
+        // browser extension jahat, session-replay tool pihak ketiga,
+        // atau siapa pun yang buka DevTools di device yang dipakai
+        // bersama. Dihapus total, bukan cuma di-lower-level jadi debug
+        // log (token sensitif tidak boleh menyentuh console sama sekali).
         config.headers.Authorization = `Bearer ${token}`;
       }
     }

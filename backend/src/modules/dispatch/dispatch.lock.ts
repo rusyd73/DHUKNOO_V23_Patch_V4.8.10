@@ -1,72 +1,12 @@
+// modules/dispatch/dispatch.lock.ts
+import { DispatchRedis } from './dispatch.redis';
+
 export class DispatchLock {
-
-  private static locks =
-    new Set<string>();
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | Acquire
-  |--------------------------------------------------------------------------
-  */
-
-  static acquire(
-    orderId: string
-  ): boolean {
-
-    if (this.locks.has(orderId)) {
-
-      return false;
-
-    }
-
-    this.locks.add(orderId);
-
-    return true;
-
+  static async acquire(orderId: string): Promise<boolean> {
+    return DispatchRedis.acquireLock(orderId);
   }
 
-
-  /*
-  |--------------------------------------------------------------------------
-  | Release
-  |--------------------------------------------------------------------------
-  */
-
-  static release(
-    orderId: string
-  ) {
-
-    this.locks.delete(orderId);
-
+  static async release(orderId: string): Promise<void> {
+    await DispatchRedis.releaseLock(orderId);
   }
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | Locked
-  |--------------------------------------------------------------------------
-  */
-
-  static isLocked(
-    orderId: string
-  ): boolean {
-
-    return this.locks.has(orderId);
-
-  }
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | Clear
-  |--------------------------------------------------------------------------
-  */
-
-  static clear() {
-
-    this.locks.clear();
-
-  }
-
 }

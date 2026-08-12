@@ -1,8 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 🆕 FIX "Android architecture" (audit lanjutan): allowBackup
+         sebelumnya "true" -- WebView app ini menyimpan access token &
+         refresh token JWT di localStorage (lihat useAuthStore.ts).
+         allowBackup="true" mengizinkan data app (termasuk localStorage
+         WebView) ikut tercakup di adb backup / Android Auto Backup ke
+         Google Drive tanpa root di Android <12 -- kalau HP dicuri/
+         diakses orang lain dengan USB debugging aktif, atau backup
+         cloud-nya diakses, token sesi bisa diekstrak dan dipakai
+         membajak akun tanpa perlu password. Diubah ke "false". -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"

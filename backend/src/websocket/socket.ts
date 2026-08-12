@@ -4,7 +4,6 @@ import jwt from "jsonwebtoken";
 import { logger } from "../config/logger";
 import { ENV } from "../config/env";
 import { prisma } from "../config/prisma";
-// 🔥 TAMBAHKAN IMPORT UNTUK REDIS
 import { RedisService } from "../config/redis";
 
 type SocketRole = "CUSTOMER" | "DRIVER" | "ADMIN" | "MERCHANT";
@@ -17,35 +16,36 @@ interface SocketUser {
 
 interface SocketData {
   user: SocketUser;
+  userId?: string;
+  role?: string;
 }
 
 type AppServer = Server<any, any, any, SocketData>;
 type AppSocket = Socket<any, any, any, SocketData>;
 
-const LOCATION_UPDATE_MIN_INTERVAL_MS = 2000; // maksimal 1 update lokasi / 2 detik / socket
-const CHAT_MESSAGE_MIN_INTERVAL_MS = 400; // anti flood chat sederhana
-const SOCKET_PREFIX = 'socket:driver:'; // 🔥 Prefix untuk Redis key
+const LOCATION_UPDATE_MIN_INTERVAL_MS = 2000;
+const CHAT_MESSAGE_MIN_INTERVAL_MS = 400;
+const SOCKET_PREFIX = 'socket:driver:';
+const DRIVER_SOCKETS_SET = 'driver:sockets:';
+const DRIVER_LOCATION_PREFIX = 'driver:location:';
+const ROOM_PREFIX = 'room:';
 
-/**
- * Keamanan Socket.IO:
- * 1. Setiap koneksi WAJIB mengirim JWT (sama seperti REST API) lewat
- *    `socket.handshake.auth.token`. Koneksi tanpa token / token invalid ditolak
- *    di tahap handshake (io.use), sebelum event apa pun bisa dikirim.
- * 2. Setiap client OTOMATIS di-join ke room pribadinya (`user_<userId>`) supaya
- *    emitToUser() selalu sampai ke semua device/tab milik user itu, dan admin
- *    di-join ke room "admins" untuk broadcast operasional (dashboard admin realtime).
- * 3. Join ke room sensitif (`order_<id>`, `driver_<id>`) diverifikasi ke database
- *    dulu — client tidak bisa asal join room order/driver milik orang lain.
- * 4. Event yang mengubah data (driver_location_update, send_chat_message)
- *    diverifikasi kepemilikan/keterlibatan pengirim, dan dibatasi laju (rate-limited)
- *    supaya satu client nakal tidak bisa membanjiri seluruh server.
- */
 export class SocketService {
   private static io: AppServer | null = null;
   private static lastLocationEmitAt = new Map<string, number>();
   private static lastChatEmitAt = new Map<string, number>();
 
   public static init(server: HttpServer): AppServer {
+    // 🆕 FIX "WebSocket security": konsisten dengan fix CORS Express di
+    // app.ts -- sejak env.ts sekarang hard-fail di production kalau
+    // ALLOWED_ORIGINS kosong, cabang '*' di bawah ini SECARA PRAKTIK
+    // hanya bisa kejadian di development (production sudah crash duluan
+    // sebelum sampai sini). Tetap dipertahankan sebagai defense-in-depth
+    // + biar dev tidak perlu set env dulu, tapi didokumentasikan bahwa
+    // kombinasi origin:'*' + credentials:true sebenarnya juga tidak
+    // valid untuk Socket.IO (browser akan menolak handshake polling
+    // transport-nya kalau benar-benar dipakai lintas origin dengan
+    // cookie) -- untuk dev lokal biasanya tidak masalah karena same-origin.
     const allowedOrigins = ENV.ALLOWED_ORIGINS.length > 0 ? ENV.ALLOWED_ORIGINS : "*";
     if (allowedOrigins === "*") {
       logger.warn(
@@ -86,34 +86,41 @@ export class SocketService {
       }
     });
 
+    // ── 2. Connection handler ────────────────────────────────────────────
     this.io.on("connection", (socket: AppSocket) => {
       const user = socket.data.user;
       logger.info(`Socket client connected: ${socket.id} (user=${user.id}, role=${user.role})`);
 
-      // Room pribadi otomatis — dipakai emitToUser()
+      // ✅ SET socket.data untuk disconnect
+      socket.data.userId = user.id;
+      socket.data.role = user.role;
+
+      // Room pribadi otomatis
       socket.join(`user_${user.id}`);
       if (user.role === "ADMIN") {
         socket.join("admins");
       }
 
-      // PERBAIKAN: sebelumnya key Redis untuk cleanup "set offline saat
-      // disconnect" (di bawah) hanya dibuat oleh event 'driver-register',
-      // yang TIDAK PERNAH dipanggil oleh frontend manapun (driver online
-      // status di-toggle lewat REST, bukan socket). Akibatnya driver yang
-      // koneksinya putus (app crash, sinyal hilang, tab ditutup paksa)
-      // TIDAK PERNAH otomatis di-set offline di database -- dispatch
-      // engine akan terus menawarkan order ke driver "hantu" ini sampai
-      // OFFER_TIMEOUT_SECONDS habis sebelum lanjut ke driver berikutnya,
-      // salah satu penyebab order terasa lambat/tidak realtime. Sekarang
-      // key registrasi dibuat langsung saat koneksi socket terbentuk.
+      // ✅ REGISTER MULTIPLE SOCKETS PAKAI REDIS SET (untuk driver)
       if (user.role === "DRIVER") {
+        const setKey = `${DRIVER_SOCKETS_SET}${user.id}`;
+        RedisService.sadd(setKey, socket.id).catch((err) => {
+          logger.error(`[SOCKET] Gagal menambahkan socket driver ${user.id} ke Redis Set: ${(err as Error).message}`);
+        });
+        RedisService.expire(setKey, 60 * 60 * 24 * 7).catch((err) => {
+          logger.error(`[SOCKET] Gagal set expire untuk driver ${user.id}: ${(err as Error).message}`);
+        });
+
+        // SIMPAN juga individual key (untuk backward compatibility)
         RedisService.setex(`${SOCKET_PREFIX}${user.id}`, 60 * 60 * 24 * 7, socket.id).catch((err) => {
           logger.error(`[SOCKET] Gagal mendaftarkan socket driver ${user.id} ke Redis: ${(err as Error).message}`);
         });
+
+        logger.info(`[SOCKET] Driver ${user.id} registered (total sockets: ${RedisService.scard(setKey)})`);
       }
 
       // ──────────────────────────────────────────────────────────────────
-      // 🔥 EVENT HANDLER YANG SUDAH ADA (TIDAK DIUBAH)
+      // 🔥 EVENT HANDLER
       // ──────────────────────────────────────────────────────────────────
 
       /**
@@ -165,7 +172,6 @@ export class SocketService {
           this.io.to(`driver_${data.driverId}`).emit("location_changed", payload);
 
           // Kalau driver sedang punya order aktif, siarkan juga ke room order itu
-          // supaya peta customer ikut bergerak realtime tanpa perlu subscribe manual.
           const activeOrder = await prisma.order.findFirst({
             where: { driverId: driverProfile.id, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED"] } },
             select: { id: true },
@@ -224,15 +230,7 @@ export class SocketService {
       });
 
       /**
-       * PERBAIKAN: Telepon In-App (VoIP) Customer <-> Driver — sebelumnya
-       * frontend (InAppVoipCall.tsx) sudah emit call_initiate/call_answer/
-       * call_reject/call_end, TAPI backend TIDAK PERNAH mendengarkan event
-       * ini sama sekali. Akibatnya panggilan tidak pernah "terhubung"
-       * (stuck di status CALLING/Memanggil... selamanya) karena sinyal
-       * panggilan tidak pernah diteruskan ke pihak lain — beda dengan jalur
-       * chat (send_chat_message) yang sudah benar di-relay ke room order.
-       * Di sini dipakai pola yang SAMA PERSIS seperti send_chat_message:
-       * verifikasi partisipan order, lalu broadcast ke room `order_<id>`.
+       * 🔥 In-App Call events (VoIP) — relay ke room order
        */
       socket.on("call_initiate", async (data: { orderId: string; callerId: string; callerName?: string; callerRole?: string }) => {
         if (!this.io) return;
@@ -307,77 +305,95 @@ export class SocketService {
       });
 
       // ──────────────────────────────────────────────────────────────────
-      // 🔥 [DIHAPUS] LEGACY DUPLICATE HANDLERS: driver-register,
-      // driver-toggle-ready, publish-order, accept-order
+      // 🔥 DISCONNECT - Cleanup (TANPA KEYS * + MULTI DEVICE SUPPORT)
       // ──────────────────────────────────────────────────────────────────
-      // PERBAIKAN (poin #3 - stabilitas): blok event handler ini adalah
-      // implementasi LAMA/DUPLIKAT dari alur order yang sekarang sudah
-      // ditangani dengan benar lewat REST + service layer:
-      //   - toggle online/auto-accept  -> DriverAPI (REST, driverProfile.isOnline)
-      //   - publish/create order       -> OrderService.createOrder (REST)
-      //   - accept order               -> OrderService.acceptOrder /
-      //                                    DispatchService.acceptOffer /
-      //                                    driver/routes/job.routes.ts (REST)
-      // Frontend TIDAK PERNAH memanggil event socket ini (grep
-      // "accept-order"/"driver-register"/"publish-order" di frontend/src
-      // hanya menghasilkan definisi handler, tidak ada `socket.emit` yang
-      // memicunya). Selama masih ada di sini, kode ini adalah jebakan:
-      //   - Melewati semua pengecekan bisnis (verifikasi driver, minimum
-      //     deposit, unconfirmed cash, dsb) yang sudah benar di REST.
-      //   - Broadcast ke SEMUA client (`this.io.emit(...)`) alih-alih ke
-      //     room yang relevan.
-      //   - Nama room-nya salah (`to(orderId)` tanpa prefix "order_"),
-      //     tidak konsisten dengan seluruh sistem room lain di file ini.
-      // Kalau alur ini ternyata memang masih dibutuhkan (mis. untuk versi
-      // Android/iOS native yang belum migrasi ke REST), jangan aktifkan
-      // ulang blok ini apa adanya -- bangun ulang lewat pemanggilan
-      // OrderService/DispatchService yang sama seperti REST, supaya semua
-      // pengecekan bisnis & event realtime tetap konsisten satu jalur.
-
-      // ──────────────────────────────────────────────────────────────────
-      // 🔥 DISCONNECT - Cleanup
-      // ──────────────────────────────────────────────────────────────────
-
       socket.on("disconnect", async () => {
         this.lastLocationEmitAt.delete(socket.id);
         this.lastChatEmitAt.delete(socket.id);
         logger.info(`Socket disconnected : ${socket.id}`);
 
-        // 🔥 Cleanup Redis untuk driver
         try {
-          const keys = await RedisService.keys(`${SOCKET_PREFIX}*`);
-          for (const key of keys) {
-            const socketId = await RedisService.get(key);
-            if (socketId === socket.id) {
-              const driverId = key.replace(SOCKET_PREFIX, "");
-              await RedisService.del(key);
+          const userId = socket.data?.userId;
+          if (!userId) {
+            logger.warn(`[SOCKET] No userId found for socket ${socket.id}`);
+            return;
+          }
 
+          const role = socket.data?.role;
+
+          // ✅ DRIVER: Hapus dari Redis Set (multi-device support)
+          if (role === 'DRIVER') {
+            const setKey = `${DRIVER_SOCKETS_SET}${userId}`;
+            await RedisService.srem(setKey, socket.id);
+
+            // Cek sisa socket aktif
+            const activeSockets = await RedisService.smembers(setKey);
+            const activeCount = activeSockets.length;
+
+            logger.info(`[SOCKET] Driver ${userId} remaining active sockets: ${activeCount}`);
+
+            // 🔒 Driver OFFLINE hanya jika TIDAK ADA socket aktif
+            if (activeCount === 0) {
+              // Hapus individual key
+              await RedisService.del(`${SOCKET_PREFIX}${userId}`);
+
+              // Hapus lokasi
+              await RedisService.del(`${DRIVER_LOCATION_PREFIX}${userId}`);
+
+              // Update status offline di database
               await prisma.driverProfile.update({
-                where: { userId: driverId },
+                where: { userId: userId },
                 data: { isOnline: false }
               });
 
-              logger.info(`🔴 Driver ${driverId} disconnected, set offline`);
-              break;
+              logger.info(`🔴 Driver ${userId} disconnected (all ${activeCount} sockets closed), set offline`);
+            } else {
+              // Masih ada socket aktif, tetap online
+              logger.info(`🟢 Driver ${userId} still online (${activeCount} active sockets)`);
             }
+          } else {
+            // ✅ NON-DRIVER: Langsung hapus key
+            await RedisService.del(`${SOCKET_PREFIX}${userId}`);
           }
+
+          // Hapus room key
+          await RedisService.del(`${ROOM_PREFIX}${userId}`);
+
         } catch (error) {
-          logger.error("Disconnect cleanup error:", error);
+          logger.error("[SOCKET] Disconnect cleanup error:", error);
         }
       });
     });
 
     logger.info("Socket.IO initialized (auth + room authorization enabled).");
-
     return this.io;
   }
 
-  /** Otorisasi join_room: order_<id>, driver_<id>, map_updates, drivers_pool. */
-  private static async canJoinRoom(user: SocketUser, roomId: string): Promise<boolean> {
-    if (user.role === "ADMIN") return true; // admin boleh memantau semua room
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 PRIVATE STATIC METHODS
+  // ──────────────────────────────────────────────────────────────────
 
+  private static async canJoinRoom(user: SocketUser, roomId: string): Promise<boolean> {
+    if (user.role === "ADMIN") return true;
+
+    // 🆕 FIX "WebSocket security" -- KEBOCORAN PRIVASI KRITIS:
+    // sebelumnya kedua room ini bisa di-join SIAPA SAJA yang login
+    // (customer, merchant, bahkan driver lain yang tidak berkepentingan),
+    // tanpa pengecekan role sama sekali:
+    // - "map_updates" menyiarkan lokasi GPS REAL-TIME SEMUA driver
+    //   platform (lihat driver_location_update handler) -- customer/
+    //   merchant manapun bisa join lalu memantau/menguntit pergerakan
+    //   semua driver, bukan cuma driver yang sedang mengantar order
+    //   mereka. Risiko keamanan fisik nyata buat driver.
+    // - "drivers_pool" menyiarkan detail SETIAP order baru
+    //   (pickupAddress, dropoffAddress, price -- lihat
+    //   emitToDriversPool('new_order_available', ...)) ke siapa pun di
+    //   room ini -- customer/merchant manapun bisa join lalu memanen
+    //   alamat rumah & harga order customer LAIN secara real-time.
+    // Sekarang keduanya HANYA untuk role DRIVER (yang memang butuh info
+    // ini untuk bekerja) atau ADMIN (sudah return true di baris atas).
     if (roomId === "map_updates" || roomId === "drivers_pool") {
-      return true; // read-only, tidak membocorkan data sensitif per-individu
+      return user.role === "DRIVER";
     }
 
     if (roomId.startsWith("order_")) {
@@ -391,8 +407,6 @@ export class SocketService {
         const driverProfile = await prisma.driverProfile.findUnique({ where: { userId: user.id } });
         if (driverProfile?.id === driverId) return true;
       }
-      // Customer boleh subscribe room driver HANYA jika driver itu sedang
-      // menangani salah satu order milik customer tsb (untuk lacak peta).
       if (user.role === "CUSTOMER") {
         const customerProfile = await prisma.customerProfile.findUnique({ where: { userId: user.id } });
         if (!customerProfile) return false;
@@ -407,7 +421,6 @@ export class SocketService {
 
     if (roomId === `user_${user.id}`) return true;
 
-    // Room tak dikenal / tidak eksplisit diizinkan -> tolak by default (fail-closed).
     return false;
   }
 
@@ -423,6 +436,10 @@ export class SocketService {
     return false;
   }
 
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 PUBLIC STATIC METHODS
+  // ──────────────────────────────────────────────────────────────────
+
   public static getIO(): AppServer {
     if (!this.io) {
       throw new Error("Socket.IO belum diinisialisasi.");
@@ -430,33 +447,51 @@ export class SocketService {
     return this.io;
   }
 
-  /** Emit ke satu room */
   public static emitToRoom(room: string, event: string, payload: any) {
     if (!this.io) return;
     this.io.to(room).emit(event, payload);
   }
 
-  /** Emit ke satu user (semua device/tab miliknya) */
   public static emitToUser(userId: string, event: string, payload: any) {
     if (!this.io) return;
     this.io.to(`user_${userId}`).emit(event, payload);
   }
 
-  /** Emit ke seluruh participant order */
   public static emitToOrder(orderId: string, event: string, payload: any) {
     if (!this.io) return;
     this.io.to(`order_${orderId}`).emit(event, payload);
   }
 
-  /** Emit ke seluruh admin yang sedang terhubung (dashboard admin realtime) */
   public static emitToAdmins(event: string, payload: any) {
     if (!this.io) return;
     this.io.to("admins").emit(event, payload);
   }
 
-  /** Emit ke seluruh driver yang sedang memantau pool lowongan (order baru masuk) */
   public static emitToDriversPool(event: string, payload: any) {
     if (!this.io) return;
     this.io.to("drivers_pool").emit(event, payload);
+  }
+
+  // ============================================================
+  // 🔒 HELPER: CEK DRIVER ONLINE (PAKAI REDIS SET)
+  // ============================================================
+  public static async isDriverOnline(driverId: string): Promise<boolean> {
+    try {
+      const setKey = `${DRIVER_SOCKETS_SET}${driverId}`;
+      const count = await RedisService.scard(setKey);
+      return count > 0;
+    } catch {
+      const key = `${SOCKET_PREFIX}${driverId}`;
+      const socketId = await RedisService.get(key);
+      return !!socketId;
+    }
+  }
+
+  // ============================================================
+  // 🔒 HELPER: GET DRIVER ACTIVE SOCKETS
+  // ============================================================
+  public static async getDriverSockets(driverId: string): Promise<string[]> {
+    const setKey = `${DRIVER_SOCKETS_SET}${driverId}`;
+    return RedisService.smembers(setKey);
   }
 }

@@ -1,5 +1,6 @@
 import { PromoRepository } from './promo.repository';
 import { AppError, NotFoundError } from '../../core/errors/AppError';
+import { Prisma } from '@prisma/client';
 
 export class PromoService {
   private promoRepo = new PromoRepository();
@@ -48,6 +49,18 @@ export class PromoService {
 
   markUsed(promoId: string) {
     return this.promoRepo.incrementUsage(promoId);
+  }
+
+  // 🆕 FIX "Promo race": dipanggil SEBELUM order benar-benar dibuat
+  // (bukan sesudahnya seperti markUsed() lama), pakai UPDATE atomik
+  // tryIncrementUsage() -- kalau kuota ternyata sudah habis PAS di
+  // detik terakhir (kalah race melawan request lain), order creation
+  // WAJIB dibatalkan di sini, sebelum order/pembayaran apa pun terjadi.
+  async reserveUsage(promoId: string, quota: number, tx?: Prisma.TransactionClient): Promise<void> {
+    const reserved = await this.promoRepo.tryIncrementUsage(promoId, quota, tx);
+    if (!reserved) {
+      throw new AppError('Kuota kode promo ini baru saja habis (dipakai orang lain lebih dulu). Silakan coba tanpa kode promo.', 409);
+    }
   }
 
   createPromo(data: Parameters<PromoRepository['create']>[0]) {

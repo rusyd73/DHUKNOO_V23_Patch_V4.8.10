@@ -10,24 +10,19 @@ import { AuditLogger } from "../../../core/logging/audit.logger";
 import { SocketService } from "../../../websocket/socket";
 import { updateOrderStatusSchema } from "../../../core/validation/schemas";
 import { OrderStatus } from "@prisma/client";
+import { TariffEngineService } from "../../tariff/tariff.service";
 import { PaymentService } from "../../payment/payment.service";
-import { driverEligibilityService } from "../driver-eligibility.service";
-
-const paymentService = new PaymentService();
+import { DriverEligibilityService } from "../services/driver-eligibility.service";
+import { JobService } from "../services/job.service";  // <-- TAMBAHKAN
 
 const router = Router();
+const paymentService = new PaymentService();
+const tariffEngine = new TariffEngineService();
+const eligibilityService = new DriverEligibilityService();
+const jobService = new JobService();  // <-- TAMBAHKAN
+
 export { router as jobRouter };
 
-/*
-|--------------------------------------------------------------------------
-| Valid State Transition
-|--------------------------------------------------------------------------
-| NOTE: memakai OrderStatus yang SUNGGUH ADA di prisma/schema.prisma
-| (PENDING, ACCEPTED, ON_THE_WAY, ARRIVED, COMPLETED, CANCELLED).
-| Versi sebelumnya sempat memakai nama status hasil refactor
-| (ARRIVED_PICKUP/IN_PROGRESS/SEARCHING_DRIVER) yang TIDAK PERNAH
-| dimigrasikan ke schema.prisma — itulah salah satu "link" yang hilang.
-*/
 const allowedTransitions: Record<OrderStatus, OrderStatus[]> = {
   PENDING: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
   ACCEPTED: [OrderStatus.ON_THE_WAY, OrderStatus.CANCELLED],
@@ -43,7 +38,9 @@ const ACTIVE_STATUSES: OrderStatus[] = [
   OrderStatus.ARRIVED,
 ];
 
-// GET /api/driver/jobs - Job pool (PENDING) + order yang sedang ditangani driver ini
+// ============================================================
+// 🔒 GET /api/driver/jobs - HANYA ORDER YANG ELIGIBLE
+// ============================================================
 router.get(
   '/jobs',
   authenticateToken as any,
@@ -55,41 +52,42 @@ router.get(
         return res.status(401).json({ error: 'Tidak terautentikasi' });
       }
 
-      const driverProfile = await prisma.driverProfile.findUnique({
-        where: { userId },
-      });
+      const { limit = 20, offset = 0 } = req.query;
 
-      if (!driverProfile) {
-        return res.status(404).json({ error: 'Profil driver tidak ditemukan!' });
-      }
+      const result = await jobService.getEligibleJobs(
+        userId,
+        Number(limit),
+        Number(offset)
+      );
 
-      const jobs = await prisma.order.findMany({
-        where: {
-          OR: [
-            { status: OrderStatus.PENDING },
-            { driverId: driverProfile.id },
-          ],
+      return res.status(200).json({
+        success: true,
+        data: result.jobs,
+        pagination: {
+          total: result.total,
+          limit: Number(limit),
+          offset: Number(offset),
         },
-        include: {
-          customer: {
-            include: {
-              user: {
-                select: { fullName: true, email: true },
-              },
-            },
-          },
+        metadata: {
+          serviceType: result.serviceType,
+          minimumDeposit: result.minimumDeposit,
+          balance: result.balance,
         },
-        orderBy: { createdAt: 'desc' },
       });
-
-      return res.status(200).json({ jobs });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message });
+      console.error('[GET /jobs] Error:', err);
+      const status = err.message?.includes('not found') ? 404 :
+                     err.message?.includes('not active') ? 403 :
+                     err.message?.includes('offline') ? 403 :
+                     err.message?.includes('tidak mencukupi') ? 403 : 500;
+      return res.status(status).json({ error: err.message || 'Internal Server Error' });
     }
   }
 );
 
-// POST /api/driver/jobs/:orderId/accept - Terima lowongan order (atomic, anti race condition)
+// ============================================================
+// 🔒 POST /api/driver/jobs/:orderId/accept
+// ============================================================
 router.post(
   "/jobs/:orderId/accept",
   authenticateToken as any,
@@ -103,17 +101,74 @@ router.post(
         return res.status(401).json({ error: "Tidak terautentikasi" });
       }
 
-      const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+      const driverProfile = await prisma.driverProfile.findUnique({
+        where: { userId },
+        include: { user: true },
+      });
 
       if (!driverProfile) {
         return res.status(404).json({ error: "Profil driver tidak ditemukan!" });
       }
 
       if (!driverProfile.isVerified) {
-        return res.status(403).json({ error: "Akun belum diverifikasi!" });
+        return res.status(403).json({ error: "Akun driver belum diverifikasi!" });
       }
 
-      // Driver hanya boleh punya SATU order aktif dalam satu waktu.
+      // ============================================================
+      // 🔒 CEK ORDER
+      // ============================================================
+      const orderToClaim = await prisma.order.findUnique({
+        where: { id: orderId },
+        select: { serviceType: true, status: true, pickupLat: true, pickupLng: true },
+      });
+
+      if (!orderToClaim) {
+        return res.status(404).json({ error: "Order tidak ditemukan!" });
+      }
+
+      if (orderToClaim.status !== OrderStatus.PENDING) {
+        return res.status(409).json({ error: "Order sudah tidak tersedia!" });
+      }
+
+      // ============================================================
+      // 🔒 CEK ELIGIBILITY (SATU FUNGSI)
+      // ============================================================
+      const minimumDeposit = await tariffEngine.getMinimumDriverDeposit();
+
+      const eligibility = await eligibilityService.check({
+        driverId: driverProfile.id,
+        order: {
+          serviceType: orderToClaim.serviceType,
+          pickupLat: orderToClaim.pickupLat || 0,
+          pickupLng: orderToClaim.pickupLng || 0,
+        },
+        options: {
+          minimumDeposit,
+          maxDistanceKm: 5,
+          maxDailyOrders: 20,
+          checkLocationFreshness: false,
+        },
+      });
+
+      if (!eligibility.isEligible) {
+        return res.status(403).json({
+          error: `Driver tidak eligible: ${eligibility.reasons.join(', ')}`,
+        });
+      }
+
+      // ============================================================
+      // 🔒 CEK KLASIFIKASI (SEND dan MART dikecualikan)
+      // ============================================================
+      const isSendOrMart = orderToClaim.serviceType === 'SEND' || orderToClaim.serviceType === 'MART';
+      if (!isSendOrMart && orderToClaim.serviceType !== (driverProfile as any).serviceType) {
+        return res.status(403).json({
+          error: `Order ini untuk layanan ${orderToClaim.serviceType}, sedangkan akun Anda terdaftar sebagai driver ${(driverProfile as any).serviceType}.`,
+        });
+      }
+
+      // ============================================================
+      // 🔒 CEK ORDER AKTIF
+      // ============================================================
       const activeOrder = await prisma.order.findFirst({
         where: { driverId: driverProfile.id, status: { in: ACTIVE_STATUSES } },
       });
@@ -124,60 +179,36 @@ router.post(
         });
       }
 
-      // BEKUKAN: driver yang punya order CASH sebelumnya sudah COMPLETED
-      // tapi BELUM dikonfirmasi lunas (isPaid masih false) tidak boleh
-      // menerima order baru apa pun sampai konfirmasi uang tunai diterima
-      // lewat /api/payment/confirm-cash.
+      // ============================================================
+      // 🔒 CEK UNCONFIRMED CASH
+      // ============================================================
       const unconfirmedCash = await prisma.order.findFirst({
-        where: { driverId: (driverProfile as any).id, status: "COMPLETED", paymentMethod: "CASH", isPaid: false },
+        where: {
+          driverId: driverProfile.id,
+          status: "COMPLETED",
+          paymentMethod: "CASH",
+          isPaid: false,
+        },
         select: { id: true },
       });
+
       if (unconfirmedCash) {
         return res.status(403).json({
-          error: `Anda masih punya pembayaran CASH order #${unconfirmedCash.id} yang belum dikonfirmasi diterima. Konfirmasi dulu sebelum bisa menerima order baru.`,
+          error: `Anda masih punya pembayaran CASH order #${unconfirmedCash.id} yang belum dikonfirmasi.`,
         });
       }
 
-      // Gerbang deposit: saldo di bawah minimum tidak boleh menerima order.
-      // 🆕 SATUKAN ELIGIBILITY: sekarang dari DriverEligibilityService yang
-      // sama dipakai Dispatch Engine & Auto-Accept (lihat
-      // driver-eligibility.service.ts) -- bukan lagi logika terpisah di sini.
-      const { eligible: hasEnoughDeposit, currentBalance, minimumDeposit } = await driverEligibilityService.checkDeposit(userId);
-
-      if (!hasEnoughDeposit) {
-        return res.status(403).json({
-          error:
-            `Saldo deposit Anda (Rp${currentBalance.toLocaleString("id-ID")}) ` +
-            `belum memenuhi minimum Rp${minimumDeposit.toLocaleString("id-ID")}.`,
-        });
-      }
-
-      // KUNCI KLASIFIKASI: driver motor tidak boleh ambil order mobil, dsb —
-      // dicek terhadap jenis layanan yang didaftarkan driver ini.
-      //
-      // 🆕 SATUKAN ELIGIBILITY (bug diperbaiki): sebelumnya HANYA order SEND
-      // yang dikecualikan dari klasifikasi di sini, padahal Dispatch Engine
-      // & Auto-Accept sama-sama mengecualikan SEND *dan* MART. Akibatnya
-      // driver bisa ditawari order MART lewat dispatch/auto-accept tapi
-      // ditolak SALAH di sini kalau mencoba klaim manual order MART serupa.
-      // Sekarang memakai aturan yang SAMA persis (matchesServiceType) di
-      // ketiga jalur -- lihat driver-eligibility.service.ts.
-      const orderToClaim = await prisma.order.findUnique({ where: { id: orderId }, select: { serviceType: true } });
-      if (!orderToClaim) {
-        return res.status(404).json({ error: "Order tidak ditemukan!" });
-      }
-      if (!driverEligibilityService.matchesServiceType(orderToClaim.serviceType, (driverProfile as any).serviceType)) {
-        return res.status(403).json({
-          error: `Order ini untuk layanan ${orderToClaim.serviceType}, sedangkan akun Anda terdaftar sebagai driver ${(driverProfile as any).serviceType}.`,
-        });
-      }
-
-      // Atomic accept: updateMany dengan guard status:PENDING mencegah dua driver
-      // sama-sama "berhasil" menerima order yang sama (race condition).
+      // ============================================================
+      // 🔒 ATOMIC ACCEPT
+      // ============================================================
       const updatedOrder = await prisma.$transaction(async (tx) => {
         const result = await tx.order.updateMany({
           where: { id: orderId, status: OrderStatus.PENDING },
-          data: { status: OrderStatus.ACCEPTED, driverId: driverProfile.id, acceptedAt: new Date() },
+          data: {
+            status: OrderStatus.ACCEPTED,
+            driverId: driverProfile.id,
+            acceptedAt: new Date(),
+          },
         });
 
         if (result.count === 0) {
@@ -187,7 +218,7 @@ router.post(
         const orderAfterUpdate = await tx.order.findUnique({
           where: { id: orderId },
           include: {
-            customer: true,
+            customer: { include: { user: { select: { fullName: true, email: true } } } },
             driver: { include: { user: { select: { fullName: true } } } },
           },
         });
@@ -201,7 +232,9 @@ router.post(
         return orderAfterUpdate;
       });
 
-      // Realtime — disiarkan ke room order, room pribadi customer, dan seluruh admin.
+      // ============================================================
+      // 🔒 REALTIME NOTIFICATIONS
+      // ============================================================
       try {
         SocketService.emitToOrder(updatedOrder.id, "order_status_changed", {
           orderId: updatedOrder.id,
@@ -220,27 +253,31 @@ router.post(
         SocketService.emitToDriversPool("order_taken", { orderId: updatedOrder.id });
         SocketService.emitToAdmins("order_accepted", { orderId: updatedOrder.id });
       } catch {
-        // Socket.IO belum siap — abaikan, order tetap berhasil diambil.
+        // Socket.IO belum siap
       }
 
       return res.status(200).json({
+        success: true,
         message: "Order berhasil diterima! Silakan jemput pelanggan.",
         order: updatedOrder,
       });
+
     } catch (err: any) {
+      console.error('[POST /jobs/:orderId/accept] Error:', err);
       if (err.message === "ORDER_ALREADY_ACCEPTED") {
         return res.status(409).json({ error: "Order sudah diterima driver lain." });
       }
       if (err.message === "ORDER_NOT_FOUND") {
         return res.status(404).json({ error: "Order tidak ditemukan." });
       }
-      console.error(err);
       return res.status(500).json({ error: "Internal Server Error" });
     }
   }
 );
 
-// POST /api/driver/jobs/:orderId/status - Ubah status perjalanan (atomic, validasi transisi)
+// ============================================================
+// 🔒 POST /api/driver/jobs/:orderId/status
+// ============================================================
 router.post(
   "/jobs/:orderId/status",
   authenticateToken as any,
@@ -256,7 +293,9 @@ router.post(
         return res.status(401).json({ error: "Tidak terautentikasi" });
       }
 
-      const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+      const driverProfile = await prisma.driverProfile.findUnique({
+        where: { userId },
+      });
 
       if (!driverProfile) {
         return res.status(404).json({ error: "Profil driver tidak ditemukan!" });
@@ -298,7 +337,9 @@ router.post(
           throw new Error("ORDER_STATUS_CHANGED");
         }
 
-        const orderAfterUpdate = await tx.order.findUnique({ where: { id: orderId } });
+        const orderAfterUpdate = await tx.order.findUnique({
+          where: { id: orderId },
+        });
 
         if (!orderAfterUpdate) {
           throw new Error("ORDER_NOT_FOUND");
@@ -314,8 +355,7 @@ router.post(
         return orderAfterUpdate;
       });
 
-      // Realtime — ke room order DAN room pribadi customer+driver, supaya sampai walau
-      // client belum sempat join room order_<id> secara manual.
+      // Realtime notifications
       try {
         const recipients = [order.customer.userId, userId];
         SocketService.emitToOrder(orderId, "order_status_changed", {
@@ -338,19 +378,10 @@ router.post(
         }
         SocketService.emitToAdmins("order_status_changed", { orderId, status });
       } catch {
-        // Socket.IO belum siap — abaikan.
+        // Socket.IO belum siap
       }
 
-      // PERBAIKAN: endpoint INI (bukan OrderService.updateStatus) yang benar-benar
-      // dipanggil oleh tombol "Selesai" di dashboard driver (DriverAPI.updateJobStatus
-      // -> /api/driver/jobs/:orderId/status). Order dengan metode bayar WALLET (saldo)
-      // harus AUTO DEBET begitu trip COMPLETED -- customer TIDAK perlu klik "Bayar
-      // Sekarang" manual. Sebelumnya endpoint ini TIDAK PERNAH memicu pembayaran sama
-      // sekali (cuma menyuruh customer bayar manual lewat endpoint payment terpisah),
-      // jadi riwayat perjalanan customer selalu menampilkan status BELUM LUNAS untuk
-      // order WALLET yang sudah selesai. Kegagalan auto-debet (mis. saldo kurang)
-      // TIDAK menggagalkan penyelesaian trip -- order tetap COMPLETED, customer
-      // diberi tahu lewat event realtime supaya top-up & bayar manual.
+      // Auto-debit untuk WALLET
       let autoDebitFailed = false;
       let finalOrder = updatedOrder;
       if (status === OrderStatus.COMPLETED && updatedOrder.paymentMethod === 'WALLET' && !updatedOrder.isPaid) {
@@ -366,7 +397,7 @@ router.post(
               error: err?.message || 'Auto debet saldo wallet gagal. Silakan cek saldo Anda.',
             });
           } catch {
-            // Socket.IO belum siap — abaikan.
+            // Socket.IO belum siap
           }
         }
       }
@@ -381,10 +412,12 @@ router.post(
           : "";
 
       return res.status(200).json({
+        success: true,
         message: `Status order berhasil diperbarui ke ${status}!${note}`,
         order: finalOrder,
       });
     } catch (err: any) {
+      console.error('[POST /jobs/:orderId/status] Error:', err);
       if (err.message === "ORDER_STATUS_CHANGED") {
         return res.status(409).json({
           error: "Status order telah berubah oleh proses lain. Silakan refresh data.",
@@ -393,7 +426,6 @@ router.post(
       if (err.message === "ORDER_NOT_FOUND") {
         return res.status(404).json({ error: "Order tidak ditemukan." });
       }
-      console.error(err);
       return res.status(500).json({ error: "Internal Server Error" });
     }
   }

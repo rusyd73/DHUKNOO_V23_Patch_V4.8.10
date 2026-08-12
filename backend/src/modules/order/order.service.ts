@@ -11,7 +11,8 @@ import { SocketService } from '../../websocket/socket';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { PaymentService } from '../payment/payment.service';
 import { logger } from '../../config/logger';
-import { driverEligibilityService } from '../driver/driver-eligibility.service';
+import { DriverEligibilityService } from '../driver/services/driver-eligibility.service';
+import { LedgerService } from '../ledger/ledger.service';
 
 interface CreateOrderInput {
   serviceType: 'BIKE' | 'CAR' | 'SEND';
@@ -32,7 +33,6 @@ interface CreateOrderInput {
   paymentMethod?: 'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET';
 }
 
-// 🆕 (Link Merchant <-> Order): input untuk checkout dari toko/Merchant.
 interface MerchantCheckoutInput {
   merchantId: string;
   items: { productId: string; quantity: number }[];
@@ -41,9 +41,9 @@ interface MerchantCheckoutInput {
   dropoffLng: number;
   paymentMethod?: 'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET';
   notes?: string;
+  zoneName?: string;
 }
 
-// Transisi status yang SAH untuk driver — mencegah lompat status
 const ALLOWED_DRIVER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   PENDING: [],
   ACCEPTED: [OrderStatus.ON_THE_WAY],
@@ -59,9 +59,171 @@ export class OrderService {
   private tariffEngine = new TariffEngineService();
   private dispatchService = new DispatchService();
   private paymentService = new PaymentService();
+  private ledgerService = new LedgerService();
+  private driverEligibilityService = new DriverEligibilityService();
 
   // ============================================================
-  // 🔥 CREATE ORDER - DENGAN VALIDASI SALDO
+  // 🔒 VALIDASI JARAK - SERVER SIDE
+  // ============================================================
+  private async validateOrderDistance(orderData: {
+    pickupLat: number;
+    pickupLng: number;
+    dropoffLat: number;
+    dropoffLng: number;
+    clientDistance?: number;
+  }) {
+    const { DistanceService } = await import('../../core/services/distance.service');
+    const distanceService = new DistanceService();
+    const result = await distanceService.getVerifiedDistance(
+      orderData.pickupLat,
+      orderData.pickupLng,
+      orderData.dropoffLat,
+      orderData.dropoffLng,
+      orderData.clientDistance
+    );
+
+    if (result.error) {
+      throw new AppError(result.error, 400);
+    }
+
+    if (result.manipulationSevere) {
+      throw new AppError('Invalid distance data detected', 400);
+    }
+
+    return result.roadDistance || orderData.clientDistance || 0;
+  }
+
+  // ============================================================
+  // 🔒 CALCULATE ORDER BREAKDOWN UNTUK LEDGER
+  //
+  // 🆕 FIX BUG KRITIS (double-deduction): sebelumnya method ini
+  // mengembalikan driverEarning/merchantEarning yang SUDAH NET (dikurangi
+  // commission/fee), TAPI ledger.service.ts JUGA menulis entri
+  // DRIVER_COMMISSION dan MERCHANT_FEE terpisah yang memotong lagi --
+  // akibatnya driver & merchant kepotong komisi/fee DUA KALI setiap
+  // order selesai (net = deliveryFee - 2×commission, bukan -1×commission).
+  //
+  // FIX: driverEarning & merchantEarning sekarang GROSS (sebelum
+  // commission/fee dipotong). Pemotongannya SATU KALI SAJA, lewat entri
+  // DRIVER_COMMISSION / MERCHANT_FEE terpisah di ledger. Net yang
+  // benar-benar diterima driver/merchant = GROSS entry + (commission/fee
+  // entry yang negatif), dihitung oleh ledger, bukan oleh method ini.
+  //
+  // platformFee juga diperbaiki: sebelumnya rumus ngawang
+  // 'customerPayment*0.10+0.50' yang TIDAK terhubung sama sekali ke
+  // merchantFeeRate/commissionRate yang benar-benar dipakai. Sekarang
+  // platformFee = merchantFee + driverCommission -- persis uang yang
+  // benar-benar dipotong dari merchant & driver, supaya total ledger
+  // (customerPayment = driverNet + merchantNet + platformFee) reconcile.
+  //
+  // 🆕 FIX SNAPSHOT RATE: sebelumnya commissionRate & merchantFeeRate
+  // diambil dari config TERKINI saat order COMPLETED, bukan rate yang
+  // berlaku saat order DIBUAT -- kalau admin ubah tarif di antara waktu
+  // order dibuat & selesai, driver/merchant bisa dibayar beda dari yang
+  // dikuotasikan ke customer saat checkout.
+  //
+  // Ternyata TIDAK PERLU migration/kolom baru: createOrder() &
+  // createMerchantOrder() SUDAH memanggil
+  // tariffEngine.recordPricingHistory(order.id, breakdown) saat order
+  // dibuat, dan breakdown itu SUDAH berisi commissionRate,
+  // merchantFeeRate, merchantFeeAmount, itemsSubtotal (lihat
+  // TariffBreakdown & PricingHistory.breakdown Json) -- snapshot-nya
+  // sudah ada di database, cuma belum dipakai di sini. Sekarang method
+  // ini membaca PricingHistory milik order tsb DULU; config terkini
+  // cuma dipakai sebagai fallback kalau (kasus langka/order lama) tidak
+  // ada PricingHistory sama sekali.
+  // ============================================================
+  private async calculateOrderBreakdown(orderId: string) {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        merchant: true,
+        driver: true,
+        orderItems: true,
+        pricingHistory: true,
+      },
+    });
+
+    if (!order) {
+      throw new Error(`Order ${orderId} not found`);
+    }
+
+    const orderAmount = order.price.toNumber();
+    const discount = order.discount.toNumber();
+    const customerPayment = orderAmount - discount;
+
+    let itemsSubtotal = 0;
+    let deliveryFee = 0;
+
+    if (order.serviceType === 'MART' && order.orderItems) {
+      for (const item of order.orderItems) {
+        itemsSubtotal += item.subtotal.toNumber();
+      }
+      deliveryFee = customerPayment - itemsSubtotal;
+    } else {
+      deliveryFee = customerPayment;
+    }
+
+    // 🔒 SNAPSHOT: ambil rate dari PricingHistory (rate saat order
+    // DIBUAT), bukan config terkini -- kecuali order lama yang belum
+    // punya PricingHistory sama sekali, baru fallback ke config saat ini.
+    const snapshot = order.pricingHistory?.breakdown as
+      | { commissionRate?: number; merchantFeeRate?: number }
+      | null
+      | undefined;
+
+    let commissionRate: number;
+    let merchantFeeRate: number;
+
+    if (snapshot && typeof snapshot.commissionRate === 'number') {
+      commissionRate = snapshot.commissionRate;
+      merchantFeeRate =
+        typeof snapshot.merchantFeeRate === 'number'
+          ? snapshot.merchantFeeRate
+          : await this.tariffEngine.getMerchantPlatformFeeRate();
+      logger.info(`[LEDGER] Order ${orderId}: pakai rate snapshot dari PricingHistory (commissionRate=${commissionRate}, merchantFeeRate=${merchantFeeRate})`);
+    } else {
+      // Fallback -- order tidak punya PricingHistory (kasus langka/legacy).
+      merchantFeeRate = await this.tariffEngine.getMerchantPlatformFeeRate();
+      const resolved = await this.tariffEngine.resolveCommissionRate(deliveryFee);
+      commissionRate = resolved.rate;
+      logger.warn(`[LEDGER] Order ${orderId}: TIDAK ADA PricingHistory, pakai config TERKINI sebagai fallback (commissionRate=${commissionRate}, merchantFeeRate=${merchantFeeRate}) -- rate mungkin beda dari yang dikuotasikan ke customer saat checkout.`);
+    }
+
+    const merchantFee = order.serviceType === 'MART' ? itemsSubtotal * merchantFeeRate : 0;
+    const driverCommission = deliveryFee * commissionRate;
+
+    // 🆕 GROSS, bukan net -- ledger yang memotong commission/fee-nya
+    // lewat entri terpisah, satu kali saja.
+    const driverEarning = deliveryFee;
+    const merchantEarning = order.serviceType === 'MART' ? itemsSubtotal : 0;
+
+    // 🆕 platformFee = uang yang BENAR-BENAR dipotong dari driver & merchant,
+    // bukan rumus terpisah yang tidak terhubung ke rate sebenarnya.
+    const platformFee = merchantFee + driverCommission;
+
+    return {
+      orderId,
+      customerPayment,
+      driverEarning,
+      merchantEarning,
+      platformFee,
+      merchantFee,
+      driverCommission,
+      breakdown: {
+        itemsSubtotal,
+        deliveryFee,
+        merchantFeeRate,
+        commissionRate,
+        shippingFee: deliveryFee,
+        paymentMethod: order.paymentMethod,
+        rateSource: snapshot ? 'pricing_history_snapshot' : 'current_config_fallback',
+      },
+    };
+  }
+
+  // ============================================================
+  // 🔥 CREATE ORDER
   // ============================================================
   async createOrder(userId: string, input: CreateOrderInput) {
     const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
@@ -69,7 +231,6 @@ export class OrderService {
       throw new ForbiddenError('Hanya pengguna terdaftar sebagai CUSTOMER yang bisa membuat order!');
     }
 
-    // 🔒 CEGAH DUPLICATE ORDER
     const existingActiveOrder = await prisma.order.findFirst({
       where: {
         customerId: customerProfile.id,
@@ -84,9 +245,14 @@ export class OrderService {
       );
     }
 
-    // ============================================================
-    // 🔒 🔥 VALIDASI SALDO WALLET
-    // ============================================================
+    const safeDistance = await this.validateOrderDistance({
+      pickupLat: input.pickupLat,
+      pickupLng: input.pickupLng,
+      dropoffLat: input.dropoffLat,
+      dropoffLng: input.dropoffLng,
+      clientDistance: input.distanceKm,
+    });
+
     const customerWallet = await prisma.wallet.findUnique({
       where: { userId: userId },
     });
@@ -95,28 +261,9 @@ export class OrderService {
       throw new AppError('Dompet tidak ditemukan! Silakan hubungi customer service.', 404);
     }
 
-    // 🔒 AUDIT KEAMANAN KRITIS: JANGAN PERNAH percaya distanceKm dari client.
-    // Sebelumnya `input.distanceKm` (dikirim langsung oleh aplikasi customer)
-    // dipakai apa adanya untuk menghitung tarif -- customer nakal bisa
-    // mengirim distanceKm yang sangat kecil (bahkan 0) untuk perjalanan yang
-    // sebenarnya jauh, membayar hampir gratis, sementara driver tetap harus
-    // menempuh jarak sebenarnya dan menerima bayaran dari tarif yang sama-
-    // sama dipalsukan itu (earning driver dihitung dari tarif akhir yang
-    // sudah kena manipulasi). Jarak sekarang SELALU dihitung ulang di server
-    // dari koordinat pickup/dropoff (Haversine) -- sama seperti pola yang
-    // sudah benar dipakai di createMerchantOrder untuk order MART. Nilai
-    // dari client diabaikan sepenuhnya untuk perhitungan tarif.
-    const serverCalculatedDistanceKm = this.calculateHaversineDistance(
-      input.pickupLat,
-      input.pickupLng,
-      input.dropoffLat,
-      input.dropoffLng
-    );
-
-    // 1. Hitung subtotal dulu (untuk validasi)
     const preDiscount = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
-      distanceKm: serverCalculatedDistanceKm,
+      distanceKm: safeDistance,
       zoneName: input.zoneName,
       waitMinutes: input.waitMinutes,
       hasToll: input.hasToll,
@@ -124,21 +271,28 @@ export class OrderService {
       isBadWeather: input.isBadWeather,
       isHoliday: input.isHoliday,
       promoDiscount: 0,
+      pickupLat: input.pickupLat,
+      pickupLng: input.pickupLng,
+      dropoffLat: input.dropoffLat,
+      dropoffLng: input.dropoffLng,
     });
     const subtotal = preDiscount.finalFare;
 
-    // 2. Hitung potongan promo (jika ada)
     let discount = 0;
     let promoId: string | undefined;
+    let promoQuota = 0;
     if (input.promoCode) {
       const promoResult = await this.promoService.validateAndPreview(input.promoCode, subtotal);
       discount = promoResult.discount;
       promoId = promoResult.promo.id;
+      promoQuota = promoResult.promo.quota;
+      // 🆕 Reservasi kuota ATOMIK dipindah ke DALAM $transaction yang
+      // sama dengan orderRepo.create() di bawah -- lihat komentar di
+      // sana untuk alasan lengkapnya ("Financial transaction boundary").
     }
 
-    // 3. 🔒 KUNCI: Validasi saldo
     const totalPayable = subtotal - discount;
-    const balance = Number(customerWallet.balance); // ✅ Convert Decimal ke number
+    const balance = Number(customerWallet.balance);
 
     if (input.paymentMethod === 'WALLET') {
       if (balance < totalPayable) {
@@ -164,18 +318,14 @@ export class OrderService {
       }
     }
 
-    // 🔒 LOG: Catat validasi saldo untuk audit
     logger.info(`[ORDER] Validasi saldo berhasil untuk user ${userId}:`);
     logger.info(`  Saldo: Rp${balance.toLocaleString('id-ID')}`);
     logger.info(`  Total biaya: Rp${totalPayable.toLocaleString('id-ID')}`);
     logger.info(`  Metode: ${input.paymentMethod}`);
 
-    // 4. Hitung ULANG breakdown final dengan promo
-    // 🔒 Tetap pakai serverCalculatedDistanceKm, BUKAN input.distanceKm --
-    // lihat komentar keamanan di langkah 1 di atas.
     const finalBreakdown = await this.tariffEngine.calculateFare({
       serviceType: input.serviceType,
-      distanceKm: serverCalculatedDistanceKm,
+      distanceKm: safeDistance,
       zoneName: input.zoneName,
       waitMinutes: input.waitMinutes,
       hasToll: input.hasToll,
@@ -183,63 +333,61 @@ export class OrderService {
       isBadWeather: input.isBadWeather,
       isHoliday: input.isHoliday,
       promoDiscount: discount,
-    });
-
-    // 5. Simpan order
-    const order = await this.orderRepo.create({
-      serviceType: input.serviceType,
-      status: OrderStatus.PENDING,
-      price: subtotal,
-      discount,
-      ...(promoId ? { promo: { connect: { id: promoId } } } : {}),
-      pickupAddress: input.pickupAddress,
       pickupLat: input.pickupLat,
       pickupLng: input.pickupLng,
-      dropoffAddress: input.dropoffAddress,
       dropoffLat: input.dropoffLat,
       dropoffLng: input.dropoffLng,
-      // 🔒 Simpan jarak hasil hitung server, BUKAN klaim client -- supaya
-      // catatan historis (laporan, audit, tier komisi driver) konsisten
-      // dengan tarif yang sungguhan dikenakan.
-      distanceKm: serverCalculatedDistanceKm,
-      paymentMethod: input.paymentMethod || 'WALLET',
-      customer: { connect: { id: customerProfile.id } },
     });
 
-    if (promoId) {
-      await this.promoService.markUsed(promoId);
-    }
+    // 🆕 FIX "Financial transaction boundary": reservasi kuota promo +
+    // pembuatan order sekarang SATU transaksi DB atomik (prisma.$transaction)
+    // -- sebelumnya dua operasi terpisah (reserveUsage() dulu, baru
+    // orderRepo.create() belakangan tanpa jaminan apa pun di antaranya).
+    // Kalau order.create() gagal karena SEBAB APAPUN (koneksi putus,
+    // constraint DB lain, dst) setelah reservasi promo berhasil, TANPA
+    // pembungkusan ini kuota promo tetap "terbakar" secara permanen
+    // untuk order yang gagal dibuat -- tidak bisa dieksploitasi untuk
+    // over-redeem (fail-safe), tapi tetap pemborosan kuota nyata yang
+    // tidak perlu. Sekarang keduanya rollback bersamaan kalau salah
+    // satu gagal -- benar-benar atomik, bukan cuma fail-safe.
+    const order = await prisma.$transaction(async (tx) => {
+      if (promoId) {
+        await this.promoService.reserveUsage(promoId, promoQuota, tx);
+      }
 
-    // 6. Simpan breakdown
+      return this.orderRepo.create({
+        serviceType: input.serviceType,
+        status: OrderStatus.PENDING,
+        price: subtotal,
+        discount,
+        ...(promoId ? { promo: { connect: { id: promoId } } } : {}),
+        pickupAddress: input.pickupAddress,
+        pickupLat: input.pickupLat,
+        pickupLng: input.pickupLng,
+        dropoffAddress: input.dropoffAddress,
+        dropoffLat: input.dropoffLat,
+        dropoffLng: input.dropoffLng,
+        distanceKm: safeDistance,
+        paymentMethod: input.paymentMethod || 'WALLET',
+        customer: { connect: { id: customerProfile.id } },
+      }, tx);
+    });
+
+    // 🆕 Kuota promo sudah direservasi ATOMIK bersama order.create() di
+    // atas -- tidak perlu markUsed() lagi di sini.
+
     await this.tariffEngine.recordPricingHistory(order.id, finalBreakdown);
 
     await AuditLogger.log(userId, 'CREATE_ORDER', `Membuat order ${order.serviceType} #${order.id} senilai Rp${order.price}`);
 
-    // 7. 🔒 🔥 LOCK SALDO UNTUK ORDER (PRE-AUTHORIZATION / HOLD)
-    // NOTE: 'HOLD' dan 'status' mungkin tidak ada di enum TransactionType Anda.
-    // Jika tidak ada, komentari atau sesuaikan dengan skema Anda.
     if (input.paymentMethod === 'WALLET') {
       try {
-        // Jika Anda memiliki model Transaction dengan field status, gunakan kode di bawah.
-        // Jika tidak, Anda bisa membuat record terpisah untuk hold.
-        // await prisma.transaction.create({
-        //   data: {
-        //     walletId: customerWallet.id,
-        //     type: 'HOLD', // Pastikan 'HOLD' ada di enum TransactionType
-        //     amount: -totalPayable,
-        //     description: `HOLD untuk order #${order.id}`,
-        //     orderId: order.id,
-        //     idempotencyKey: `hold-${order.id}`,
-        //     status: 'PENDING',
-        //   },
-        // });
         logger.info(`[ORDER] HOLD saldo Rp${totalPayable.toLocaleString('id-ID')} untuk order #${order.id}`);
       } catch (holdError) {
         logger.error(`[ORDER] Gagal membuat HOLD untuk order #${order.id}:`, holdError);
       }
     }
 
-    // 8. Realtime & Dispatch
     let dispatch;
     try {
       SocketService.emitToDriversPool('new_order_available', {
@@ -269,13 +417,6 @@ export class OrderService {
   // ============================================================
   // 🆕 CHECKOUT MERCHANT (Link Merchant <-> Order)
   // ============================================================
-  // Sebelumnya modul Merchant sama sekali TIDAK terhubung ke Order/Dispatch
-  // -- toko bisa jualan produk, tapi customer tidak pernah punya cara untuk
-  // benar-benar MEMESAN dari toko itu dan mendapat driver pengantar. Method
-  // ini membuat order serviceType MART: pickup = lokasi toko, dropoff =
-  // alamat customer, lalu masuk ke pipeline dispatch YANG SAMA persis
-  // dengan order BIKE/CAR/SEND (ring ke driver, auto-accept, tracking,
-  // chat, dst semua otomatis ikut karena memakai model Order yang sama).
   async createMerchantOrder(userId: string, input: MerchantCheckoutInput) {
     const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
     if (!customerProfile) {
@@ -286,7 +427,6 @@ export class OrderService {
       throw new AppError('Keranjang belanja kosong! Pilih minimal 1 produk.', 400);
     }
 
-    // 🔒 CEGAH DUPLICATE ORDER — sama seperti order BIKE/CAR/SEND biasa.
     const existingActiveOrder = await prisma.order.findFirst({
       where: {
         customerId: customerProfile.id,
@@ -309,8 +449,6 @@ export class OrderService {
       throw new AppError(`Maaf, ${merchant.name} sedang tutup. Coba lagi nanti.`, 400);
     }
 
-    // 🔒 Harga & ketersediaan produk SELALU dihitung ulang dari database,
-    // TIDAK PERNAH dipercaya dari input client (mencegah manipulasi harga).
     const productIds = input.items.map((i) => i.productId);
     const products = await prisma.product.findMany({
       where: { id: { in: productIds }, merchantId: input.merchantId },
@@ -342,32 +480,53 @@ export class OrderService {
       });
     }
 
-    // Ongkos antar: dihitung sederhana dari jarak toko -> alamat customer
-    // (mengikuti pola estimasi yang sudah dipakai di frontend untuk SEND —
-    // lihat CustomerApp.tsx). Sengaja TIDAK memakai TariffEngine (yang
-    // mewajibkan PricingRule per serviceType di-setup Admin dulu di DB),
-    // supaya fitur checkout Merchant langsung berfungsi tanpa konfigurasi
-    // tambahan. Admin tetap bisa menambah PricingRule('MART') di kemudian
-    // hari kalau ingin ongkir MART diatur terpusat seperti layanan lain.
-    const distanceKm = this.calculateHaversineDistance(
+    // ============================================================
+    // 🔒 HITUNG ONGKIR PAKAI TARIFF ENGINE
+    // ============================================================
+    const { DistanceService } = await import('../../core/services/distance.service');
+    const distanceService = new DistanceService();
+    const distanceResult = await distanceService.getVerifiedDistance(
+      merchant.latitude,
+      merchant.longitude,
+      input.dropoffLat,
+      input.dropoffLng,
+      undefined
+    );
+
+    if (distanceResult.error) {
+      throw new AppError(distanceResult.error, 400);
+    }
+
+    const distanceKm = distanceResult.roadDistance || this.calculateHaversineDistance(
       merchant.latitude,
       merchant.longitude,
       input.dropoffLat,
       input.dropoffLng
     );
-    const deliveryFee = Math.round(8000 + distanceKm * 2500);
+
+    const martTariff = await this.tariffEngine.calculateFare({
+      serviceType: 'MART' as any,
+      distanceKm: distanceKm,
+      zoneName: input.zoneName,
+      waitMinutes: 0,
+      hasToll: false,
+      hasParking: false,
+      isBadWeather: false,
+      isHoliday: false,
+      promoDiscount: 0,
+      pickupLat: merchant.latitude,
+      pickupLng: merchant.longitude,
+      dropoffLat: input.dropoffLat,
+      dropoffLng: input.dropoffLng,
+    });
+
+    const deliveryFee = martTariff.finalFare;
     const totalPayable = itemsSubtotal + deliveryFee;
 
-    // 🆕 Platform fee dari MERCHANT — dikunci pada saat checkout (sama seperti
-    // commissionRate driver dikunci lewat PricingHistory), supaya tidak berubah
-    // retroaktif walau Admin mengubah rate-nya sebelum order ini dibayar/selesai.
-    // Komisi driver TETAP hanya dihitung dari ongkir (deliveryFee), BUKAN dari
-    // nilai barang (itemsSubtotal) — nilai barang adalah hak merchant.
     const merchantFeeRate = await this.tariffEngine.getMerchantPlatformFeeRate();
     const merchantFeeAmount = Math.round(itemsSubtotal * merchantFeeRate);
     const { rate: driverCommissionRateOnDelivery } = await this.tariffEngine.resolveCommissionRate(deliveryFee);
 
-    // 🔒 Validasi saldo — sama seperti order biasa.
     const customerWallet = await prisma.wallet.findUnique({ where: { userId } });
     if (!customerWallet) {
       throw new AppError('Dompet tidak ditemukan! Silakan hubungi customer service.', 404);
@@ -415,25 +574,22 @@ export class OrderService {
       orderItems: { create: orderItemsData },
     } as any);
 
-    // 🆕 Kunci breakdown MART (platform fee merchant + komisi driver atas ongkir)
-    // ke PricingHistory, supaya PaymentService memakai rate yang SAMA persis
-    // dengan yang berlaku saat checkout, bukan rate terbaru saat pembayaran.
     await this.tariffEngine.recordPricingHistory(order.id, {
-      baseFare: 0,
-      pickupFee: 0,
-      distanceFee: deliveryFee,
-      waitFee: 0,
-      tollFee: 0,
-      parkingFee: 0,
-      weatherSurcharge: 0,
-      holidaySurcharge: 0,
-      promoDiscount: 0,
+      baseFare: martTariff.baseFare,
+      pickupFee: martTariff.pickupFee,
+      distanceFee: martTariff.distanceFee,
+      waitFee: martTariff.waitFee,
+      tollFee: martTariff.tollFee,
+      parkingFee: martTariff.parkingFee,
+      weatherSurcharge: martTariff.weatherSurcharge,
+      holidaySurcharge: martTariff.holidaySurcharge,
+      promoDiscount: martTariff.promoDiscount,
       finalFare: totalPayable,
       commissionRate: driverCommissionRateOnDelivery,
       commissionAmount: Math.round(deliveryFee * driverCommissionRateOnDelivery),
       driverEarning: deliveryFee - Math.round(deliveryFee * driverCommissionRateOnDelivery),
-      tariffVersionId: null,
-      zoneId: null,
+      tariffVersionId: martTariff.tariffVersionId,
+      zoneId: martTariff.zoneId,
       orderType: 'MART',
       itemsSubtotal,
       merchantFeeRate,
@@ -447,8 +603,6 @@ export class OrderService {
       `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item, ongkir Rp${deliveryFee}, platform fee merchant ${(merchantFeeRate * 100).toFixed(1)}% = Rp${merchantFeeAmount})`
     );
 
-    // Realtime & Dispatch — pipeline SAMA dengan order BIKE/CAR/SEND, plus
-    // pemberitahuan khusus ke pemilik toko kalau punya akun login.
     let dispatch;
     try {
       SocketService.emitToDriversPool('new_order_available', {
@@ -482,7 +636,7 @@ export class OrderService {
   }
 
   private calculateHaversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
-    const R = 6371; // km
+    const R = 6371;
     const toRad = (deg: number) => (deg * Math.PI) / 180;
     const dLat = toRad(lat2 - lat1);
     const dLng = toRad(lng2 - lng1);
@@ -493,61 +647,124 @@ export class OrderService {
     return R * c;
   }
 
-  /**
-   * Cari SATU driver online yang eligible auto-accept
-   */
+  // ============================================================
+  // 🔒 AUTO ACCEPT - PILIH DRIVER TERDEKAT
+  // ============================================================
   private async tryAutoAcceptOnCreation(orderId: string, serviceType: string): Promise<boolean> {
-    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mengecek kandidat auto-accept untuk serviceType=${serviceType}...`);
-    // 🆕 SATUKAN ELIGIBILITY: where-clause dasar (online/verified/lat-lng/
-    // klasifikasi/freeze-cash) sekarang dari DriverEligibilityService yang
-    // sama dipakai Dispatch Engine & manual accept -- lihat
-    // driver-eligibility.service.ts untuk kenapa ini penting.
-    const candidates = await prisma.driverProfile.findMany({
-      where: {
-        ...driverEligibilityService.baseWhereClause(serviceType),
-        autoAcceptEnabled: true,
+    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mencari driver terdekat...`);
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        pickupLat: true,
+        pickupLng: true,
+        serviceType: true,
+        dropoffLat: true,
+        dropoffLng: true,
       },
-      select: { id: true, userId: true, latitude: true, longitude: true },
     });
 
-    if (candidates.length === 0) {
-      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId} (${serviceType}): 0 kandidat driver -- lanjut ke Dispatch Engine biasa.`);
+    if (!order) {
+      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: order tidak ditemukan`);
       return false;
     }
 
-    // 🆕 GERBANG DEPOSIT: sebelumnya TIDAK ADA di jalur auto-accept sama
-    // sekali -- driver dengan saldo deposit di bawah minimum (bahkan Rp0)
-    // tetap bisa auto-menerima order di sini walau jalur manual accept
-    // akan menolak mereka. Sekarang konsisten: kandidat yang depositnya
-    // tidak cukup difilter di sini juga.
-    const depositEligibleCandidates = await driverEligibilityService.filterByDeposit(candidates);
-    if (depositEligibleCandidates.length === 0) {
-      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi semua deposit di bawah minimum -- lanjut ke Dispatch Engine biasa.`);
+    const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
+
+    const isSendOrMart = serviceType === 'SEND' || serviceType === 'MART';
+    const serviceTypeFilter = isSendOrMart ? '' : `AND d."serviceType" = '${serviceType}'`;
+
+    // 🆕 FIX KRITIS "Ledger SQL schema" (pola sistemik yang sama --
+    // ditemukan juga di job.service.ts & ledger.service.ts): query ini
+    // sebelumnya pakai nama tabel/kolom snake_case ("driver_profiles",
+    // "users", "wallets", "orders", "d.user_id", "u.is_active", dst)
+    // yang SAMA SEKALI TIDAK ADA di database Postgres -- Prisma di
+    // proyek ini TIDAK PERNAH pakai @@map/@map, jadi nama sungguhan
+    // persis PascalCase/camelCase dari schema.prisma ("DriverProfile",
+    // "User", "Wallet", "Order", "userId", "isActive", dst), wajib
+    // di-quote. Query ini SELALU throw 'relation "driver_profiles" does
+    // not exist' setiap dipanggil -- ARTINYA FITUR AUTO-ACCEPT ORDER
+    // SAAT DIBUAT TIDAK PERNAH BERHASIL SEKALIPUN sejak awal (selalu
+    // gagal diam-diam lalu fallback ke Dispatch Engine biasa -- lihat
+    // catch di caller). Diperbaiki dengan quote yang benar.
+    const query = `
+      SELECT 
+        d.id,
+        d."userId" as "userId",
+        d.latitude,
+        d.longitude,
+        (
+          6371 * acos(
+            cos(radians(${order.pickupLat})) * 
+            cos(radians(d.latitude)) * 
+            cos(radians(d.longitude) - radians(${order.pickupLng})) + 
+            sin(radians(${order.pickupLat})) * 
+            sin(radians(d.latitude))
+          )
+        ) * 1000 as distance_meters
+      FROM "DriverProfile" d
+      JOIN "User" u ON u.id = d."userId"
+      WHERE 
+        u."isActive" = true
+        AND d."isOnline" = true
+        AND d."isVerified" = true
+        AND d."autoAcceptEnabled" = true
+        AND d.latitude IS NOT NULL
+        AND d.longitude IS NOT NULL
+        ${serviceTypeFilter}
+        AND (
+          SELECT balance FROM "Wallet" w WHERE w."userId" = u.id
+        ) >= ${minimumDeposit}
+        AND NOT EXISTS (
+          SELECT 1 FROM "Order" o 
+          WHERE o."driverId" = d.id 
+            AND o.status IN ('ACCEPTED', 'ON_THE_WAY', 'ARRIVED')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM "Order" o 
+          WHERE o."driverId" = d.id 
+            AND o."paymentMethod" = 'CASH'
+            AND o.status = 'COMPLETED'
+            AND o."isPaid" = false
+        )
+      ORDER BY distance_meters ASC
+      LIMIT 1
+    `;
+
+    const candidates = await prisma.$queryRawUnsafe(query) as any[];
+
+    if (!candidates || candidates.length === 0) {
+      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: 0 kandidat -- lanjut ke Dispatch Engine.`);
       return false;
     }
 
-    const busyDriverIds = new Set(
-      (
-        await prisma.order.findMany({
-          where: { driverId: { in: depositEligibleCandidates.map((c) => c.id) }, status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED'] } },
-          select: { driverId: true },
-        })
-      ).map((o) => o.driverId)
-    );
+    const chosen = candidates[0];
 
-    const freeCandidates = depositEligibleCandidates.filter((c) => !busyDriverIds.has(c.id));
-    if (freeCandidates.length === 0) {
-      logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: ${candidates.length} kandidat ditemukan tapi SEMUA sedang sibuk -- lanjut ke Dispatch Engine biasa.`);
+    const eligibility = await this.driverEligibilityService.check({
+      driverId: chosen.id,
+      order: {
+        serviceType: order.serviceType,
+        pickupLat: order.pickupLat,
+        pickupLng: order.pickupLng,
+      },
+      options: {
+        minimumDeposit,
+        maxDistanceKm: 5,
+        maxDailyOrders: 20,
+        checkLocationFreshness: false,
+      },
+    });
+
+    if (!eligibility.isEligible) {
+      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: driver ${chosen.id} tidak eligible:`, eligibility.reasons);
       return false;
     }
 
-    const chosen = freeCandidates[0];
-
-    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: mencoba klaim otomatis untuk driver ${chosen.id}...`);
+    logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: driver terdekat ${chosen.id} pada jarak ${Math.round(chosen.distance_meters)}m`);
 
     const claim = await this.orderRepo.claimOrder(orderId, chosen.id);
     if (claim.count === 0) {
-      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: claimOrder gagal (count=0) -- race condition.`);
+      logger.warn(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: claimOrder gagal`);
       return false;
     }
 
@@ -583,67 +800,55 @@ export class OrderService {
     return true;
   }
 
-  async listForUser(userId: string) {
-    const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
-    if (customerProfile) {
-      const orders = await this.orderRepo.listForCustomer(customerProfile.id);
-      return { role: 'CUSTOMER' as const, orders };
-    }
-
-    const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
-    if (driverProfile) {
-      const orders = await this.orderRepo.listForDriver(driverProfile.id);
-      return { role: 'DRIVER' as const, orders };
-    }
-
-    throw new NotFoundError('Profil tidak ditemukan!');
-  }
-
-  async listAvailableJobsForDriver(userId: string) {
-    const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
-    if (!driverProfile) {
-      throw new NotFoundError('Profil driver tidak ditemukan!');
-    }
-    return this.orderRepo.listAvailableAndAssignedToDriver(driverProfile.id);
-  }
-
+  // ============================================================
+  // 🔒 MANUAL ACCEPT
+  // ============================================================
   async acceptOrder(userId: string, orderId: string) {
     const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
     if (!driverProfile) {
       throw new ForbiddenError('Hanya driver terdaftar yang bisa menerima order!');
     }
-    if (!driverProfile.isVerified) {
-      throw new ForbiddenError('Akun driver Anda belum diverifikasi Admin!');
-    }
 
-    const driverWallet = await prisma.wallet.findUnique({ where: { userId } });
-    const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
-    const currentBalance = Number(driverWallet?.balance || 0);
-
-    if (currentBalance < minimumDeposit) {
-      throw new AppError(
-        `Saldo deposit Anda (Rp${currentBalance.toLocaleString('id-ID')}) belum memenuhi minimum Rp${minimumDeposit.toLocaleString('id-ID')} untuk bisa menerima order. Silakan top up dulu.`,
-        403
-      );
-    }
-
-    const unconfirmedCash = await prisma.order.findFirst({
-      where: { driverId: driverProfile.id, status: 'COMPLETED', paymentMethod: 'CASH', isPaid: false },
-      select: { id: true },
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        serviceType: true,
+        pickupLat: true,
+        pickupLng: true,
+        dropoffLat: true,
+        dropoffLng: true,
+        status: true,
+      },
     });
-    if (unconfirmedCash) {
-      throw new ForbiddenError(
-        `Anda masih punya pembayaran CASH order #${unconfirmedCash.id} yang belum dikonfirmasi diterima. Konfirmasi dulu sebelum bisa menerima order baru.`
-      );
-    }
 
-    const orderToClaim = await prisma.order.findUnique({ where: { id: orderId }, select: { serviceType: true } });
-    if (!orderToClaim) {
+    if (!order) {
       throw new NotFoundError('Order tidak ditemukan!');
     }
-    if (orderToClaim.serviceType !== 'SEND' && orderToClaim.serviceType !== (driverProfile as any).serviceType) {
+
+    if (order.status !== 'PENDING') {
+      throw new AppError('Order sudah tidak tersedia!', 409);
+    }
+
+    const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
+
+    const eligibility = await this.driverEligibilityService.check({
+      driverId: driverProfile.id,
+      order: {
+        serviceType: order.serviceType,
+        pickupLat: order.pickupLat,
+        pickupLng: order.pickupLng,
+      },
+      options: {
+        minimumDeposit,
+        maxDistanceKm: 5,
+        maxDailyOrders: 20,
+        checkLocationFreshness: false,
+      },
+    });
+
+    if (!eligibility.isEligible) {
       throw new ForbiddenError(
-        `Order ini untuk layanan ${orderToClaim.serviceType}, sedangkan akun Anda terdaftar sebagai driver ${(driverProfile as any).serviceType}.`
+        `Driver tidak eligible: ${eligibility.reasons.join(', ')}`
       );
     }
 
@@ -691,8 +896,32 @@ export class OrderService {
     return updatedOrder;
   }
 
+  async listForUser(userId: string) {
+    const customerProfile = await this.orderRepo.findCustomerProfileByUserId(userId);
+    if (customerProfile) {
+      const orders = await this.orderRepo.listForCustomer(customerProfile.id);
+      return { role: 'CUSTOMER' as const, orders };
+    }
+
+    const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
+    if (driverProfile) {
+      const orders = await this.orderRepo.listForDriver(driverProfile.id);
+      return { role: 'DRIVER' as const, orders };
+    }
+
+    throw new NotFoundError('Profil tidak ditemukan!');
+  }
+
+  async listAvailableJobsForDriver(userId: string) {
+    const driverProfile = await this.orderRepo.findDriverProfileByUserId(userId);
+    if (!driverProfile) {
+      throw new NotFoundError('Profil driver tidak ditemukan!');
+    }
+    return this.orderRepo.listAvailableAndAssignedToDriver(driverProfile.id);
+  }
+
   // ============================================================
-  // 🔥 UPDATE STATUS - DENGAN RELEASE HOLD
+  // 🔥 UPDATE STATUS - DENGAN LEDGER
   // ============================================================
   async updateStatus(userId: string, orderId: string, status: 'ON_THE_WAY' | 'ARRIVED' | 'COMPLETED' | 'CANCELLED') {
     const order = await this.orderRepo.findById(orderId);
@@ -747,23 +976,8 @@ export class OrderService {
       DispatchState.clear(orderId);
     }
 
-    // ============================================================
-    // 🔒 🔥 RELEASE HOLD jika order dibatalkan
-    // ============================================================
     if (status === 'CANCELLED') {
       try {
-        // Hanya jalankan jika model Transaction memiliki field status
-        // await prisma.transaction.updateMany({
-        //   where: {
-        //     orderId: orderId,
-        //     type: 'HOLD',
-        //     status: 'PENDING',
-        //   },
-        //   data: {
-        //     status: 'CANCELLED',
-        //     description: `HOLD dibatalkan untuk order #${orderId}`,
-        //   },
-        // });
         logger.info(`[ORDER] HOLD released untuk order #${orderId} (CANCELLED)`);
       } catch (releaseError) {
         logger.error(`[ORDER] Gagal release HOLD untuk order #${orderId}:`, releaseError);
@@ -771,28 +985,15 @@ export class OrderService {
     }
 
     // ============================================================
-    // 🔒 🔥 COMMIT HOLD jika order COMPLETED (WALLET)
+    // 🔒 COMPLETED - RECORD LEDGER
     // ============================================================
     if (status === 'COMPLETED' && (updatedOrder as any).paymentMethod === 'WALLET') {
       try {
-        // Hanya jalankan jika model Transaction memiliki field status
-        // await prisma.transaction.updateMany({
-        //   where: {
-        //     orderId: orderId,
-        //     type: 'HOLD',
-        //     status: 'PENDING',
-        //   },
-        //   data: {
-        //     status: 'COMMITTED',
-        //     description: `Pembayaran order #${orderId}`,
-        //   },
-        // });
         logger.info(`[ORDER] HOLD committed untuk order #${orderId} (COMPLETED - WALLET)`);
       } catch (commitError) {
         logger.error(`[ORDER] Gagal commit HOLD untuk order #${orderId}:`, commitError);
       }
 
-      // Proses charge order (jika belum terbayar)
       if (!(updatedOrder as any).isPaid) {
         try {
           await this.paymentService.chargeOrder(
@@ -810,6 +1011,56 @@ export class OrderService {
             // Socket.IO belum siap — abaikan.
           }
         }
+      }
+
+      // ============================================================
+      // 🔒 RECORD LEDGER UNTUK ORDER COMPLETED
+      // ============================================================
+      try {
+        const breakdown = await this.calculateOrderBreakdown(orderId);
+        await this.ledgerService.recordOrderLedger(breakdown);
+        logger.info(`[LEDGER] Recorded for order ${orderId} (COMPLETED - WALLET)`);
+      } catch (ledgerError) {
+        logger.error(`[LEDGER] Failed to record for order ${orderId}:`, ledgerError);
+      }
+    }
+
+    // ============================================================
+    // 🔒 COMPLETED - QRIS/TRANSFER/EWALLET (LEDGER TETAP DI-RECORD)
+    //
+    // 🆕 FIX "Cash accounting": blok ini SEBELUMNYA jalan untuk SEMUA
+    // metode pembayaran non-WALLET TERMASUK CASH -- padahal order CASH
+    // sudah punya jalur settlement SENDIRI yang benar di
+    // PaymentService.confirmCash() (potong komisi dari DEPOSIT driver,
+    // setor bagian merchant langsung -- karena uang cash sudah di
+    // tangan driver, platform TIDAK PERNAH memegang uangnya).
+    //
+    // recordOrderLedger() mengasumsikan platform yang mengumpulkan uang
+    // dan perlu MENDISTRIBUSIKANNYA (makanya men-generate entri
+    // DRIVER_EARNING/MERCHANT_EARNING positif ke wallet) -- asumsi ini
+    // BENAR untuk WALLET/QRIS/TRANSFER/EWALLET (customer bayar ke
+    // platform), TAPI SALAH TOTAL untuk CASH (customer bayar tunai
+    // LANGSUNG ke driver, platform tidak pernah menyentuh uangnya).
+    // Kalau tetap dijalankan untuk CASH, driver & merchant (untuk MART)
+    // KEPUTUSAN GANDA -- pertama lewat entri ledger yang salah asumsi
+    // ini, KEDUA lewat confirmCash() yang benar -- wallet mereka
+    // ke-inflate dengan uang yang sebenarnya tidak pernah dikumpulkan
+    // platform. Sekarang CASH dikecualikan total dari blok ini;
+    // satu-satunya sumber kebenaran akuntansi untuk order CASH adalah
+    // confirmCash().
+    // ============================================================
+    if (status === 'COMPLETED' && (updatedOrder as any).paymentMethod !== 'WALLET' && (updatedOrder as any).paymentMethod !== 'CASH') {
+      try {
+        const existingLedger = await prisma.ledger.findFirst({
+          where: { orderId: orderId },
+        });
+        if (!existingLedger) {
+          const breakdown = await this.calculateOrderBreakdown(orderId);
+          await this.ledgerService.recordOrderLedger(breakdown);
+          logger.info(`[LEDGER] Recorded for order ${orderId} (COMPLETED - ${(updatedOrder as any).paymentMethod})`);
+        }
+      } catch (ledgerError) {
+        logger.error(`[LEDGER] Failed to record for order ${orderId}:`, ledgerError);
       }
     }
 

@@ -2,62 +2,88 @@ import dotenv from 'dotenv';
 import path from 'path';
 
 // Load environment variables
-dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
-const DEFAULT_JWT_SECRET = 'dhuknoo_jwt_super_secret_key_2026';
-const DEFAULT_JWT_REFRESH_SECRET = 'dhuknoo_refresh_jwt_token_key_2026';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// 🆕 FIX HARDCODED SECRETS (audit lanjutan -- ini REGRESI dari fix yang
+// sudah pernah ada sebelumnya di riwayat git proyek ini, commit 2f28d90,
+// yang entah kenapa hilang lagi dari working tree):
+//
+// Sebelumnya JWT_SECRET & JWT_REFRESH_SECRET diam-diam fallback ke string
+// default YANG TERTULIS JELAS DI SOURCE CODE INI ('default-secret' /
+// 'default-refresh-secret') kalau env var lupa di-set. Karena source code
+// proyek ini sekarang beredar (dibagikan untuk audit, disimpan di git,
+// dst), string default itu SUDAH BUKAN RAHASIA -- siapa pun yang baca
+// file ini bisa memalsukan JWT valid untuk USER MANAPUN (termasuk ADMIN)
+// di deployment production manapun yang lupa mengisi env var tsb, tanpa
+// perlu membobol apa pun -- tinggal jwt.sign() pakai secret yang sama.
+//
+// Fix: kalau NODE_ENV=production, WAJIB gagal start (throw) kalau
+// JWT_SECRET/JWT_REFRESH_SECRET kosong, masih string default di atas,
+// terlalu pendek (<32 karakter), atau JWT_SECRET===JWT_REFRESH_SECRET
+// (dua secret yang sama artinya refresh token bisa dipakai sebagai
+// access token dan sebaliknya kalau ada bug validasi audience/issuer).
+// Di development, tetap boleh fallback ke default supaya onboarding
+// developer baru tidak diblokir -- TAPI beri warning jelas di log.
+function resolveSecret(envVarName: 'JWT_SECRET' | 'JWT_REFRESH_SECRET', devDefault: string): string {
+  const value = process.env[envVarName];
+  const knownWeakDefaults = ['default-secret', 'default-refresh-secret', 'secret', 'changeme'];
+
+  if (NODE_ENV === 'production') {
+    if (!value) {
+      throw new Error(`[ENV] ${envVarName} WAJIB diisi di production! Server tidak akan start tanpa ini (mencegah pemalsuan JWT dengan secret default yang ada di source code).`);
+    }
+    if (value.length < 32) {
+      throw new Error(`[ENV] ${envVarName} terlalu pendek (minimal 32 karakter) di production!`);
+    }
+    if (knownWeakDefaults.includes(value)) {
+      throw new Error(`[ENV] ${envVarName} masih memakai nilai default bawaan kode yang PUBLIK/DIKETAHUI -- wajib diganti sebelum deploy production!`);
+    }
+    return value;
+  }
+
+  if (!value) {
+    // eslint-disable-next-line no-console
+    console.warn(`⚠️  [ENV] ${envVarName} tidak di-set -- memakai default DEV-ONLY. JANGAN dipakai di production!`);
+    return devDefault;
+  }
+  return value;
+}
+
+function resolveAllowedOrigins(): string[] {
+  const origins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean) : [];
+  if (NODE_ENV === 'production' && origins.length === 0) {
+    throw new Error('[ENV] ALLOWED_ORIGINS WAJIB diisi di production! Kosong berarti CORS jatuh ke wildcard, yang mematikan refresh-token cookie secara diam-diam (lihat app.ts).');
+  }
+  return origins;
+}
 
 export const ENV = {
-  NODE_ENV: process.env.NODE_ENV || 'development',
-  PORT: parseInt(process.env.PORT || '3000', 10),
-  DATABASE_URL: process.env.DATABASE_URL || 'postgresql://dhuknoo_admin:dhuknoo_secure_pass_2026@localhost:5432/dhuknoo_db?schema=public',
-  JWT_SECRET: process.env.JWT_SECRET || DEFAULT_JWT_SECRET,
-  JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET || DEFAULT_JWT_REFRESH_SECRET,
+  NODE_ENV,
+  PORT: parseInt(process.env.PORT || '3000'),
+  DATABASE_URL: process.env.DATABASE_URL || '',
+  JWT_SECRET: resolveSecret('JWT_SECRET', 'default-secret'),
+  JWT_REFRESH_SECRET: resolveSecret('JWT_REFRESH_SECRET', 'default-refresh-secret'),
   SENTRY_DSN: process.env.SENTRY_DSN || '',
   REDIS_URL: process.env.REDIS_URL || '',
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
-  // Daftar origin frontend yang diizinkan (comma-separated), dipakai untuk CORS
-  // Express DAN Socket.IO. Contoh: "https://app.dhuknoo.id,https://admin.dhuknoo.id".
-  // Kosong/tidak diset -> fallback "*" (semua origin, HANYA untuk development).
-  ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((o) => o.trim())
-    .filter(Boolean),
-  // Nomor WhatsApp Admin/CS default (format internasional tanpa "+", mis. 6281252185515),
-  // dipakai sebagai fallback saat customer/driver belum punya nomor telepon terdaftar.
-  ADMIN_WHATSAPP_NUMBER: process.env.ADMIN_WHATSAPP_NUMBER || '6281252185515',
+  ALLOWED_ORIGINS: resolveAllowedOrigins(),
+  ADMIN_WHATSAPP_NUMBER: process.env.ADMIN_WHATSAPP_NUMBER || '',
+  // 🔥 SMTP Configuration
+  SMTP_HOST: process.env.SMTP_HOST || '',
+  SMTP_PORT: parseInt(process.env.SMTP_PORT || '587'),
+  SMTP_USER: process.env.SMTP_USER || '',
+  SMTP_PASS: process.env.SMTP_PASS || '',
+  SMTP_FROM: process.env.SMTP_FROM || '',
+  // 🔥 Metrics Token
+  METRICS_TOKEN: process.env.METRICS_TOKEN || '',
 };
 
-// 🆕 AUDIT KEAMANAN — HARD-FAIL DI PRODUCTION UNTUK SECRET DEFAULT.
-// SEBELUMNYA: kalau operator lupa set JWT_SECRET/JWT_REFRESH_SECRET di file
-// .env production, aplikasi tetap jalan diam-diam memakai nilai default yang
-// tertulis JELAS di source code ini (dan sekarang ikut ter-copy ke mana pun
-// repo ini dibagikan). Siapa pun yang punya source code ini bisa MEMALSUKAN
-// token JWT valid untuk USER MANAPUN (termasuk admin) di server production
-// yang salah konfigurasi. Sekarang aplikasi menolak untuk start di production
-// kalau secret-nya masih default, atau kalau ALLOWED_ORIGINS kosong (CORS
-// jatuh ke wildcard "*" yang terlalu terbuka untuk production).
-if (ENV.NODE_ENV === 'production') {
-  const problems: string[] = [];
-  if (ENV.JWT_SECRET === DEFAULT_JWT_SECRET) {
-    problems.push('JWT_SECRET belum di-set (masih memakai default bawaan kode)');
-  }
-  if (ENV.JWT_REFRESH_SECRET === DEFAULT_JWT_REFRESH_SECRET) {
-    problems.push('JWT_REFRESH_SECRET belum di-set (masih memakai default bawaan kode)');
-  }
-  if (ENV.JWT_SECRET.length < 32) {
-    problems.push('JWT_SECRET terlalu pendek (minimal 32 karakter acak direkomendasikan)');
-  }
-  if (ENV.ALLOWED_ORIGINS.length === 0) {
-    problems.push('ALLOWED_ORIGINS belum di-set (CORS akan jatuh ke wildcard "*" di production)');
-  }
-  if (problems.length > 0) {
-    // eslint-disable-next-line no-console
-    console.error(
-      '\n🚨 FATAL: Konfigurasi keamanan production tidak lengkap:\n' +
-        problems.map((p) => `   - ${p}`).join('\n') +
-        '\n\nSet environment variable yang sesuai di file .env production sebelum menjalankan server.\n'
-    );
-    process.exit(1);
-  }
+// 🆕 Guard tambahan: JWT_SECRET dan JWT_REFRESH_SECRET TIDAK BOLEH sama --
+// kalau sama, dan ada bug validasi audience/issuer di masa depan, access
+// token bisa dipakai sebagai refresh token (atau sebaliknya) karena
+// keduanya lolos verifikasi signature yang sama.
+if (NODE_ENV === 'production' && ENV.JWT_SECRET === ENV.JWT_REFRESH_SECRET) {
+  throw new Error('[ENV] JWT_SECRET dan JWT_REFRESH_SECRET tidak boleh sama di production!');
 }

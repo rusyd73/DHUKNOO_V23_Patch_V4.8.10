@@ -1,17 +1,28 @@
 import { ServiceType } from '@prisma/client';
 import { TariffRepository } from './tariff.repository';
 import { AppError } from '../../core/errors/AppError';
+import { logger } from '../../config/logger';
 
 export interface TariffCalculationInput {
   serviceType: ServiceType;
   distanceKm: number;
-  zoneName?: string; // mis. "Kota Batu" — kalau tidak dikirim, pakai rule fallback umum
-  waitMinutes?: number; // Biaya Tunggu
-  hasToll?: boolean; // apakah rute lewat tol
-  hasParking?: boolean; // apakah butuh biaya parkir
-  isBadWeather?: boolean; // Cuaca
-  isHoliday?: boolean; // Hari Libur
-  promoDiscount?: number; // Promo (nominal potongan, sudah dihitung dari PromoService)
+  // 🚫 SEMUA PARAMETER FINANSIAL TIDAK DIPERCAYA DARI CLIENT
+  // Semua akan dihitung/dideteksi server-side
+  zoneName?: string;        // 🚫 IGNORE - deteksi dari koordinat
+  waitMinutes?: number;     // 🚫 IGNORE - dihitung dari timestamp
+  hasToll?: boolean;        // 🚫 IGNORE - deteksi dari routing
+  hasParking?: boolean;     // 🚫 IGNORE - ditentukan driver/event
+  isBadWeather?: boolean;   // 🚫 IGNORE - deteksi dari weather API
+  isHoliday?: boolean;      // 🚫 IGNORE - deteksi dari kalender
+  promoDiscount?: number;   // 🚫 IGNORE - dihitung dari promo code
+  // 🔒 KOORDINAT UNTUK DETEKSI SERVER-SIDE
+  pickupLat?: number;
+  pickupLng?: number;
+  dropoffLat?: number;
+  dropoffLng?: number;
+  // 🔒 TIMESTAMP UNTUK WAIT TIME
+  createdAt?: Date;
+  acceptedAt?: Date;
 }
 
 export interface TariffBreakdown {
@@ -30,35 +41,157 @@ export interface TariffBreakdown {
   driverEarning: number;
   tariffVersionId: string | null;
   zoneId: string | null;
-  // 🆕 Field khusus order MART (checkout dari toko/Merchant). Order BIKE/CAR/SEND
-  // biasa tidak mengisi field ini (tetap undefined), supaya struktur lama tidak
-  // berubah. Disimpan di sini (bukan kolom baru di tabel Order) supaya nilainya
-  // TERKUNCI pada saat checkout — persis seperti commissionRate driver — dan
-  // tidak berubah retroaktif walau Admin mengubah rate platform fee merchant
-  // di kemudian hari.
   orderType?: 'MART';
-  itemsSubtotal?: number; // total harga barang (belum termasuk ongkir)
-  merchantFeeRate?: number; // platform fee dari merchant, mis. 0.1 = 10%
-  merchantFeeAmount?: number; // itemsSubtotal * merchantFeeRate
-  merchantEarning?: number; // itemsSubtotal - merchantFeeAmount (masuk ke wallet merchant)
+  itemsSubtotal?: number;
+  merchantFeeRate?: number;
+  merchantFeeAmount?: number;
+  merchantEarning?: number;
 }
 
-/**
- * TariffEngineService — mesin tarif terpusat. SEMUA komponen harga (tarif
- * dasar, biaya pickup, biaya perjalanan, biaya tunggu, tol, parkir, cuaca,
- * hari libur, promo) dan komisi platform (tiered berdasarkan nilai order)
- * dibaca dari database (PricingRule, RegionalPolicy, TariffVersion), BUKAN
- * hardcode di kode program. Admin bisa ubah semuanya lewat panel Admin
- * tanpa perlu rilis aplikasi baru.
- */
 export class TariffEngineService {
   private tariffRepo = new TariffRepository();
 
-  async calculateFare(input: TariffCalculationInput): Promise<TariffBreakdown> {
-    const zone = input.zoneName ? await this.tariffRepo.findZoneByName(input.zoneName) : null;
+  // ============================================================
+  // 🔒 ZONE CENTERS (SERVER-SIDE REFERENCE)
+  // ============================================================
+  private readonly ZONE_CENTERS: Record<string, { lat: number; lng: number; radiusKm: number }> = {
+    'Kota Malang': { lat: -7.9666, lng: 112.6326, radiusKm: 10 },
+    'Kota Batu': { lat: -7.8671, lng: 112.5239, radiusKm: 8 },
+    'Malang Raya': { lat: -7.9666, lng: 112.6326, radiusKm: 30 },
+  };
 
-    // 1. Cari PricingRule: prioritas rule spesifik-zona, fallback ke rule umum (zoneId null)
-    let rule = zone ? await this.tariffRepo.findActiveRule(input.serviceType, zone.id) : null;
+  // ============================================================
+  // 🔒 DETEKSI ZONE (SERVER-SIDE)
+  // ============================================================
+  private async detectZone(lat: number, lng: number): Promise<string | null> {
+    const zones = await this.tariffRepo.listZones();
+    let detected: string | null = null;
+    let minDistance = Infinity;
+
+    for (const zone of zones) {
+      const center = this.ZONE_CENTERS[zone.name];
+      if (!center) continue;
+      const distance = this.calculateDistance(lat, lng, center.lat, center.lng);
+      if (distance <= center.radiusKm && distance < minDistance) {
+        minDistance = distance;
+        detected = zone.name;
+      }
+    }
+
+    if (detected) {
+      logger.info(`[ZONE] Detected: ${detected} (${minDistance.toFixed(2)}km)`);
+      return detected;
+    }
+    return null;
+  }
+
+  // ============================================================
+  // 🔒 DETEKSI HOLIDAY (SERVER-SIDE)
+  // ============================================================
+  private async detectHoliday(date: Date): Promise<boolean> {
+    const dateStr = date.toISOString().split('T')[0];
+    const holiday = await this.tariffRepo.findHoliday(dateStr);
+    if (holiday) return true;
+    // Cek hari Minggu
+    return date.getDay() === 0;
+  }
+
+  // ============================================================
+  // 🔒 DETEKSI WEATHER (SERVER-SIDE)
+  // ============================================================
+  private async detectBadWeather(lat: number, lng: number): Promise<boolean> {
+    // 🔥 Implementasi: panggil Weather API (OpenWeatherMap)
+    // Sementara: return false
+    return false;
+  }
+
+  // ============================================================
+  // 🔒 DETEKSI TOLL (SERVER-SIDE)
+  // ============================================================
+  private async detectToll(
+    pickupLat: number,
+    pickupLng: number,
+    dropoffLat: number,
+    dropoffLng: number
+  ): Promise<boolean> {
+    // 🔥 Implementasi: cek route dengan OSRM/Google Maps
+    // Sementara: return false
+    return false;
+  }
+
+  // ============================================================
+  // 🔒 DETEKSI PARKING (SERVER-SIDE)
+  // ============================================================
+  private async detectParking(dropoffLat: number, dropoffLng: number): Promise<boolean> {
+    // 🔥 Implementasi: cek apakah dropoff di area parkir berbayar
+    // Sementara: return false
+    return false;
+  }
+
+  // ============================================================
+  // 🔒 HITUNG WAIT TIME (SERVER-SIDE)
+  // ============================================================
+  private calculateWaitTime(createdAt: Date, acceptedAt?: Date): number {
+    const now = new Date();
+    const startTime = acceptedAt || createdAt;
+    const diffMinutes = (now.getTime() - startTime.getTime()) / 60000;
+    return Math.max(0, Math.floor(diffMinutes));
+  }
+
+  // ============================================================
+  // 🔥 CALCULATE FARE - SEMUA PARAMETER DARI SERVER
+  // ============================================================
+  async calculateFare(input: TariffCalculationInput): Promise<TariffBreakdown> {
+    // 🔒 STEP 1: ZONE - deteksi dari koordinat
+    let zoneId: string | null = null;
+    if (input.pickupLat && input.pickupLng) {
+      const detectedZone = await this.detectZone(input.pickupLat, input.pickupLng);
+      if (detectedZone) {
+        const zone = await this.tariffRepo.findZoneByName(detectedZone);
+        if (zone) zoneId = zone.id;
+      }
+    }
+
+    // 🔒 STEP 2: HOLIDAY - deteksi server-side
+    const isHoliday = await this.detectHoliday(new Date());
+
+    // 🔒 STEP 3: WEATHER - deteksi server-side
+    let isBadWeather = false;
+    if (input.pickupLat && input.pickupLng) {
+      isBadWeather = await this.detectBadWeather(input.pickupLat, input.pickupLng);
+    }
+
+    // 🔒 STEP 4: TOLL - deteksi server-side
+    let hasToll = false;
+    if (input.pickupLat && input.pickupLng && input.dropoffLat && input.dropoffLng) {
+      hasToll = await this.detectToll(
+        input.pickupLat,
+        input.pickupLng,
+        input.dropoffLat,
+        input.dropoffLng
+      );
+    }
+
+    // 🔒 STEP 5: PARKING - deteksi server-side
+    let hasParking = false;
+    if (input.dropoffLat && input.dropoffLng) {
+      hasParking = await this.detectParking(input.dropoffLat, input.dropoffLng);
+    }
+
+    // 🔒 STEP 6: WAIT TIME - dihitung dari timestamp
+    const waitMinutes = this.calculateWaitTime(
+      input.createdAt || new Date(),
+      input.acceptedAt
+    );
+
+    // 🔒 STEP 7: PROMO DISCOUNT - akan dihitung dari PromoService
+    // input.promoDiscount IGNORE
+
+    // ✅ LOG semua parameter yang sebenarnya dipakai
+    logger.info(`[TARIFF] Server-side params: zone=${zoneId}, holiday=${isHoliday}, weather=${isBadWeather}, toll=${hasToll}, wait=${waitMinutes}min, parking=${hasParking}`);
+
+    // STEP 8: Cari PricingRule
+    let rule = zoneId ? await this.tariffRepo.findActiveRule(input.serviceType, zoneId) : null;
     if (!rule) {
       rule = await this.tariffRepo.findFallbackRule(input.serviceType);
     }
@@ -69,36 +202,35 @@ export class TariffEngineService {
       );
     }
 
-    // 2. Komponen dasar dari PricingRule
+    // STEP 9: Komponen dasar
     const baseFare = Number(rule.baseFare);
     const pickupFee = Number(rule.pickupFee);
     const distanceFee = Number(rule.perKmFee) * Math.max(0, input.distanceKm);
-    const waitFee = Number(rule.perMinuteWaitFee) * Math.max(0, input.waitMinutes || 0);
+    const waitFee = Number(rule.perMinuteWaitFee) * Math.max(0, waitMinutes);
 
-    // 3. Komponen regional (tol, parkir, cuaca, hari libur) dari RegionalPolicy zona tsb
+    // STEP 10: Komponen regional
     let tollFee = 0;
     let parkingFee = 0;
     let weatherSurcharge = 0;
     let holidaySurcharge = 0;
 
-    if (zone) {
-      const policy = await this.tariffRepo.findActiveRegionalPolicy(zone.id);
+    if (zoneId) {
+      const policy = await this.tariffRepo.findActiveRegionalPolicy(zoneId);
       if (policy) {
-        tollFee = input.hasToll ? Number(policy.tollFee) : 0;
-        parkingFee = input.hasParking ? Number(policy.parkingFee) : 0;
-        weatherSurcharge = input.isBadWeather ? Number(policy.weatherSurcharge) : 0;
-        holidaySurcharge = input.isHoliday ? Number(policy.holidaySurcharge) : 0;
+        tollFee = hasToll ? Number(policy.tollFee) : 0;
+        parkingFee = hasParking ? Number(policy.parkingFee) : 0;
+        weatherSurcharge = isBadWeather ? Number(policy.weatherSurcharge) : 0;
+        holidaySurcharge = isHoliday ? Number(policy.holidaySurcharge) : 0;
       }
     }
 
-    const promoDiscount = Math.max(0, input.promoDiscount || 0);
+    // 🔒 PROMO DISCOUNT - dihitung terpisah (bukan dari input)
+    const promoDiscount = 0;
 
-    // 4. Tarif Akhir = Tarif Dasar + Pickup + Perjalanan + Tunggu + Tol + Parkir + Cuaca + Hari Libur - Promo
     const subtotal =
       baseFare + pickupFee + distanceFee + waitFee + tollFee + parkingFee + weatherSurcharge + holidaySurcharge;
     const finalFare = Math.max(0, subtotal - promoDiscount);
 
-    // 5. Komisi platform TIERED berdasarkan nilai order akhir, dibaca dari TariffVersion aktif
     const { rate: commissionRate, tariffVersionId } = await this.resolveCommissionRate(finalFare);
     const commissionAmount = finalFare * commissionRate;
     const driverEarning = finalFare - commissionAmount;
@@ -118,16 +250,27 @@ export class TariffEngineService {
       commissionAmount,
       driverEarning,
       tariffVersionId,
-      zoneId: zone?.id ?? null,
+      zoneId,
     };
   }
 
-  /**
-   * Mencari tarif komisi (rate) yang berlaku untuk sebuah nilai order, berdasarkan
-   * tier yang didefinisikan di TariffVersion yang sedang aktif. Kalau belum ada
-   * TariffVersion aktif sama sekali, jatuh ke default aman 20% (supaya sistem
-   * tidak pernah gagal total hanya karena Admin belum sempat setup tariff engine).
-   */
+  // ============================================================
+  // 🔒 HITUNG JARAK (Haversine)
+  // ============================================================
+  private calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371;
+    const dLat = this.toRad(lat2 - lat1);
+    const dLon = this.toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)**2 + 
+              Math.cos(this.toRad(lat1)) * Math.cos(this.toRad(lat2)) * 
+              Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  private toRad(deg: number): number {
+    return deg * Math.PI / 180;
+  }
+
   async resolveCommissionRate(orderValue: number): Promise<{ rate: number; tariffVersionId: string | null }> {
     const activeVersion = await this.tariffRepo.findActiveTariffVersion();
     if (!activeVersion) {
@@ -135,7 +278,6 @@ export class TariffEngineService {
     }
 
     const tiers = activeVersion.commissionTiers as unknown as Array<{ maxOrderValue: number | null; rate: number }>;
-    // Tiers diasumsikan terurut naik berdasarkan maxOrderValue (null = tier terakhir/tanpa batas)
     const sorted = [...tiers].sort((a, b) => {
       if (a.maxOrderValue === null) return 1;
       if (b.maxOrderValue === null) return -1;
@@ -150,12 +292,6 @@ export class TariffEngineService {
     return this.tariffRepo.savePricingHistory(orderId, breakdown.tariffVersionId, breakdown);
   }
 
-  /**
-   * Nilai minimum deposit yang wajib dimiliki driver sebelum bisa menerima order,
-   * diatur Admin lewat PlatformConfig (key: MINIMUM_DRIVER_DEPOSIT). Kalau belum
-   * pernah di-set sama sekali, jatuh ke default aman Rp20.000 (bukan 0), supaya
-   * gerbang deposit tetap aktif secara wajar walau Admin belum sempat mengatur nilainya.
-   */
   async getMinimumDriverDeposit(): Promise<number> {
     const config = await this.tariffRepo.getConfig('MINIMUM_DRIVER_DEPOSIT');
     if (!config) return 20000;
@@ -163,17 +299,6 @@ export class TariffEngineService {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 20000;
   }
 
-  /**
-   * 🆕 Platform fee yang dipotong dari MERCHANT (bukan driver) untuk setiap
-   * penjualan barang lewat checkout MART — sebelumnya belum ada sama sekali
-   * di ekosistem tarif engine ini (hanya ada komisi driver dari TariffVersion).
-   * Nilainya berupa rate 0..1 (mis. 0.1 = 10%), diatur Admin lewat endpoint
-   * PlatformConfig yang sama seperti MINIMUM_DRIVER_DEPOSIT (key:
-   * "MERCHANT_PLATFORM_FEE_RATE"), tanpa perlu rilis aplikasi baru. Kalau
-   * Admin belum pernah mengatur, jatuh ke default aman 10% (bukan 0%),
-   * supaya platform tidak pernah kehilangan pendapatan dari sisi merchant
-   * hanya karena belum sempat dikonfigurasi.
-   */
   async getMerchantPlatformFeeRate(): Promise<number> {
     const config = await this.tariffRepo.getConfig('MERCHANT_PLATFORM_FEE_RATE');
     if (!config) return 0.1;

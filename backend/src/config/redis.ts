@@ -6,6 +6,8 @@ export class RedisService {
   private static client: Redis | null = null;
   private static isConnected = false;
   private static inMemoryCache = new Map<string, { value: string; expiresAt: number | null }>();
+  private static inMemorySets = new Map<string, Set<string>>();
+  private static inMemoryGeo = new Map<string, Map<string, { longitude: number; latitude: number; timestamp: number }>>();
 
   public static async init(): Promise<void> {
     if (!ENV.REDIS_URL) {
@@ -21,7 +23,7 @@ export class RedisService {
           if (times > 3) {
             logger.warn('Redis reconnection failed after 3 attempts. Falling back to in-memory.');
             this.isConnected = false;
-            return null; // Stop retrying
+            return null;
           }
           return Math.min(times * 100, 1000);
         },
@@ -46,6 +48,10 @@ export class RedisService {
     return this.client;
   }
 
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 BASIC OPERATIONS
+  // ──────────────────────────────────────────────────────────────────
+
   public static async get(key: string): Promise<string | null> {
     if (this.isConnected && this.client) {
       try {
@@ -54,8 +60,6 @@ export class RedisService {
         logger.error(`Error getting key ${key} from Redis: %s`, (err as Error).message);
       }
     }
-
-    // Fallback to in-memory cache
     const item = this.inMemoryCache.get(key);
     if (!item) return null;
     if (item.expiresAt && Date.now() > item.expiresAt) {
@@ -78,16 +82,10 @@ export class RedisService {
         logger.error(`Error setting key ${key} in Redis: %s`, (err as Error).message);
       }
     }
-
-    // Fallback to in-memory cache
     const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : null;
     this.inMemoryCache.set(key, { value, expiresAt });
   }
 
-  /**
-   * 🔥 BARU: Set key dengan TTL (expiry) - sama seperti set tapi lebih eksplisit
-   * Digunakan untuk menyimpan socketId driver dengan masa berlaku
-   */
   public static async setex(key: string, seconds: number, value: string): Promise<void> {
     if (this.isConnected && this.client) {
       try {
@@ -97,8 +95,6 @@ export class RedisService {
         logger.error(`Error setex key ${key} in Redis: %s`, (err as Error).message);
       }
     }
-
-    // Fallback to in-memory cache
     const expiresAt = seconds ? Date.now() + seconds * 1000 : null;
     this.inMemoryCache.set(key, { value, expiresAt });
   }
@@ -115,10 +111,6 @@ export class RedisService {
     this.inMemoryCache.delete(key);
   }
 
-  /**
-   * 🔥 BARU: Mencari semua key yang match dengan pattern
-   * Digunakan untuk mencari socketId driver yang terdaftar
-   */
   public static async keys(pattern: string): Promise<string[]> {
     if (this.isConnected && this.client) {
       try {
@@ -128,8 +120,6 @@ export class RedisService {
         return [];
       }
     }
-
-    // Fallback to in-memory cache
     const result: string[] = [];
     const regex = new RegExp(pattern.replace(/\*/g, '.*'));
     for (const key of this.inMemoryCache.keys()) {
@@ -140,9 +130,216 @@ export class RedisService {
     return result;
   }
 
-  /**
-   * 🔥 BARU: Publish message ke channel (untuk event-driven architecture)
-   */
+  public static async expire(key: string, seconds: number): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.expire(key, seconds);
+      } catch (err) {
+        logger.error(`Error expire key ${key} in Redis: %s`, (err as Error).message);
+        return 0;
+      }
+    }
+    const item = this.inMemoryCache.get(key);
+    if (item) {
+      item.expiresAt = Date.now() + seconds * 1000;
+      return 1;
+    }
+    return 0;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 SET OPERATIONS (untuk multi-device driver)
+  // ──────────────────────────────────────────────────────────────────
+
+  public static async sadd(key: string, value: string): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.sadd(key, value);
+      } catch (err) {
+        logger.error(`Error sadd key ${key} in Redis: %s`, (err as Error).message);
+        return 0;
+      }
+    }
+    if (!this.inMemorySets.has(key)) {
+      this.inMemorySets.set(key, new Set());
+    }
+    const set = this.inMemorySets.get(key)!;
+    set.add(value);
+    return set.size;
+  }
+
+  public static async srem(key: string, value: string): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.srem(key, value);
+      } catch (err) {
+        logger.error(`Error srem key ${key} in Redis: %s`, (err as Error).message);
+        return 0;
+      }
+    }
+    const set = this.inMemorySets.get(key);
+    if (set) {
+      const deleted = set.delete(value) ? 1 : 0;
+      if (set.size === 0) {
+        this.inMemorySets.delete(key);
+      }
+      return deleted;
+    }
+    return 0;
+  }
+
+  public static async smembers(key: string): Promise<string[]> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.smembers(key);
+      } catch (err) {
+        logger.error(`Error smembers key ${key} in Redis: %s`, (err as Error).message);
+        return [];
+      }
+    }
+    const set = this.inMemorySets.get(key);
+    return set ? Array.from(set) : [];
+  }
+
+  public static async scard(key: string): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.scard(key);
+      } catch (err) {
+        logger.error(`Error scard key ${key} in Redis: %s`, (err as Error).message);
+        return 0;
+      }
+    }
+    const set = this.inMemorySets.get(key);
+    return set ? set.size : 0;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 GEO SPATIAL OPERATIONS (untuk nearest driver)
+  // ──────────────────────────────────────────────────────────────────
+
+  public static async geoadd(key: string, longitude: number, latitude: number, member: string): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.geoadd(key, longitude, latitude, member);
+      } catch (err) {
+        logger.error(`Error geoadd key ${key}:`, err);
+        return 0;
+      }
+    }
+    if (!this.inMemoryGeo.has(key)) {
+      this.inMemoryGeo.set(key, new Map());
+    }
+    const geoMap = this.inMemoryGeo.get(key)!;
+    geoMap.set(member, { longitude, latitude, timestamp: Date.now() });
+    return 1;
+  }
+
+  public static async geosearch(
+    key: string,
+    longitude: number,
+    latitude: number,
+    radius: number,
+    unit: 'km' | 'm' = 'km'
+  ): Promise<Array<{ member: string; distance: number }>> {
+    if (this.isConnected && this.client) {
+      try {
+        // ioredis geosearch syntax yang benar
+        const results = await this.client.sendCommand(
+          new Redis.Command('GEOSEARCH', [
+            key,
+            'FROMLONLAT',
+            longitude.toString(),
+            latitude.toString(),
+            'BYRADIUS',
+            radius.toString(),
+            unit,
+            'WITHDIST',
+            'ASC'
+          ])
+        ) as any[];
+
+        return results.map((item: any) => {
+          if (Array.isArray(item) && item.length === 2) {
+            return {
+              member: item[0] as string,
+              distance: parseFloat(item[1]),
+            };
+          }
+          return { member: '', distance: 0 };
+        }).filter((item: any) => item.member !== '');
+      } catch (err) {
+        logger.error(`Error geosearch key ${key}:`, err);
+        return [];
+      }
+    }
+
+    // Fallback: in-memory Geo search (O(N) - hanya untuk development)
+    const geoMap = this.inMemoryGeo.get(key);
+    if (!geoMap || geoMap.size === 0) return [];
+
+    const results: Array<{ member: string; distance: number }> = [];
+    const R = 6371;
+    const toRad = (deg: number) => deg * Math.PI / 180;
+
+    for (const [member, loc] of geoMap) {
+      const dLat = toRad(loc.latitude - latitude);
+      const dLon = toRad(loc.longitude - longitude);
+      const a = Math.sin(dLat/2)**2 + 
+                Math.cos(toRad(latitude)) * Math.cos(toRad(loc.latitude)) * 
+                Math.sin(dLon/2)**2;
+      const distance = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      
+      const distanceInUnit = unit === 'km' ? distance : distance * 1000;
+      if (distanceInUnit <= radius) {
+        results.push({ member, distance: distanceInUnit });
+      }
+    }
+
+    results.sort((a, b) => a.distance - b.distance);
+    return results;
+  }
+
+  public static async geopos(key: string, member: string): Promise<[number, number][]> {
+    if (this.isConnected && this.client) {
+      try {
+        const result = await this.client.geopos(key, member);
+        if (!result || !result[0]) return [];
+        const pos = result[0];
+        if (!pos || pos.length < 2) return [];
+        return [[parseFloat(pos[0] as string), parseFloat(pos[1] as string)]];
+      } catch (err) {
+        logger.error(`Error geopos key ${key}:`, err);
+        return [];
+      }
+    }
+    const geoMap = this.inMemoryGeo.get(key);
+    if (!geoMap) return [];
+    const loc = geoMap.get(member);
+    if (!loc) return [];
+    return [[loc.longitude, loc.latitude]];
+  }
+
+  public static async zrem(key: string, member: string): Promise<number> {
+    if (this.isConnected && this.client) {
+      try {
+        return await this.client.zrem(key, member);
+      } catch (err) {
+        logger.error(`Error zrem key ${key}:`, err);
+        return 0;
+      }
+    }
+    const geoMap = this.inMemoryGeo.get(key);
+    if (geoMap) {
+      return geoMap.delete(member) ? 1 : 0;
+    }
+    return 0;
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 PUB/SUB
+  // ──────────────────────────────────────────────────────────────────
+
   public static async publish(channel: string, message: string): Promise<void> {
     if (this.isConnected && this.client) {
       try {
@@ -153,9 +350,6 @@ export class RedisService {
     }
   }
 
-  /**
-   * 🔥 BARU: Subscribe ke channel (untuk event-driven architecture)
-   */
   public static async subscribe(channel: string, callback: (message: string) => void): Promise<void> {
     if (this.isConnected && this.client) {
       try {
@@ -172,9 +366,6 @@ export class RedisService {
     }
   }
 
-  /**
-   * 🔥 BARU: Unsubscribe dari channel
-   */
   public static async unsubscribe(channel: string): Promise<void> {
     if (this.isConnected && this.client) {
       try {
@@ -186,10 +377,10 @@ export class RedisService {
     }
   }
 
-  /**
-   * 🔥 BARU: Hapus semua key dengan pattern tertentu
-   * Digunakan untuk cleanup
-   */
+  // ──────────────────────────────────────────────────────────────────
+  // 🔥 UTILITY
+  // ──────────────────────────────────────────────────────────────────
+
   public static async delPattern(pattern: string): Promise<void> {
     const keys = await this.keys(pattern);
     if (keys.length > 0) {
@@ -200,17 +391,13 @@ export class RedisService {
     }
   }
 
-  /**
-   * 🔥 BARU: Cek apakah Redis terhubung
-   */
   public static isReady(): boolean {
     return this.isConnected;
   }
 
-  /**
-   * 🔥 BARU: Clear semua in-memory cache (untuk testing)
-   */
   public static clearMemoryCache(): void {
     this.inMemoryCache.clear();
+    this.inMemorySets.clear();
+    this.inMemoryGeo.clear();
   }
 }

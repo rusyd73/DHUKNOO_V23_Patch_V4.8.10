@@ -9,6 +9,9 @@ import { prisma } from '../../config/prisma';
 export class WalletController {
   private walletService = new WalletService();
 
+  // ============================================================
+  // 🔒 GET BALANCE
+  // ============================================================
   getBalance = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
@@ -21,6 +24,9 @@ export class WalletController {
     }
   };
 
+  // ============================================================
+  // 🔒 GET TRANSACTION HISTORY
+  // ============================================================
   getTransactions = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
@@ -35,110 +41,151 @@ export class WalletController {
     }
   };
 
+  // ============================================================
+  // 🔒 REQUEST TOPUP (DENGAN VALIDASI)
+  // ============================================================
   createTopupRequest = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
       const { amount, method, proofImageUrl, note } = req.body;
+
+      // 🔒 Validasi input
       const parsedAmount = Number(amount);
       if (isNaN(parsedAmount) || parsedAmount < 5000) {
         return res.status(400).json({ error: 'Nominal top-up minimal adalah Rp 5.000!' });
       }
 
-      // PAYMENT_LINK bukan nilai valid di enum PaymentMethod (schema.prisma) --
-      // secara konsep gateway checkout link tetap sejenis TRANSFER, jadi
-      // dinormalisasi supaya tidak gagal saat disimpan ke database.
+      if (!method) {
+        return res.status(400).json({ error: 'Payment method is required' });
+      }
+
+      if (!proofImageUrl) {
+        return res.status(400).json({ error: 'Proof image is required' });
+      }
+
+      // 🔒 Normalisasi method
       const normalizedMethod = method === 'PAYMENT_LINK' ? 'TRANSFER' : method;
 
-      const topupRequest = await prisma.topupRequest.create({
-        data: {
-          userId,
-          amount: parsedAmount,
-          method: normalizedMethod || 'TRANSFER',
-          proofImageUrl: proofImageUrl || null,
-          note: note || null,
-          status: 'PENDING_REVIEW',
-        },
-      });
+      // 🔒 Panggil service dengan validasi
+      const topupRequest = await this.walletService.requestTopup(
+        userId,
+        parsedAmount,
+        normalizedMethod,
+        proofImageUrl,
+        note
+      );
 
-      await AuditLogger.log(userId, 'WALLET_TOPUP_REQUESTED', `Permintaan top-up Rp${parsedAmount.toLocaleString('id-ID')} (${normalizedMethod || 'TRANSFER'})`);
+      await AuditLogger.log(
+        userId,
+        'WALLET_TOPUP_REQUESTED',
+        `Permintaan top-up Rp${parsedAmount.toLocaleString('id-ID')} (${normalizedMethod})`
+      );
 
       return res.status(201).json({
+        success: true,
         message: 'Permintaan top-up berhasil diajukan! Menunggu peninjauan dan konfirmasi Admin.',
-        topupRequest,
+        data: topupRequest,
+        requiresAdminApproval: true,
       });
+
     } catch (err: any) {
       logger.error('WalletController.createTopupRequest error: %s', err.message);
-      return res.status(500).json({ error: err.message || 'Gagal mengajukan permintaan top-up.' });
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({
+        success: false,
+        error: err.message || 'Gagal mengajukan permintaan top-up.',
+      });
     }
   };
 
+  // ============================================================
+  // 🔒 GET MY TOPUP REQUESTS
+  // ============================================================
   getMyTopupRequests = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
-      const requests = await prisma.topupRequest.findMany({
-        where: { userId },
-        orderBy: { createdAt: 'desc' },
-      });
-      return res.status(200).json({ topupRequests: requests });
-    } catch (err: any) {
-      logger.error('WalletController.getMyTopupRequests error: %s', err.message);
-      return res.status(500).json({ error: err.message || 'Gagal mengambil riwayat permintaan top-up.' });
-    }
-  };
+      const { limit = 20, offset = 0 } = req.query;
 
-  topup = async (req: AuthenticatedRequest, res: Response) => {
-    try {
-      const userId = req.user!.id;
-      const { amount, method, proofImageUrl, note } = req.body;
-      const parsedAmount = Number(amount);
-
-      if (isNaN(parsedAmount) || parsedAmount < 5000) {
-        return res.status(400).json({ error: 'Nominal top-up minimal adalah Rp 5.000!' });
-      }
-
-      // 🆕 AUDIT KEAMANAN KRITIS: sebelumnya kalau yang memanggil endpoint ini
-      // berrole ADMIN, saldo WALLET MEREKA SENDIRI langsung ditambahkan tanpa
-      // review sama sekali (bypass total dari alur PENDING_REVIEW di bawah).
-      // Ini celah self-dealing yang serius: admin manapun (termasuk akun yang
-      // seharusnya tidak pernah ada, sebelum registrasi publik role ADMIN
-      // ditutup -- lihat schemas.ts registerSchema) bisa mencetak saldo
-      // sendiri tanpa batas hanya dengan memanggil endpoint ini langsung,
-      // tidak lewat UI mana pun. Tidak ada satu pun pemanggil frontend yang
-      // sah memakai jalur ini (hanya CUSTOMER/DRIVER lewat TopupModal). Semua
-      // permintaan top-up sekarang WAJIB lewat antrean review, siapa pun
-      // pemanggilnya -- kalau admin butuh menambah saldo user LAIN secara
-      // langsung (mis. kompensasi), pakai POST /api/admin/wallet/credit yang
-      // mewajibkan target userId eksplisit + alasan, dan tidak bisa
-      // menyasar diri sendiri (lihat admin.routes.ts).
-      //
-      // PAYMENT_LINK bukan nilai valid di enum PaymentMethod (schema.prisma) --
-      // secara konsep gateway checkout link tetap sejenis TRANSFER, jadi
-      // dinormalisasi supaya tidak gagal saat disimpan ke database.
-      const normalizedMethod = method === 'PAYMENT_LINK' ? 'TRANSFER' : method;
-
-      const topupRequest = await prisma.topupRequest.create({
-        data: {
-          userId,
-          amount: parsedAmount,
-          method: normalizedMethod || 'TRANSFER',
-          proofImageUrl: proofImageUrl || null,
-          note: note || null,
-          status: 'PENDING_REVIEW',
-        },
-      });
-
-      await AuditLogger.log(userId, 'WALLET_TOPUP_REQUESTED', `Pengajuan top-up saldo Rp${parsedAmount.toLocaleString('id-ID')} (${normalizedMethod || 'TRANSFER'})`);
+      const result = await this.walletService.getTopupHistory(
+        userId,
+        Number(limit),
+        Number(offset)
+      );
 
       return res.status(200).json({
-        message: 'Permintaan top-up berhasil dikirim! Menunggu verifikasi & persetujuan Admin sebelum saldo bertambah.',
-        topupRequest,
-        requiresAdminApproval: true,
+        success: true,
+        data: result.data,
+        pagination: result.pagination,
       });
+
     } catch (err: any) {
-      logger.error('WalletController.topup error: %s', err.message);
-      const status = err instanceof AppError ? err.statusCode : 500;
-      return res.status(status).json({ error: err.message || 'Gagal melakukan top-up.' });
+      logger.error('WalletController.getMyTopupRequests error: %s', err.message);
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Gagal mengambil riwayat permintaan top-up.',
+      });
     }
   };
-}
 
+// ============================================================
+// 🔒 LEGACY TOPUP ENDPOINT - SEKARANG SELALU LEWAT ANTREAN REVIEW
+//
+// 🆕 AUDIT KEAMANAN KRITIS: bypass 'role===ADMIN' yang dulu ada di sini
+// DIHAPUS TOTAL. Bypass itu langsung mengkredit wallet PEMANGGIL SENDIRI
+// (this.walletService.topup(userId, ...) dengan userId = admin yang
+// memanggil) tanpa review, tanpa target eksplisit, tanpa alasan, tanpa
+// batas nominal -- admin manapun bisa mencetak saldo tak terbatas ke
+// akun sendiri hanya dengan memanggil endpoint ini langsung.
+//
+// SEKARANG: endpoint ini (dan flow topup-request) SELALU membuat
+// TopupRequest berstatus PENDING_REVIEW, SIAPA PUN pemanggilnya,
+// termasuk ADMIN. Tidak ada jalur "langsung topup ke diri sendiri" lagi.
+//
+// Jalur sah admin menambah saldo user LAIN (bukan diri sendiri) sekarang
+// HANYA lewat POST /api/admin/wallet/credit (lihat admin.routes.ts +
+// WalletAdminService.creditUserWallet) -- wajib target eksplisit +
+// alasan, tidak bisa menyasar diri sendiri, dibatasi Rp50 juta/transaksi,
+// full audit log.
+// ============================================================
+topup = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { amount, method, proofImageUrl, note } = req.body;
+    const parsedAmount = Number(amount);
+
+    if (isNaN(parsedAmount) || parsedAmount < 5000) {
+      return res.status(400).json({ error: 'Nominal top-up minimal adalah Rp 5.000!' });
+    }
+
+    const normalizedMethod = method === 'PAYMENT_LINK' ? 'TRANSFER' : method;
+    const topupRequest = await this.walletService.requestTopup(
+      userId,
+      parsedAmount,
+      normalizedMethod || 'TRANSFER',
+      proofImageUrl || '',
+      note
+    );
+
+    await AuditLogger.log(
+      userId,
+      'WALLET_TOPUP_REQUESTED',
+      `Pengajuan top-up saldo Rp${parsedAmount.toLocaleString('id-ID')} (${normalizedMethod || 'TRANSFER'})`
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: 'Permintaan top-up berhasil dikirim! Menunggu verifikasi Admin.',
+      data: topupRequest,
+      requiresAdminApproval: true,
+    });
+
+  } catch (err: any) {
+    logger.error('WalletController.topup error: %s', err.message);
+    const status = err instanceof AppError ? err.statusCode : 500;
+    return res.status(status).json({
+      success: false,
+      error: err.message || 'Gagal melakukan top-up.',
+    });
+   }
+ };
+}

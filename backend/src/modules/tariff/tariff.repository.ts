@@ -3,7 +3,6 @@ import { ServiceType } from '@prisma/client';
 
 export class TariffRepository {
   findActiveRule(serviceType: ServiceType, zoneId?: string) {
-    // Prioritas: rule spesifik untuk zona tsb, baru fallback ke rule umum (zoneId null)
     return prisma.pricingRule.findFirst({
       where: {
         serviceType,
@@ -115,7 +114,6 @@ export class TariffRepository {
   }
 
   async activateTariffVersion(id: string) {
-    // Hanya boleh 1 versi aktif dalam satu waktu — nonaktifkan semua dulu, baru aktifkan yang dipilih.
     return prisma.$transaction([
       prisma.tariffVersion.updateMany({ where: { isActive: true }, data: { isActive: false } }),
       prisma.tariffVersion.update({ where: { id }, data: { isActive: true, activatedAt: new Date() } }),
@@ -138,14 +136,6 @@ export class TariffRepository {
     return prisma.platformConfig.findMany({ orderBy: { key: 'asc' } });
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | DASHBOARD ANALYTICS SUMMARY
-  |--------------------------------------------------------------------------
-  | Dipakai AdminDashboardController.getSummary — sebelumnya method ini
-  | dipanggil tapi tidak pernah diimplementasikan sama sekali (build gagal:
-  | "Property 'getDashboardSummary' does not exist").
-  */
   async getDashboardSummary(range: 'daily' | 'weekly' | 'monthly') {
     const rangeDays = range === 'daily' ? 1 : range === 'weekly' ? 7 : 30;
     const since = new Date();
@@ -161,13 +151,10 @@ export class TariffRepository {
           where: { createdAt: { gte: since } },
           _count: { _all: true },
         }),
-        // Omzet kotor (harga sebelum diskon) dari order yang sudah lunas.
         prisma.order.aggregate({
           where: { createdAt: { gte: since }, isPaid: true },
           _sum: { price: true, discount: true },
         }),
-        // Komisi platform disimpan sebagai transaksi NEGATIF (potongan dari deposit
-        // driver) — lihat WalletRepository.applyDelta / platformFee.negated().
         prisma.transaction.aggregate({
           where: { type: 'PLATFORM_FEE', createdAt: { gte: since } },
           _sum: { amount: true },
@@ -193,5 +180,26 @@ export class TariffRepository {
       totalDriverEarningRupiah,
       statusBreakdown: statusBreakdown.map((s) => ({ status: s.status, count: s._count._all })),
     };
+  }
+
+  // ============================================================
+  // 🔒 HOLIDAY
+  // ============================================================
+
+  async findHoliday(date: string): Promise<any> {
+    const start = new Date(date);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(date);
+    end.setHours(23, 59, 59, 999);
+
+    return prisma.holiday.findFirst({
+      where: {
+        date: {
+          gte: start,
+          lte: end,
+        },
+        isActive: true,
+      },
+    });
   }
 }

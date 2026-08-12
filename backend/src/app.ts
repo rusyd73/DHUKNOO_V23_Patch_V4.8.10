@@ -10,6 +10,7 @@ import { SocketService } from './websocket/socket';
 import { BackgroundJobs } from './jobs/cron';
 import { errorHandler } from './core/middleware/error.middleware';
 import { generalRateLimiter } from './core/middleware/rateLimit.middleware';
+import cookieParser from 'cookie-parser';
 
 // Import services and controllers for telemetry & documentation
 import { RedisService } from './config/redis';
@@ -18,6 +19,7 @@ import { MetricsService } from './config/metrics';
 import { MailerService } from './config/mailer';
 import { HealthCheckController } from './config/health';
 import { SwaggerSpecification } from './docs/swagger-spec';
+
 
 // Import domain module routes
 import { authRouter } from './modules/auth/auth.routes';
@@ -37,6 +39,7 @@ import { tariffRouter } from './modules/tariff/tariff.routes';
 import { uploadRouter } from './modules/upload/upload.routes';
 import dispatchRouter from './modules/dispatch/dispatch.route';
 import { UPLOAD_DIR_ABSOLUTE, UPLOADS_PUBLIC_PATH } from './modules/upload/upload.config';
+import { fileRouter } from './modules/file/file.routes';
 
 // ────────────────────────────────────────────────────────────────────────
 // Modul ini HANYA merakit `app` Express + `httpServer` HTTP-nya — TIDAK
@@ -71,16 +74,6 @@ if (process.env.NODE_ENV !== 'test') {
 // 2. Register Global Middlewares
 // CORS dibatasi ke ALLOWED_ORIGINS (env, comma-separated). Kalau belum diset,
 // fallback ke "*" supaya development tetap mudah — TAPI wajib diisi di production.
-// 🆕 AUDIT KEAMANAN: helmet menambahkan header keamanan standar (X-Frame-Options,
-// X-Content-Type-Options: nosniff, X-DNS-Prefetch-Control, Strict-Transport-Security
-// saat HTTPS, dll) yang SEBELUMNYA sama sekali tidak ada. contentSecurityPolicy
-// dimatikan secara eksplisit di sini (bukan lupa) karena server ini juga
-// menyajikan SPA frontend-nya sendiri (lihat bagian "Serve Vite frontend" di
-// bawah) -- CSP default Helmet akan memblokir script/style yang di-inject Vite
-// tanpa audit sumber daya yang teliti dulu. crossOriginResourcePolicy diset
-// cross-origin karena foto KTP/STNK/bukti bayar di /uploads perlu bisa dimuat
-// dari origin frontend yang berbeda (mis. app.dhuknoo.id memuat gambar dari
-// api.dhuknoo.id).
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -89,12 +82,37 @@ app.use(
 );
 app.use(
   cors({
-    origin: ENV.ALLOWED_ORIGINS.length > 0 ? ENV.ALLOWED_ORIGINS : '*',
+    // 🆕 FIX AUTH CONTRACT / REFRESH COOKIE INTEGRATION: sebelumnya jatuh
+    // ke '*' kalau ALLOWED_ORIGINS kosong/lupa di-set. Kombinasi
+    // `origin: '*'` + `credentials: true` SECARA SPESIFIKASI CORS TIDAK
+    // VALID -- browser MENOLAK melampirkan/menerima cookie (termasuk
+    // httpOnly refreshToken cookie) kalau Access-Control-Allow-Origin
+    // adalah wildcard sementara request dikirim dengan credentials.
+    // Efeknya: kalau env ALLOWED_ORIGINS lupa di-set saat deploy,
+    // SELURUH mekanisme refresh-token-via-cookie diam-diam MATI TOTAL di
+    // production (bukan error yang jelas -- request gagal CORS di
+    // browser tanpa pesan yang jelas ke user). Sekarang: gagal cepat &
+    // jelas di startup kalau production tapi ALLOWED_ORIGINS kosong,
+    // supaya ketauan pas deploy, bukan pas user nge-refresh browser lalu
+    // ke-logout misterius.
+    origin: (() => {
+      if (ENV.ALLOWED_ORIGINS.length > 0) return ENV.ALLOWED_ORIGINS;
+      if (ENV.NODE_ENV === 'production') {
+        throw new Error(
+          '[CORS] ALLOWED_ORIGINS wajib diisi di production! origin:"*" + credentials:true tidak valid secara spesifikasi CORS dan akan mematikan refresh-token cookie secara diam-diam.'
+        );
+      }
+      // Dev/test: fallback ke true (reflect request origin) -- BUKAN
+      // literal '*', supaya credentials:true tetap valid untuk browser
+      // saat development lokal tanpa perlu set env dulu.
+      return true;
+    })(),
     credentials: true,
   })
 );
 app.use(express.json());
 app.use(MetricsService.middleware());
+app.use(cookieParser());
 
 // 3. Initialize Realtime WebSockets (Socket.IO) — di-skip saat test agar
 //    tidak membuka handle yang membuat proses Jest menggantung.
@@ -105,7 +123,7 @@ if (process.env.NODE_ENV !== 'test') {
 
 // Telemetry, Health, and Documentation routes
 app.get('/health', HealthCheckController.check as any);
-app.get('/metrics', MetricsService.getMetrics as any);
+app.get('/metrics', MetricsService.getMetrics.bind(MetricsService));
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(SwaggerSpecification));
 
 // 5. Register Domain Routes
@@ -129,12 +147,25 @@ app.use('/api/review', reviewRouter);
 app.use('/api/tariff', tariffRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/report', reportRoutes);
-// Dispatch Engine (mesin penawaran driver terdekat) — dilindungi auth di dalam
-// dispatch.route.ts sendiri (lihat catatan keamanan di file tsb).
 app.use('/api/dispatch', dispatchRouter);
+app.use('/api/files', fileRouter);
+
+// ============================================================
+// 🔒 API 404 HANDLER - UNKNOWN API ROUTE (JSON)
+// HARUS SEBELUM SPA FALLBACK
+// ============================================================
+app.use('/api/*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `API route not found: ${req.method} ${req.originalUrl}`,
+    path: req.originalUrl,
+    method: req.method,
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Foto KTP/STNK & bukti bayar disajikan statis dari sini (mis. /uploads/xxxx.jpg)
-app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE));
+//app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE));
 
 // Serve Vite frontend in development, or static build in production
 import fs from 'fs';
@@ -173,7 +204,10 @@ app.use(async (req: any, res: any, next: any) => {
   }
 });
 
-// Serve static build if we are not using Vite dev server (extremely light on RAM/CPU)
+// ============================================================
+// 🔓 SPA FALLBACK - HANYA UNTUK NON-API ROUTES
+// HARUS SETELAH API 404 HANDLER
+// ============================================================
 if (!useViteDev) {
   if (fs.existsSync(distPath)) {
     logger.info('Serving pre-built static frontend from: %s (Lightweight Mode)', distPath);

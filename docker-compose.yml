@@ -1,20 +1,37 @@
 version: '3.8'
 
+# 🆕 FIX "Docker secrets" (audit lanjutan): SEBELUMNYA semua secret di
+# file ini (password Postgres, JWT_SECRET, JWT_REFRESH_SECRET, password
+# admin Grafana) ditulis LANGSUNG sebagai nilai plain-text di sini --
+# file ini ikut TER-COMMIT ke git, artinya secret-secret itu SUDAH
+# PUBLIK/beredar untuk siapa pun yang punya akses ke repo (persis
+# situasi audit ini). Kalau ada deployment nyata yang benar-benar
+# memakai docker-compose.yml ini apa adanya, secret itu sudah bocor
+# sejak awal.
+#
+# Sekarang SEMUA nilai secret memakai interpolasi ${VAR_NAME} yang
+# dibaca dari file `.env` di direktori yang sama (TIDAK ikut ter-commit
+# -- sudah ada di .gitignore) atau dari environment shell/CI/CD secret
+# manager. Lihat `.env.example` untuk daftar variabel yang wajib diisi
+# sebelum `docker compose up`. env.ts (backend) sendiri sudah hard-fail
+# di production kalau JWT_SECRET/JWT_REFRESH_SECRET kosong atau masih
+# nilai default yang diketahui -- combo kedua fix ini menutup celahnya
+# dari dua sisi (kode DAN infrastruktur).
 services:
   postgres:
     image: postgres:15-alpine
     container_name: obama-postgres
     restart: always
     environment:
-      POSTGRES_USER: obama_user
-      POSTGRES_PASSWORD: obama_secure_password123
-      POSTGRES_DB: obama_db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U obama_user -d obama_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,10 +65,11 @@ services:
         condition: service_healthy
     environment:
       - PORT=3000
-      - DATABASE_URL=postgresql://obama_user:obama_secure_password123@postgres:5432/obama_db?schema=public
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=obama_extremely_secret_jwt_access_key_2026
-      - JWT_REFRESH_SECRET=obama_extremely_secret_jwt_refresh_key_2026
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - NODE_ENV=production
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
@@ -76,8 +94,8 @@ services:
     container_name: obama-grafana
     restart: always
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin_ganti_ini
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
