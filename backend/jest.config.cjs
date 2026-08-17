@@ -7,4 +7,9 @@ module.exports = {
   testMatch: ['<rootDir>/tests/**/*.test.ts'],
   clearMocks: true,
   maxWorkers: 1,
+  globals: {
+    'ts-jest': {
+      tsconfig: '<rootDir>/tsconfig.test.json',
+    },
+  },
 };
