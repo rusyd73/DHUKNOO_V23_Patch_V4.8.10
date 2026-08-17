@@ -9,6 +9,7 @@ describe('Create-order API contract', () => {
     // Route exists; authentication is reached before controller/validation.
     const canonical = await request(app).post('/api/order').send({});
     expect(canonical.status).toBe(401);
-    expect(canonical.body.error).toMatch(/Token autentikasi kosong/i);
+    // 🔥 PERBAIKAN: Sesuai pesan error dari kode produksi (auth.middleware.ts)
+    expect(canonical.body.error).toMatch(/Akses ditolak. Token autentikasi kosong!|Token autentikasi kosong/i);
   });
 });
