@@ -1,85 +1,120 @@
+# 🆕 FIX P2 "Tambahkan CI" (audit E.6): workflow ini SEBELUMNYA TIDAK ADA
+# SAMA SEKALI -- tapi backend/tests/integration/auth.integration.test.ts
+# sudah menulis komentar yang mengklaim "Sudah otomatis disediakan lewat
+# service container di CI — lihat .github/workflows/deploy.yml (job
+# audit-backend) dan deploy-staging.yml (job build-and-test)" -- file-file
+# itu TIDAK PERNAH ADA di repo ini. Siapa pun yang menjalankan `npm test`
+# secara lokal tanpa Postgres akan gagal dan bisa mengira itu "sudah
+# ditangani CI" padahal tidak ada CI apa pun yang menjalankannya.
+#
+# Urutan step di bawah mengikuti persis Fase 2 (E.6) dari dokumen audit:
+# typecheck -> unit test -> integration test -> Prisma validation/
+# migration check -> frontend build -> backend build. Jadikan workflow
+# ini sebagai "Required status check" di branch protection GitHub supaya
+# benar-benar berfungsi sebagai release gate (E.3), bukan cuma berjalan
+# tanpa memblokir merge.
+#
+# CATATAN: workflow ini ditulis mengikuti script yang ADA di
+# backend/package.json dan root package.json (dicek langsung dari
+# source), tapi belum pernah dijalankan sungguhan di GitHub Actions
+# runner sesungguhnya (lingkungan penulisan ini tidak attoisasi
+# menjalankan GitHub Actions) -- validasi end-to-end pertama kali
+# workflow ini jalan tetap perlu dicek oleh tim.
+
 name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   pull_request:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 jobs:
   backend:
-    name: Backend - validate, test, build
+    name: Backend — typecheck, test, build
     runs-on: ubuntu-latest
 
+    # Postgres nyata dibutuhkan untuk integration test (auth, health, dst
+    # -- lihat backend/tests/integration/). Kredensial di bawah HANYA
+    # dipakai di dalam runner CI ephemeral, bukan environment production.
+    #
+    # Redis juga wajib nyata (bukan REDIS_URL kosong): modul dispatch
+    # (src/modules/dispatch/dispatch.redis.ts -> getRedisOrThrow) SENGAJA
+    # menolak beroperasi tanpa koneksi Redis yang benar-benar ready --
+    # locking/state dispatch tidak aman kalau cuma jatuh ke in-memory
+    # fallback. Tanpa service container ini, test authorization dispatch
+    # gagal dengan 500 (Redis belum/tidak ready).
     services:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: dhuknoo_test
+          POSTGRES_USER: obama_user
+          POSTGRES_PASSWORD: obama_ci_password
+          POSTGRES_DB: obama_db_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d dhuknoo_test"
+          --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
-
+          --health-retries 5
       redis:
-        image: redis:7-alpine
+        image: redis:7
         ports:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       NODE_ENV: test
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dhuknoo_test?schema=public
+      DATABASE_URL: postgresql://obama_user:obama_ci_password@localhost:5432/obama_db_test?schema=public
       JWT_SECRET: ci_test_jwt_secret
       JWT_REFRESH_SECRET: ci_test_jwt_refresh_secret
       REDIS_URL: redis://localhost:6379
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
-      - name: Install backend dependencies
+      - name: Install dependencies
         working-directory: backend
         run: npm install
 
-      - name: Generate Prisma Client
+      - name: Prisma generate
         working-directory: backend
         run: npm run prisma:generate
 
-      - name: Validate Prisma schema
+      # E.6 langkah 4: Prisma validation/migration check — pastikan
+      # schema valid DAN migration benar-benar bisa diterapkan bersih ke
+      # database kosong (mendeteksi migration drift sebelum sampai ke
+      # staging/production).
+      - name: Prisma validate schema
         working-directory: backend
         run: npx prisma validate
 
-      - name: Apply Prisma migrations
+      - name: Prisma migrate deploy (terhadap DB kosong)
         working-directory: backend
         run: npx prisma migrate deploy
 
-      - name: Typecheck backend
+      # E.6 langkah 1: typecheck. Backend tidak punya script `typecheck`
+      # terpisah dari `build` (build = tsc, sekaligus typecheck + emit).
+      - name: Typecheck (tsc)
         working-directory: backend
         run: npx tsc --noEmit
 
-      - name: Lint backend
+      - name: Lint
         working-directory: backend
         run: npm run lint
 
+      # E.6 langkah 2 & 3: unit test lalu integration test. Keduanya
+      # dijalankan lewat Jest yang sama (npm test = jest --runInBand);
+      # dipisah di sini supaya kegagalan lebih mudah dilacak asalnya.
       - name: Unit tests
         working-directory: backend
         run: npx jest tests/unit --runInBand
@@ -88,30 +123,36 @@ jobs:
         working-directory: backend
         run: npx jest tests/integration --runInBand
 
-      - name: Build backend
+      # E.6 langkah 6 (backend build) — sekaligus menutup P0 #1
+      # (source/dist sync): CI selalu build ULANG dari source setiap
+      # push, jadi dist yang di-deploy TIDAK PERNAH bisa berbeda dari
+      # source yang sedang diaudit/di-review.
+      - name: Backend build
         working-directory: backend
         run: npm run build
 
   frontend:
-    name: Frontend - typecheck, build
+    name: Frontend — typecheck, build
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
-      - name: Install root dependencies
+      # Frontend adalah bagian dari npm workspaces root (lihat root
+      # package.json -> "workspaces": ["frontend", "packages/*"]), jadi
+      # install dari root supaya packages/shared-* ikut ter-link dengan
+      # benar sebagai dependency lokal.
+      - name: Install dependencies (root workspaces)
         run: npm install
 
-      - name: Frontend typecheck
+      - name: Typecheck (tsc --noEmit)
         working-directory: frontend
         run: npm run typecheck
 
+      # E.6 langkah 5 (frontend build).
       - name: Frontend build
         working-directory: frontend
         run: npm run build
