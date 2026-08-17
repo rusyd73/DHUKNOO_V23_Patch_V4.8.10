@@ -1,7 +1,7 @@
+import './_teardown';
 import request from 'supertest';
 import { app } from '../../src/app';
 import { prisma } from '../../src/config/prisma';
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 // Test ini BUTUH Postgres nyala (lihat DATABASE_URL di tests/setupEnv.ts atau .env).
 // 🆕 FIX P2 "README/dokumentasi jangan merujuk struktur yang tidak sesuai"
