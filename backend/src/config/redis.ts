@@ -63,6 +63,26 @@ export class RedisService {
       this.client.on('reconnecting', () => {
         this.isConnected = false;
       });
+
+      // 🆕 FIX race condition: sebelumnya init() resolve LANGSUNG setelah
+      // client dibuat, TANPA menunggu handshake selesai -- caller (mis.
+      // bootstrap test) bisa lanjut mengirim request sebelum Redis benar-
+      // benar ready, sehingga isReady() masih false walau Redis sebenarnya
+      // hidup. Sekarang init() menunggu event 'ready' ATAU 'error' dulu
+      // (timeout 5s sebagai jaring pengaman kalau Redis tidak terjangkau
+      // sama sekali) sebelum resolve, supaya status isConnected sudah
+      // settle begitu init() selesai.
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 5000);
+        this.client!.once('ready', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        this.client!.once('error', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
     } catch (err) {
       logger.error('Failed to initialize Redis client: %s', (err as Error).message || err);
       this.isConnected = false;

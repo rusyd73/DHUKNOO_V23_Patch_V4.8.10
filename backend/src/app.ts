@@ -70,6 +70,21 @@ if (process.env.NODE_ENV !== 'test') {
   startServices().catch((err) => {
     logger.error('Error starting core backend services: %s', (err as Error).message || err);
   });
+} else {
+  // 🆕 FIX: saat NODE_ENV=test, startServices() penuh SENGAJA di-skip
+  // (Metrics/Queue/Mailer bisa membuat proses Jest menggantung). TAPI
+  // Redis TIDAK BOLEH ikut ter-skip -- modul dispatch (dispatch.redis.ts
+  // -> getRedisOrThrow) sengaja menolak beroperasi tanpa Redis asli demi
+  // keamanan locking, dan CI sudah menyediakan service container Redis
+  // lewat REDIS_URL. Tanpa baris ini, integration test dispatch SELALU
+  // gagal 500 walau Redis container CI sudah nyala & REDIS_URL sudah
+  // diisi benar -- karena RedisService.init() memang tidak pernah
+  // dipanggil sama sekali saat test. RedisService.init() sendiri aman
+  // dipanggil tanpa REDIS_URL (in-memory fallback), jadi tidak berefek
+  // ke test lain yang tidak butuh Redis.
+  RedisService.init().catch((err) => {
+    logger.error('Error initializing Redis for tests: %s', (err as Error).message || err);
+  });
 }
 
 // 2. Register Global Middlewares
