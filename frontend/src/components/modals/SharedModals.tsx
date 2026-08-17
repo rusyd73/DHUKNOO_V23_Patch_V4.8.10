@@ -16,7 +16,6 @@ import {
 } from 'lucide-react';
 import { AuthAPI, UploadAPI, WalletAPI } from '../../api';
 import { formatRupiah } from '@obama/shared-utils';
-import { openWhatsAppMessage } from '../../utils/whatsapp';
 
 // PERBAIKAN PERFORMA: file ini sebelumnya adalah bagian dari app/App.tsx
 // (satu file monolitik ~5100 baris) yang SELALU ikut ter-load di initial
@@ -510,7 +509,7 @@ export function PasswordResetModal({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [step, setStep] = useState<'REQUEST' | 'VERIFY'>('REQUEST');
   const [isLoading, setIsLoading] = useState(false);
-  const [resetTokenReceived, setResetTokenReceived] = useState<string | null>(null);
+  const [resetWhatsAppUrl, setResetWhatsAppUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (user?.phone || user?.email) {
@@ -531,10 +530,18 @@ export function PasswordResetModal({
     try {
       const res = await AuthAPI.requestPasswordReset({ phone: phone.trim(), emailOrPhone: phone.trim() });
       triggerToast(res.message || '✅ Kode otentikasi alternatif dikirim ke nomor HP pendaftar!');
-      if (res.token) {
-        setResetTokenReceived(res.token);
-        setOtpCode(res.token);
+
+      // 🔒 Kode OTP TIDAK PERNAH ditampilkan di dashboard/UI.
+      // Kode hanya dikirim lewat pesan WhatsApp yang sudah disiapkan
+      // backend (whatsappUrl). Buka otomatis begitu diterima:
+      // - Dibuka di browser desktop -> redirect ke WhatsApp Web
+      // - Dibuka di HP -> langsung membuka aplikasi WhatsApp
+      if (res.whatsappUrl) {
+        setResetWhatsAppUrl(res.whatsappUrl);
+        window.open(res.whatsappUrl, '_blank', 'noopener,noreferrer');
       }
+
+      setOtpCode('');
       setStep('VERIFY');
     } catch (err: any) {
       triggerToast(err.response?.data?.error || 'Gagal mengirim kode otentikasi ke nomor HP!');
@@ -644,17 +651,17 @@ export function PasswordResetModal({
                 <CheckCircle className="w-3.5 h-3.5" /> Kode Otentikasi Alternatif Terkirim!
               </span>
               <p className="text-[9px] text-[#A5C9B8]">
-                Layanan otentikasi DHUKNOO Ride telah mengirimkan kode verifikasi 6-digit ke No. HP Pendaftar: <strong className="text-white">{phone}</strong>.
+                Layanan otentikasi DHUKNOO Ride telah mengirimkan kode verifikasi 6-digit lewat WhatsApp ke No. HP Pendaftar: <strong className="text-white">{phone}</strong>. Buka WhatsApp Anda untuk melihat kodenya.
               </p>
-              {resetTokenReceived && (
+              {resetWhatsAppUrl && (
                 <div className="mt-1 bg-[#0D2E1F] p-2 rounded-lg border border-[#00E575]/30 flex justify-between items-center text-[10px]">
-                  <span>Kode SMS/WA: <b className="text-[#FFD700] font-mono tracking-widest text-xs">{resetTokenReceived}</b></span>
+                  <span>Tidak menerima pesannya?</span>
                   <button
                     type="button"
-                    onClick={() => openWhatsAppMessage(phone, `Kode Otentikasi Reset Kata Sandi DHUKNOO Ride Anda: ${resetTokenReceived}`)}
+                    onClick={() => window.open(resetWhatsAppUrl, '_blank', 'noopener,noreferrer')}
                     className="text-[#25D366] text-[9px] hover:underline font-bold flex items-center gap-1"
                   >
-                    <MessageCircle className="w-3 h-3" /> WA Code
+                    <MessageCircle className="w-3 h-3" /> Buka WhatsApp Lagi
                   </button>
                 </div>
               )}
@@ -706,7 +713,11 @@ export function PasswordResetModal({
             <div className="flex gap-2 mt-2">
               <button
                 type="button"
-                onClick={() => setStep('REQUEST')}
+                onClick={() => {
+                  setStep('REQUEST');
+                  setResetWhatsAppUrl(null);
+                  setOtpCode('');
+                }}
                 className="flex-1 bg-[#06170E] text-[#A5C9B8] font-bold py-2.5 rounded-xl text-xs hover:bg-[#23583E]"
               >
                 Ganti No HP

@@ -9,6 +9,7 @@ import { DISPATCH_CONSTANTS } from "./dispatch.constants";
 import { prisma } from "../../config/prisma";
 import { logger } from "../../config/logger";
 import { TariffEngineService } from "../tariff/tariff.service";
+import { getOrderNumber } from "../../core/utils/order-number";
 import {
   DispatchCandidate,
   DispatchRequest,
@@ -99,30 +100,65 @@ export class DispatchService {
         eligibleDrivers.map((d: any) => [d.id, d])
       );
 
-      const candidates: DispatchCandidate[] = nearestDrivers
+      const haversineMeters = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+        const R = 6371000;
+        const toRad = (v: number) => (v * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLng = toRad(lng2 - lng1);
+        const a = Math.sin(dLat / 2) ** 2
+          + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      };
+
+      const buildCandidate = (profile: any, distanceMeters: number): DispatchCandidate => ({
+        driverId: profile.id,
+        userId: profile.userId,
+        latitude: Number(profile.latitude),
+        longitude: Number(profile.longitude),
+        distanceMeters,
+        etaMinutes: Math.ceil(
+          distanceMeters / (MAP_CONSTANTS.BIKE_SPEED_KMH * 1000 / 60)
+        ),
+        autoAcceptEnabled: Boolean(profile.autoAcceptEnabled),
+      });
+
+      let candidates: DispatchCandidate[] = nearestDrivers
         .filter((driver: any) => eligibleMap.has(driver.driverId))
         .filter((driver: any) => {
-          if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") {
-            return true;
-          }
+          if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") return true;
           const profile = eligibleMap.get(driver.driverId);
           return profile && (profile as any).serviceType === request.order.serviceType;
         })
-        .map((driver: any) => {
-          const profile = eligibleMap.get(driver.driverId)!;
-          return {
-            driverId: profile.id,
-            userId: profile.userId,
-            latitude: Number(profile.latitude),
-            longitude: Number(profile.longitude),
-            distanceMeters: driver.distanceMeters,
-            etaMinutes: Math.ceil(
-              driver.distanceMeters /
-              (MAP_CONSTANTS.BIKE_SPEED_KMH * 1000 / 60)
-            ),
-            autoAcceptEnabled: Boolean((profile as any).autoAcceptEnabled),
-          };
-        });
+        .map((driver: any) => buildCandidate(eligibleMap.get(driver.driverId)!, Number(driver.distanceMeters)));
+
+      // P0 RECOVERY: Redis GEO adalah acceleration layer, bukan source of truth.
+      // Jika GEO kosong/stale atau driver baru saja online sehingga koordinat DB
+      // belum masuk GEO, jangan biarkan order PENDING menggantung. Gunakan
+      // availableDrivers + koordinat DB sebagai fallback, tetap dibatasi radius 5 km
+      // dan eligibility yang sama.
+      if (candidates.length === 0 && eligibleDrivers.length > 0) {
+        const orderLat = Number(request.order.pickupLat);
+        const orderLng = Number(request.order.pickupLng);
+        candidates = eligibleDrivers
+          .filter((profile: any) => {
+            if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") return true;
+            return profile.serviceType === request.order.serviceType;
+          })
+          .map((profile: any) => {
+            const distanceMeters = haversineMeters(
+              orderLat, orderLng, Number(profile.latitude), Number(profile.longitude)
+            );
+            return { profile, distanceMeters };
+          })
+          .filter(({ distanceMeters }) => distanceMeters <= 5000)
+          .sort((a, b) => a.distanceMeters - b.distanceMeters)
+          .slice(0, DISPATCH_CONSTANTS.MAX_CANDIDATES)
+          .map(({ profile, distanceMeters }) => buildCandidate(profile, distanceMeters));
+
+        if (candidates.length > 0) {
+          logger.warn(`[DISPATCH] order ${orderId}: Redis GEO tidak menghasilkan kandidat usable; memakai DB-location fallback (${candidates.length} kandidat).`);
+        }
+      }
 
       logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL`);
 
@@ -204,6 +240,7 @@ export class DispatchService {
       DISPATCH_CONSTANTS.NEW_ORDER_EVENT,
       {
         orderId,
+        orderNumber: getOrderNumber(orderId),
         serviceType: request.order.serviceType,
         pickupAddress: request.order.pickupAddress,
         dropoffAddress: request.order.dropoffAddress,
@@ -222,7 +259,7 @@ export class DispatchService {
       orderId,
       DISPATCH_CONSTANTS.OFFER_TIMEOUT_SECONDS,
       async () => {
-        SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId });
+        SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId, orderNumber: getOrderNumber(orderId) });
 
         const hasAccepted = await DispatchState.hasAccepted(orderId);
         if (hasAccepted) {
@@ -266,11 +303,13 @@ export class DispatchService {
         const driverProfile = await this.repository.getDriver(driverId);
         SocketService.emitToOrder(orderId, "order_status_changed", {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           status: (order as any).status,
           driverId,
         });
         SocketService.emitToUser((order as any).customer.userId, "order_accepted", {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           driverId,
           driver: {
             fullName: (driverProfile as any)?.user?.fullName,
@@ -278,8 +317,37 @@ export class DispatchService {
             vehiclePlate: (driverProfile as any)?.vehiclePlate,
           },
         });
+        if ((order as any).serviceType === 'MART') {
+          SocketService.emitToUser((order as any).customer.userId, 'mart_driver_heading_to_merchant', {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            status: (order as any).status,
+            serviceType: (order as any).serviceType,
+            message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+          });
+        }
         if (driverProfile?.userId) {
-          SocketService.emitToUser(driverProfile.userId, DISPATCH_CONSTANTS.ORDER_ACCEPTED_EVENT, { orderId });
+          SocketService.emitToUser(driverProfile.userId, DISPATCH_CONSTANTS.ORDER_ACCEPTED_EVENT, {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            driverId,
+            status: (order as any).status,
+            autoAccepted: true,
+            order: {
+              id: (order as any).id,
+              orderNumber: getOrderNumber(orderId),
+              status: (order as any).status,
+              serviceType: (order as any).serviceType,
+              pickupAddress: (order as any).pickupAddress,
+              pickupLat: (order as any).pickupLat,
+              pickupLng: (order as any).pickupLng,
+              dropoffAddress: (order as any).dropoffAddress,
+              dropoffLat: (order as any).dropoffLat,
+              dropoffLng: (order as any).dropoffLng,
+              price: (order as any).price,
+              discount: (order as any).discount,
+            },
+          });
         }
         SocketService.emitToDriversPool("order_taken", { orderId });
         SocketService.emitToAdmins("order_accepted", { orderId });

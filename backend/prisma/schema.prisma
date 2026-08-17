@@ -19,8 +19,41 @@ enum OrderStatus {
   ACCEPTED
   ON_THE_WAY
   ARRIVED
+  PICKED_UP
+  ARRIVED_CUSTOMER
   COMPLETED
   CANCELLED
+}
+
+// FIX P0 "Financial State Machine" (audit a1.4): status PERJALANAN
+// (OrderStatus di atas) dan status SETTLEMENT FINANSIAL sebelumnya
+// bercampur jadi satu sinyal implisit: boolean `isPaid` di Order. Order
+// bisa COMPLETED (perjalanan selesai) sementara isPaid masih false (auto
+// debit wallet gagal) TANPA ada state eksplisit yang bilang "settlement
+// ini butuh diretry" -- satu-satunya jejak sebelumnya adalah event
+// Socket.IO sesaat (`auto_debit_failed`) yang hilang kalau customer
+// sedang tidak online, TIDAK PERNAH tersimpan durable, dan tidak ada
+// cara sistematis untuk query "order mana saja yang settlement-nya
+// masih menggantung".
+//
+// SettlementStatus sekarang jadi state machine EKSPLISIT dan TERPISAH
+// dari OrderStatus:
+//   PENDING        -- order dibuat, belum ada percobaan settlement
+//                      (default). Untuk CASH: tetap PENDING sampai
+//                      driver confirmCash().
+//   SETTLED        -- settlement berhasil (chargeOrder/confirmCash/
+//                      reviewPaymentProof APPROVED sudah commit).
+//   RETRY_REQUIRED -- percobaan settlement OTOMATIS gagal (mis. auto
+//                      debit wallet saat order COMPLETED), tapi masih
+//                      bisa dicoba ulang -- lihat modul reconciliation.
+//   FAILED         -- percobaan retry manual/reconciliation JUGA gagal,
+//                      butuh investigasi manual admin (bukan sekadar
+//                      retry otomatis lagi).
+enum SettlementStatus {
+  PENDING
+  SETTLED
+  RETRY_REQUIRED
+  FAILED
 }
 
 enum ServiceType {
@@ -210,6 +243,16 @@ model Order {
   price        Decimal     @db.Decimal(10, 2)
   discount     Decimal     @default(0.00) @db.Decimal(10, 2)
   isPaid       Boolean     @default(false)
+  // FIX P0 "Financial State Machine" (audit a1.4) -- lihat komentar
+  // lengkap di enum SettlementStatus di atas. `isPaid` DIPERTAHANKAN
+  // (bukan dihapus) demi backward-compat dengan query/kode lama yang
+  // masih membacanya, dan tetap disinkronkan setiap kali
+  // settlementStatus diset SETTLED -- tapi settlementStatus sekarang
+  // sumber kebenaran UTAMA untuk state settlement, karena bisa
+  // membedakan "belum pernah dicoba" (PENDING) dari "sudah dicoba,
+  // gagal, butuh retry" (RETRY_REQUIRED/FAILED) -- dua hal yang sama
+  // sekali TIDAK BISA dibedakan hanya dari isPaid=false saja.
+  settlementStatus SettlementStatus @default(PENDING)
   paymentMethod PaymentMethod @default(WALLET)
   acceptedAt   DateTime?
 
@@ -249,6 +292,10 @@ model Order {
   @@index([customerId, createdAt])
   @@index([merchantId, status, createdAt])
   @@index([paymentMethod, isPaid])
+  // FIX P0 "Financial State Machine": index untuk query reconciliation
+  // ("cari semua order yang settlement-nya menggantung") -- lihat
+  // ReconciliationService.listPendingReconciliation().
+  @@index([settlementStatus])
   @@index([status, driverId, createdAt])
   @@index([pickupLat, pickupLng])
   @@index([createdAt])
@@ -547,6 +594,20 @@ model Ledger {
   reference   String   @unique
   metadata    Json?
   createdAt   DateTime @default(now())
+  // FIX KONSEPTUAL "Ledger masih bukan immutable ledger murni":
+  // snapshot saldo wallet user TEPAT SETELAH entry ini diterapkan.
+  // Sebelumnya Ledger cuma tabel delta -- untuk tahu "saldo driver X
+  // pada tanggal Y" harus SUM() ulang semua entry historis, yang
+  // secara diam-diam BISA SALAH kalau ada entry yang hilang/gagal
+  // ditulis (persis skenario "Financial error masih ditelan" yang
+  // sudah diperbaiki -- sebelum fix itu, entry BISA hilang tanpa
+  // jejak). Dengan balanceAfter, setiap baris jadi FAKTA HISTORIS YANG
+  // BERDIRI SENDIRI (self-contained) -- bisa langsung diverifikasi
+  // "apakah baris ini konsisten dengan baris sebelumnya" tanpa perlu
+  // percaya SUM() agregat selalu benar. null untuk entry recordOnly
+  // (userId='platform', atau order yang uangnya dipindah pihak lain)
+  // karena entry itu memang tidak menyentuh saldo wallet mana pun.
+  balanceAfter Decimal? @db.Decimal(12, 2)
 
   @@index([orderId])
   @@index([userId])

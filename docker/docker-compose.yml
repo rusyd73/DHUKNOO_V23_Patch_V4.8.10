@@ -1,20 +1,34 @@
 version: '3.8'
 
+# 🆕 FIX "Docker secrets" (audit lanjutan -- file ini sebelumnya
+# TERLEWAT saat memperbaiki docker-compose.yml di root; keduanya berisi
+# secret plain-text yang SAMA PERSIS, ter-commit ke git). Sama seperti
+# root docker-compose.yml: semua secret sekarang lewat interpolasi
+# ${VAR_NAME}, dibaca dari .env (lihat .env.example di root repo).
+#
+# CATATAN DUPLIKASI (belum diselesaikan penuh, didokumentasikan): proyek
+# ini punya DUA file docker-compose.yml (root & docker/) yang isinya
+# sangat mirip (file ini adalah subset dari root, tanpa prometheus/
+# grafana) -- pola pemeliharaan yang rawan (fix di satu tempat, lupa di
+# tempat lain, PERSIS seperti yang terjadi di sini). Rekomendasi lanjutan:
+# hapus salah satu (jadikan docker/ hanya berisi config pendukung seperti
+# prometheus.yml/grafana provisioning, bukan compose file kedua), atau
+# jadikan yang satu `include:`/extends yang lain.
 services:
   postgres:
     image: postgres:15-alpine
     container_name: obama-postgres
     restart: always
     environment:
-      POSTGRES_USER: obama_user
-      POSTGRES_PASSWORD: obama_secure_password123
-      POSTGRES_DB: obama_db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U obama_user -d obama_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,10 +62,11 @@ services:
         condition: service_healthy
     environment:
       - PORT=3000
-      - DATABASE_URL=postgresql://obama_user:obama_secure_password123@postgres:5432/obama_db?schema=public
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=obama_extremely_secret_jwt_access_key_2026
-      - JWT_REFRESH_SECRET=obama_extremely_secret_jwt_refresh_key_2026
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - NODE_ENV=production
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]

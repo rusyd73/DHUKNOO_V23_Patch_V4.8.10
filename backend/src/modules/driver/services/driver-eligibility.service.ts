@@ -88,11 +88,18 @@ export class DriverEligibilityService {
       score -= 30;
     }
 
-    // STEP 5: Dokumen valid
+    // STEP 5: Verifikasi dokumen
+    // P0 lifecycle rule: `isVerified=true` adalah hasil persetujuan Admin dan
+    // menjadi source-of-truth untuk kelayakan operasional. Sebelumnya driver
+    // yang sudah VERIFIED masih ditolak hanya karena seed/dev account belum
+    // memiliki baris DriverDocument APPROVED. Akibatnya dispatch ride, manual
+    // accept, dan GET /jobs semuanya bisa kosong walaupun akun sudah verified,
+    // online, saldo cukup, dan tipe layanan cocok. Dokumen tetap dibaca untuk
+    // audit/metadata, tetapi TIDAK menjadi hard-block kedua setelah isVerified.
     const hasValidDocs = driver.documents?.some(
       doc => doc.status === 'APPROVED'
     );
-    if (!hasValidDocs) {
+    if (!driver.isVerified && !hasValidDocs) {
       reasons.push('Tidak ada dokumen yang disetujui');
       score -= 30;
     }
@@ -124,7 +131,7 @@ export class DriverEligibilityService {
     const activeOrder = await prisma.order.findFirst({
       where: {
         driverId,
-        status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED'] },
+        status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'] },
       },
     });
     if (activeOrder) {

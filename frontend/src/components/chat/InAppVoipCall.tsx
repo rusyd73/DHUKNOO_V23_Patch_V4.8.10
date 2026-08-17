@@ -28,7 +28,7 @@ export function InAppVoipCall({
   const [callerName, setCallerName] = useState<string>('');
   const [callerRole, setCallerRole] = useState<string>('');
 
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ringtoneOscRef = useRef<{ audioCtx: AudioContext; osc1: OscillatorNode; osc2: OscillatorNode; gain: GainNode } | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
 

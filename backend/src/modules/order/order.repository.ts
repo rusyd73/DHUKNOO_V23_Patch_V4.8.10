@@ -1,5 +1,6 @@
 import { Prisma, OrderStatus } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { getOrderNumber } from '../../core/utils/order-number';
 
 
 export class OrderRepository {
@@ -193,7 +194,9 @@ export class OrderRepository {
 
           }
 
-        }
+        },
+        merchant: true,
+        orderItems: true,
 
       },
 
@@ -204,7 +207,10 @@ export class OrderRepository {
 
       }
 
-    });
+    }).then(orders => orders.map(order => ({
+      ...order,
+      orderNumber: getOrderNumber(order.id),
+    })));
 
   }
 
@@ -479,7 +485,7 @@ export class OrderRepository {
 
       where: {
         driverId: driverProfileId,
-        status: { in: [OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED] },
+        status: { in: [OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED, OrderStatus.PICKED_UP, OrderStatus.ARRIVED_CUSTOMER] },
       },
 
       select: { id: true },

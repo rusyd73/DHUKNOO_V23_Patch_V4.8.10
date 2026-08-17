@@ -5,8 +5,18 @@ import { logger } from '../../config/logger';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { detectFileKind } from '../../shared/security/fileSignature';
 
 const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads');
+
+// Ekstensi final ditentukan dari jenis file yang TERDETEKSI lewat magic
+// bytes (bukan dari file.originalname milik client) -- lihat saveFile().
+const EXTENSION_BY_KIND: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+};
 
 export class FileService {
   // ============================================================
@@ -19,9 +29,32 @@ export class FileService {
     entityId: string,
     file: Express.Multer.File
   ) {
-    // Generate unique file ID
+    // 🆕 FIX P1 "Upload security harus disatukan" (audit): SEBELUMNYA
+    // file langsung dipindah dari folder temp ke uploads/ tanpa validasi
+    // ISI file sama sekali -- fileFilter multer di file.routes.ts (baru
+    // ditambahkan) hanya mengecek header Content-Type yang diklaim
+    // client, yang trivial dipalsukan. Sekarang, SEBELUM dipindah
+    // permanen, beberapa byte pertama file dibaca dan dicocokkan dengan
+    // magic bytes JPEG/PNG/WEBP/PDF asli. Kalau tidak cocok dengan
+    // format manapun yang diizinkan, file temp dihapus dan upload
+    // ditolak -- tidak pernah tersimpan permanen atau tercatat di DB.
+    const header = Buffer.alloc(16);
+    const fd = fs.openSync(file.path, 'r');
+    fs.readSync(fd, header, 0, 16, 0);
+    fs.closeSync(fd);
+
+    const detectedKind = detectFileKind(header);
+    if (!detectedKind) {
+      fs.unlink(file.path, () => {});
+      logger.warn(`[FILE] Upload ditolak -- isi file tidak cocok dengan format gambar/PDF yang diizinkan (user: ${userId}, originalName: ${file.originalname}).`);
+      throw new AppError('Isi file tidak sesuai dengan format yang diizinkan (JPEG/PNG/WebP/PDF)!', 400);
+    }
+
+    // Generate unique file ID -- ekstensi dari JENIS TERDETEKSI, bukan
+    // dari file.originalname client (mencegah nama file aneh/berbahaya
+    // ikut menentukan ekstensi penyimpanan).
     const fileId = crypto.randomUUID();
-    const ext = path.extname(file.originalname);
+    const ext = EXTENSION_BY_KIND[detectedKind];
     const fileName = `${fileId}${ext}`;
     const filePath = path.join(UPLOAD_DIR, fileName);
 
@@ -33,7 +66,9 @@ export class FileService {
     // Pindahkan file dari temp ke uploads
     fs.renameSync(file.path, filePath);
 
-    // Simpan metadata ke database
+    // Simpan metadata ke database -- mimeType disimpan dari hasil deteksi
+    // konten SUNGGUHAN (detectedKind), bukan klaim header client, supaya
+    // Content-Type yang dikirim balik saat getFile() juga akurat.
     const fileRecord = await prisma.file.create({
       data: {
         id: fileId,
@@ -42,7 +77,7 @@ export class FileService {
         entityId,
         originalName: file.originalname,
         path: filePath,
-        mimeType: file.mimetype,
+        mimeType: detectedKind,
         size: file.size,
         createdAt: new Date(),
       },
@@ -53,7 +88,7 @@ export class FileService {
     return {
       id: fileId,
       originalName: file.originalname,
-      mimeType: file.mimetype,
+      mimeType: detectedKind,
       size: file.size,
       url: `/api/files/${fileId}`,
     };

@@ -1,6 +1,6 @@
 // backend/src/modules/merchant/merchant.repository.ts
 import { prisma } from '../../config/prisma';
-import { Merchant, Product } from '@prisma/client';
+import { Merchant, Product, Prisma } from '@prisma/client';
 
 export class MerchantRepository {
   
@@ -8,17 +8,28 @@ export class MerchantRepository {
   // 🔥 MERCHANT OPERATIONS
   // ============================================================
 
-  async createMerchant(data: {
-    name: string;
-    category: string;
-    address: string;
-    latitude: number;
-    longitude: number;
-    phone: string;
-    isOpen: boolean;
-    ownerId: string;
-  }): Promise<Merchant> {
-    return prisma.merchant.create({
+  // 🆕 FIX P1 "Merchant registration harus atomic" (audit): parameter
+  // `tx` opsional baru -- kalau diberikan (dari MerchantService.registerMerchant()
+  // yang membungkus User+Wallet+Merchant dalam SATU prisma.$transaction),
+  // create ini ikut jadi bagian transaksi yang sama, bukan operasi DB
+  // independen. Kalau tidak diberikan (dipanggil di luar transaksi),
+  // fallback ke `prisma` top-level seperti sebelumnya -- backward
+  // compatible untuk pemanggil lain di masa depan.
+  async createMerchant(
+    data: {
+      name: string;
+      category: string;
+      address: string;
+      latitude: number;
+      longitude: number;
+      phone: string;
+      isOpen: boolean;
+      ownerId: string;
+    },
+    tx?: Prisma.TransactionClient
+  ): Promise<Merchant> {
+    const client = tx || prisma;
+    return client.merchant.create({
       data: {
         name: data.name,
         category: data.category,

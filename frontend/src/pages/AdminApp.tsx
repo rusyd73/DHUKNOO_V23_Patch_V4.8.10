@@ -1,15 +1,16 @@
 import React, { useState, Suspense } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { formatRupiah } from '@obama/shared-utils';
+import { getApiBaseUrl } from '@obama/shared-api';
 import { sendAdminThankYouChat, openWhatsAppMessage } from '../utils/whatsapp';
 import { useAuthStore } from '../store/useAuthStore';
 import { AdminAPI, PaymentAPI, TariffAPI } from '../api';
 import AuthFlow from '../components/auth/AuthFlow';
+import AdminManagementSection from '../components/admin/AdminManagementSection';
 import {
   BarChart2,
   ClipboardList,
   DollarSign,
-  ExternalLink,
   FileSpreadsheet,
   FileText,
   MapIcon,
@@ -52,6 +53,17 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<'proofs' | 'topups' | 'documents'>('proofs');
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+
+  // Bukti bayar lama pada beberapa order bisa masih tersimpan sebagai
+  // path relatif (/uploads/...). Saat frontend berjalan di Vite :5173,
+  // path relatif akan salah menuju Vite dan SPA fallback dapat membuka
+  // dashboard. Selalu resolve media relatif ke backend API origin.
+  const resolveMediaUrl = React.useCallback((value?: string | null) => {
+    if (!value) return '';
+    if (/^(https?:|data:|blob:)/i.test(value)) return value;
+    const base = getApiBaseUrl().replace(/\/$/, '');
+    return `${base}${value.startsWith('/') ? value : `/${value}`}`;
+  }, []);
 
   const { data: proofsData } = useQuery({ queryKey: ['pendingProofs'], queryFn: PaymentAPI.getPendingProofs });
   const { data: documentsData } = useQuery({ queryKey: ['pendingDriverDocuments'], queryFn: AdminAPI.getPendingDriverDocuments });
@@ -177,11 +189,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div
-                    onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img
-                      src={p.proofImageUrl}
+                      src={resolveMediaUrl(p.proofImageUrl)}
                       loading="lazy"
                       decoding="async"
                       alt="Bukti Bayar Order"
@@ -194,19 +206,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Bukti Bayar High-Res
                     </button>
-                    <a
-                      href={p.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -307,11 +318,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div 
-                    onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={t.proofImageUrl}
+                      src={resolveMediaUrl(t.proofImageUrl)}
                       loading="lazy"
                       decoding="async" 
                       alt="Bukti Bayar Topup" 
@@ -324,19 +335,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Dokumen High-Res
                     </button>
-                    <a
-                      href={t.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -405,11 +415,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div 
-                    onClick={() => setPreviewImageUrl(d.imageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={d.imageUrl}
+                      src={resolveMediaUrl(d.imageUrl)}
                       loading="lazy"
                       decoding="async" 
                       alt="Dokumen Driver" 
@@ -422,19 +432,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(d.imageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Dokumen High-Res
                     </button>
-                    <a
-                      href={d.imageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -478,14 +487,7 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
               <img src={previewImageUrl} alt="Dokumen" className="w-full object-contain" />
             </div>
             <div className="flex gap-2">
-              <a
-                href={previewImageUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 bg-[#06170E] hover:bg-[#23583E] text-[#FFD700] border border-[#23583E] font-bold py-2 rounded-xl text-xs text-center flex items-center justify-center gap-1 transition-all"
-              >
-                <ExternalLink className="w-3.5 h-3.5" /> Buka Link Dokumen Asli
-              </a>
+
               <button
                 onClick={() => setPreviewImageUrl(null)}
                 className="flex-1 bg-[#00E575] hover:bg-[#00ff80] text-[#06170E] font-black py-2 rounded-xl text-xs transition-all"
@@ -1011,7 +1013,7 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
 
 function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void }) {
   const [timeframe, setTimeframe] = useState<'daily' | 'weekly' | 'monthly'>('daily');
-  const [activeCategory, setActiveCategory] = useState<'customers' | 'drivers' | 'transactions' | 'revenues'>('customers');
+  const [activeCategory, setActiveCategory] = useState<'customers' | 'drivers' | 'merchants' | 'transactions' | 'revenues'>('customers');
   const [searchQuery, setSearchQuery] = useState('');
 
   const { data: recapData, isLoading, refetch } = useQuery({
@@ -1039,7 +1041,7 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
             <BarChart2 className="w-6 h-6 text-[#00E575]" /> Rekapitulasi Laporan Platform
           </h3>
           <p className="text-xs text-[#A5C9B8] mt-0.5">
-            Laporan rekap menyeluruh pelanggan, driver & perolehan, volume transaksi, serta komisi platform.
+            Laporan rekap pelanggan, driver & perolehan, merchant & persebaran lokasi, volume transaksi, serta komisi platform.
           </p>
         </div>
 
@@ -1097,10 +1099,11 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
       </div>
 
       {/* Category Tabs */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
         {[
           { id: 'customers', label: '👥 Pelanggan Terdaftar', count: recapData?.customers?.length || 0 },
           { id: 'drivers', label: '🏍️ Driver & Perolehan', count: recapData?.drivers?.length || 0 },
+          { id: 'merchants', label: '🏪 Merchant Terdaftar', count: recapData?.merchantSummary?.total || recapData?.summary?.totalMerchantsCount || 0 },
           { id: 'transactions', label: '📦 Volume Transaksi', count: recapData?.transactions?.length || 0 },
           { id: 'revenues', label: '💰 Platform Revenue', count: formatRupiah(recapData?.summary?.totalPlatformRevenue || 0) },
         ].map((cat) => (
@@ -1207,8 +1210,47 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
               </tbody>
             </table>
           </div>
-        ) : activeCategory === 'transactions' ? (
-          <div className="overflow-x-auto">
+        ) : activeCategory === 'merchants' ? (
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 p-3">
+              {[
+                ['Total', recapData?.merchantSummary?.total ?? 0],
+                ['Aktif', recapData?.merchantSummary?.active ?? 0],
+                ['Tidak Aktif', recapData?.merchantSummary?.inactive ?? 0],
+                ['Pemilik Nonaktif', recapData?.merchantSummary?.ownerInactive ?? 0],
+                ['Daftar Periode', recapData?.merchantSummary?.registeredInTimeframe ?? 0],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="bg-[#0D2E1F] border border-[#23583E] rounded-xl p-3">
+                  <span className="text-[9px] uppercase text-[#A5C9B8]">{label}</span>
+                  <div className="text-xl font-black text-[#FFD700] mt-1">{value}</div>
+                </div>
+              ))}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#0D2E1F] text-[#FFD700] text-[10px] uppercase border-b border-[#23583E]">
+                  <tr>
+                    <th className="py-3 px-4">Merchant</th><th className="py-3 px-4">Pemilik</th><th className="py-3 px-4">Kategori</th><th className="py-3 px-4">Lokasi / Alamat</th><th className="py-3 px-4">Status</th><th className="py-3 px-4 text-center">Produk</th><th className="py-3 px-4 text-center">Order</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#23583E] text-[#A5C9B8]">
+                  {(recapData?.merchants || [])
+                    .filter((m: any) => [m.name, m.ownerName, m.category, m.address, m.phone].some((v) => String(v || '').toLowerCase().includes(searchQuery.toLowerCase())))
+                    .map((m: any) => (
+                      <tr key={m.id} className="hover:bg-[#0D2E1F]/50 transition-colors">
+                        <td className="py-3 px-4 font-bold text-white">{m.name}<div className="text-[9px] text-gray-500">{m.phone}</div></td>
+                        <td className="py-3 px-4">{m.ownerName}<div className="text-[9px] text-gray-500">{m.ownerEmail}</div></td>
+                        <td className="py-3 px-4">{m.category}</td>
+                        <td className="py-3 px-4 max-w-[320px]">{m.address}<div className="text-[9px] text-[#00E575]">GPS: {Number(m.latitude).toFixed(6)}, {Number(m.longitude).toFixed(6)}</div></td>
+                        <td className="py-3 px-4"><span className={m.status === 'ACTIVE' ? 'text-[#00E575] font-black' : m.status === 'INACTIVE' ? 'text-red-400 font-black' : 'text-[#FFD700] font-black'}>{m.status === 'ACTIVE' ? 'AKTIF' : m.status === 'INACTIVE' ? 'TIDAK AKTIF' : m.status === 'OWNER_INACTIVE' ? 'PEMILIK NONAKTIF' : 'TANPA PEMILIK'}</span></td>
+                        <td className="py-3 px-4 text-center">{m.productCount}</td><td className="py-3 px-4 text-center">{m.orderCount}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : activeCategory === 'transactions' ? (          <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-[#0D2E1F] text-[#FFD700] text-[10px] uppercase border-b border-[#23583E]">
                 <tr>
@@ -1710,6 +1752,7 @@ function AdminApp({ onBack, triggerToast }: PortalProps) {
         </div>
       )}
 
+      <AdminManagementSection triggerToast={triggerToast} />
       <AdminRecapSection triggerToast={triggerToast} />
       <ReviewPanel triggerToast={triggerToast} />
       <TariffPanel triggerToast={triggerToast} />

@@ -34,6 +34,11 @@ export class SocketService {
   private static io: AppServer | null = null;
   private static lastLocationEmitAt = new Map<string, number>();
   private static lastChatEmitAt = new Map<string, number>();
+  // 🆕 FIX P0 "Availability state machine / grace period" (audit
+  // driver-jobs): timer OFFLINE yang tertunda per driver -- lihat
+  // komentar lengkap di handler "disconnect" di bawah.
+  private static pendingOfflineTimers = new Map<string, NodeJS.Timeout>();
+  private static readonly OFFLINE_GRACE_PERIOD_MS = 20_000;
 
   public static init(server: HttpServer): AppServer {
     // 🆕 FIX "WebSocket security": konsisten dengan fix CORS Express di
@@ -103,6 +108,21 @@ export class SocketService {
 
       // ✅ REGISTER MULTIPLE SOCKETS PAKAI REDIS SET (untuk driver)
       if (user.role === "DRIVER") {
+        // 🆕 FIX P0 "Availability state machine / grace period" (audit
+        // driver-jobs): kalau driver ini punya timer OFFLINE yang masih
+        // tertunda dari disconnect SEBELUMNYA (mis. reconnect cepat
+        // karena pindah WiFi<->seluler, app di-background sebentar),
+        // batalkan timer itu SEKARANG -- socket baru ini membuktikan
+        // driver sebenarnya masih terhubung, jadi status ONLINE di
+        // database tidak perlu (dan tidak boleh) diturunkan jadi
+        // OFFLINE oleh timer lama yang sudah tidak relevan lagi.
+        const pendingTimer = this.pendingOfflineTimers.get(user.id);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          this.pendingOfflineTimers.delete(user.id);
+          logger.info(`[SOCKET] Driver ${user.id} reconnect dalam grace period -- timer OFFLINE dibatalkan.`);
+        }
+
         const setKey = `${DRIVER_SOCKETS_SET}${user.id}`;
         RedisService.sadd(setKey, socket.id).catch((err) => {
           logger.error(`[SOCKET] Gagal menambahkan socket driver ${user.id} ke Redis Set: ${(err as Error).message}`);
@@ -173,7 +193,7 @@ export class SocketService {
 
           // Kalau driver sedang punya order aktif, siarkan juga ke room order itu
           const activeOrder = await prisma.order.findFirst({
-            where: { driverId: driverProfile.id, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED"] } },
+            where: { driverId: driverProfile.id, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED", "PICKED_UP", "ARRIVED_CUSTOMER"] } },
             select: { id: true },
           });
           if (activeOrder) {
@@ -340,13 +360,51 @@ export class SocketService {
               // Hapus lokasi
               await RedisService.del(`${DRIVER_LOCATION_PREFIX}${userId}`);
 
-              // Update status offline di database
-              await prisma.driverProfile.update({
-                where: { userId: userId },
-                data: { isOnline: false }
-              });
+              // 🆕 FIX P0 "Availability state machine / grace period"
+              // (audit driver-jobs): SEBELUMNYA isOnline langsung
+              // diset false DI SINI, SEKETIKA socket terakhir putus --
+              // termasuk untuk disconnect SESAAT yang murni jaringan
+              // (pindah WiFi ke seluler, app di-background beberapa
+              // detik, tunnel reconnect) yang lumrah terjadi di mobile.
+              // Efeknya: driver "kedip-kedip" ONLINE/OFFLINE terus-
+              // menerus, dan setiap kali status jatuh ke OFFLINE, GET
+              // /api/driver/jobs langsung 403 "Driver is offline" --
+              // persis blocker yang dilaporkan audit, padahal driver
+              // sebenarnya tetap aktif memakai aplikasi.
+              //
+              // Sekarang OFFLINE tidak langsung ditulis ke database --
+              // dijadwalkan dulu (grace period, lihat
+              // OFFLINE_GRACE_PERIOD_MS di atas) dan BARU benar-benar
+              // ditulis kalau setelah grace period itu driver TERBUKTI
+              // masih belum reconnect (dicek ulang activeCount dari
+              // Redis, bukan diasumsikan). Kalau driver reconnect
+              // sebelum grace period habis, timer ini dibatalkan di
+              // connection handler di atas -- isOnline TIDAK PERNAH
+              // sempat ditulis false untuk disconnect sesaat.
+              const existingTimer = this.pendingOfflineTimers.get(userId);
+              if (existingTimer) clearTimeout(existingTimer);
 
-              logger.info(`🔴 Driver ${userId} disconnected (all ${activeCount} sockets closed), set offline`);
+              const timer = setTimeout(async () => {
+                this.pendingOfflineTimers.delete(userId);
+                try {
+                  const stillActiveSockets = await RedisService.smembers(setKey);
+                  if (stillActiveSockets.length === 0) {
+                    await prisma.driverProfile.update({
+                      where: { userId },
+                      data: { isOnline: false },
+                    });
+                    SocketService.emitToAdmins("driver_status_changed", { driverId: userId, isOnline: false });
+                    logger.info(`🔴 Driver ${userId} masih terputus setelah grace period ${SocketService.OFFLINE_GRACE_PERIOD_MS}ms -- diset OFFLINE.`);
+                  } else {
+                    logger.info(`🟢 Driver ${userId} sudah reconnect sebelum grace period habis -- tetap ONLINE.`);
+                  }
+                } catch (timerErr: any) {
+                  logger.error(`[SOCKET] Gagal memproses grace-period OFFLINE untuk driver ${userId}: ${timerErr?.message || timerErr}`);
+                }
+              }, this.OFFLINE_GRACE_PERIOD_MS);
+
+              this.pendingOfflineTimers.set(userId, timer);
+              logger.info(`🟡 Driver ${userId} kehilangan semua socket -- menunggu grace period ${this.OFFLINE_GRACE_PERIOD_MS}ms sebelum diset OFFLINE.`);
             } else {
               // Masih ada socket aktif, tetap online
               logger.info(`🟢 Driver ${userId} still online (${activeCount} active sockets)`);
@@ -385,13 +443,12 @@ export class SocketService {
     //   merchant manapun bisa join lalu memantau/menguntit pergerakan
     //   semua driver, bukan cuma driver yang sedang mengantar order
     //   mereka. Risiko keamanan fisik nyata buat driver.
-    // - "drivers_pool" menyiarkan detail SETIAP order baru
-    //   (pickupAddress, dropoffAddress, price -- lihat
-    //   emitToDriversPool('new_order_available', ...)) ke siapa pun di
-    //   room ini -- customer/merchant manapun bisa join lalu memanen
-    //   alamat rumah & harga order customer LAIN secara real-time.
-    // Sekarang keduanya HANYA untuk role DRIVER (yang memang butuh info
-    // ini untuk bekerja) atau ADMIN (sudah return true di baris atas).
+    // - "drivers_pool" dipakai hanya untuk sinyal pool yang non-private
+    //   seperti order_taken. Actionable offer `new_order_available` TIDAK
+    //   lagi dibroadcast ke pool; offer dikirim private oleh DispatchService
+    //   hanya kepada driver kandidat yang eligible.
+    // Sekarang keduanya HANYA untuk role DRIVER (yang memang membutuhkan
+    // pool untuk sinkronisasi kerja) atau ADMIN (sudah return true di atas).
     if (roomId === "map_updates" || roomId === "drivers_pool") {
       return user.role === "DRIVER";
     }
@@ -411,7 +468,7 @@ export class SocketService {
         const customerProfile = await prisma.customerProfile.findUnique({ where: { userId: user.id } });
         if (!customerProfile) return false;
         const activeOrder = await prisma.order.findFirst({
-          where: { customerId: customerProfile.id, driverId, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED"] } },
+          where: { customerId: customerProfile.id, driverId, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED", "PICKED_UP", "ARRIVED_CUSTOMER"] } },
           select: { id: true },
         });
         return !!activeOrder;

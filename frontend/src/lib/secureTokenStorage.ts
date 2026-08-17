@@ -20,20 +20,22 @@
 // - CAPACITOR (Android native): httpOnly cookie TIDAK reliable lintas
 //   origin di WebView (lihat catatan di app.ts/auth.controller.ts),
 //   jadi tetap butuh token tersimpan client-side -- tapi sekarang
-//   lewat @capacitor/preferences (native storage terpisah dari
-//   localStorage WebView) alih-alih localStorage biasa. Ini BUKAN
-//   hardware-keystore-encrypted (belum setara Android Keystore /
-//   EncryptedSharedPreferences), tapi TIDAK bisa diakses lewat
-//   `localStorage.getItem(...)` dari payload XSS generik yang jalan
-//   di WebView -- perlu jembatan native Capacitor juga dikompromikan,
-//   bar yang jauh lebih tinggi. Untuk proteksi setara Keystore
-//   sungguhan, langkah lanjutan yang direkomendasikan: ganti ke plugin
-//   seperti `capacitor-secure-storage-plugin` atau simpan lewat
-//   Android Keystore langsung.
+//   lewat capacitor-secure-storage-plugin, yang di Android benar-benar
+//   memakai Android Keystore (via EncryptedSharedPreferences, hardware-
+//   backed di device yang mendukung StrongBox/TEE) dan di iOS memakai
+//   Keychain -- BUKAN localStorage/Preferences biasa (yang cuma XML/
+//   SQLite polos, bisa dibaca kalau device di-root atau lewat adb
+//   backup). Ini setara level proteksi yang sama dengan cara password
+//   disimpan OS -- kunci enkripsinya tidak pernah keluar dari hardware
+//   keystore chip, jauh lebih tahan bahkan dari device yang di-root.
+//   (🆕 Riwayat: sempat pakai @capacitor/preferences sebagai langkah
+//   antara -- itu SUDAH lebih baik dari localStorage [tidak terjangkau
+//   payload XSS generik yang cuma panggil localStorage.getItem()],
+//   tapi BELUM hardware-encrypted; sekarang sudah digantikan penuh.)
 // ============================================================
 
 import { Capacitor } from '@capacitor/core';
-import { Preferences } from '@capacitor/preferences';
+import { SecureStoragePlugin } from 'capacitor-secure-storage-plugin';
 
 const REFRESH_TOKEN_KEY = 'dhuknoo_refresh_token';
 
@@ -45,6 +47,25 @@ export const isNativePlatform = (): boolean => {
   }
 };
 
+// 🆕 FIX "Capacitor Preferences belum Android Keystore" (audit
+// lanjutan): versi sebelumnya pakai @capacitor/preferences -- itu
+// SUDAH lebih baik dari localStorage biasa (tidak terjangkau
+// localStorage.getItem() dari payload XSS generik), TAPI @capacitor/
+// preferences SENDIRI TIDAK terenkripsi hardware -- di Android, isinya
+// cuma SharedPreferences file XML biasa (bisa dibaca kalau device
+// di-root atau lewat adb backup di Android <12), BUKAN setara
+// EncryptedSharedPreferences/Android Keystore.
+//
+// Diganti ke capacitor-secure-storage-plugin, yang di Android benar-
+// benar memakai Android Keystore (lewat EncryptedSharedPreferences) --
+// kunci enkripsinya disimpan di hardware-backed keystore chip
+// (kalau device mendukung StrongBox/TEE), TIDAK BISA diekstrak
+// begitu saja meski device di-root, dan TIDAK ikut kebawa backup
+// biasa. Ini proteksi yang jauh lebih dekat ke "secure storage"
+// sungguhan dibanding Preferences API biasa. Di iOS otomatis memakai
+// Keychain (setara).
+const REFRESH_TOKEN_KEY_CONST = REFRESH_TOKEN_KEY;
+
 /**
  * Ambil refresh token tersimpan (HANYA berlaku untuk platform native --
  * di web selalu return null karena refresh token TIDAK PERNAH disimpan
@@ -54,28 +75,30 @@ export const isNativePlatform = (): boolean => {
 export async function getStoredRefreshToken(): Promise<string | null> {
   if (!isNativePlatform()) return null;
   try {
-    const { value } = await Preferences.get({ key: REFRESH_TOKEN_KEY });
+    const { value } = await SecureStoragePlugin.get({ key: REFRESH_TOKEN_KEY_CONST });
     return value ?? null;
   } catch {
+    // Plugin ini throw kalau key belum pernah di-set sama sekali
+    // (bukan kondisi error sungguhan) -- treat sebagai "belum ada".
     return null;
   }
 }
 
 /**
  * Simpan refresh token -- NO-OP di web (sengaja, lihat komentar di atas).
- * Di native, ditulis ke Capacitor Preferences (fire-and-forget aman
- * dipanggil dari kode sinkron seperti Zustand store).
+ * Di native, ditulis ke Android Keystore / iOS Keychain (fire-and-forget
+ * aman dipanggil dari kode sinkron seperti Zustand store).
  */
 export function persistRefreshToken(token: string | null): void {
   if (!isNativePlatform()) return;
   if (!token) {
-    Preferences.remove({ key: REFRESH_TOKEN_KEY }).catch(() => {});
+    SecureStoragePlugin.remove({ key: REFRESH_TOKEN_KEY_CONST }).catch(() => {});
     return;
   }
-  Preferences.set({ key: REFRESH_TOKEN_KEY, value: token }).catch(() => {});
+  SecureStoragePlugin.set({ key: REFRESH_TOKEN_KEY_CONST, value: token }).catch(() => {});
 }
 
 export function clearStoredRefreshToken(): void {
   if (!isNativePlatform()) return;
-  Preferences.remove({ key: REFRESH_TOKEN_KEY }).catch(() => {});
+  SecureStoragePlugin.remove({ key: REFRESH_TOKEN_KEY_CONST }).catch(() => {});
 }

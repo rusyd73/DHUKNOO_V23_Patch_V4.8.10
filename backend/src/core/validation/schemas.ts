@@ -80,13 +80,18 @@ export const adminWalletCreditSchema = z.object({
   targetUserId: z.string().uuid('targetUserId harus UUID yang valid!'),
   amount: z.number().positive('Nominal harus lebih dari 0!').max(50_000_000, 'Nominal maksimal Rp50.000.000 per transaksi!'),
   reason: z.string().min(5, 'Alasan wajib diisi, minimal 5 karakter (untuk audit)!'),
-  // 🆕 FIX IDEMPOTENCY: wajib diisi CLIENT (bukan digenerate server dari
-  // Date.now() seperti versi sebelumnya, yang berubah tiap milidetik dan
-  // sama sekali tidak mencegah double-klik/network retry mengkredit dua
-  // kali). Client (dashboard admin) harus generate satu UUID/nonce per
-  // "niat transaksi" dan kirim ulang key YANG SAMA persis kalau request
+  // 🆕 FIX P0 IDEMPOTENCY: wajib diisi CLIENT (bukan digenerate server dari
+  // Date.now()/crypto.randomUUID() seperti versi sebelumnya -- key acak
+  // BERUBAH tiap panggilan, jadi @unique constraint di Transaction TIDAK
+  // PERNAH kena collision, dan double-klik tombol atau retry jaringan dari
+  // dashboard admin bisa MENGKREDIT DUA KALI tanpa terdeteksi sama sekali.
+  // Client (dashboard admin) WAJIB generate satu UUID/nonce per "niat
+  // transaksi" dan kirim ulang key YANG SAMA persis kalau request
   // di-retry (mis. karena timeout tapi sebenarnya sudah diproses server).
-  idempotencyKey: z.string().min(8, 'idempotencyKey minimal 8 karakter!').max(200).optional(),
+  // Sekarang WAJIB (bukan .optional()) -- operasi finansial yang bisa
+  // diretry harus selalu punya idempotency key dari sumbernya, tidak
+  // boleh diam-diam "aman sendiri" lewat fallback server-side.
+  idempotencyKey: z.string().min(8, 'idempotencyKey wajib disertakan agar kredit wallet tidak diproses dua kali!').max(200),
 });
 
 export const changePasswordSchema = z.object({
@@ -111,8 +116,8 @@ export const confirmPasswordResetSchema = z.object({
 });
 
 export const createOrderSchema = z.object({
-  serviceType: z.enum(['BIKE', 'CAR', 'SEND'], {
-    errorMap: () => ({ message: 'Tipe layanan harus BIKE, CAR, atau SEND!' }),
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND', 'MART'], {
+    errorMap: () => ({ message: 'Tipe layanan harus BIKE, CAR, SEND, atau MART!' }),
   }),
   // CATATAN: harga TIDAK diterima dari client sama sekali (celah keamanan kalau diizinkan —
   // client bisa kirim harga sembarangan). Harga SELALU dihitung server lewat Tariff Engine
@@ -135,8 +140,8 @@ export const createOrderSchema = z.object({
 });
 
 export const updateOrderStatusSchema = z.object({
-  status: z.enum(['ON_THE_WAY', 'ARRIVED', 'COMPLETED', 'CANCELLED'], {
-    errorMap: () => ({ message: 'Status harus salah satu dari: ON_THE_WAY, ARRIVED, COMPLETED, CANCELLED!' }),
+  status: z.enum(['ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER', 'COMPLETED', 'CANCELLED'], {
+    errorMap: () => ({ message: 'Status tidak valid untuk lifecycle driver.' }),
   }),
 });
 
@@ -269,8 +274,8 @@ export const updateMerchantSchema = z.object({
   name: z.string().min(3).optional(),
   category: z.string().min(1).optional(),
   address: z.string().min(3).optional(),
-  latitude: z.number().min(-90).max(90).optional(),
-  longitude: z.number().min(-180).max(180).optional(),
+  // latitude/longitude sengaja TIDAK termasuk update schema: lokasi merchant
+  // adalah master pickup point dan hanya ditetapkan saat registrasi.
   phone: z.string().optional(),
   imageUrl: z.string().url().optional(),
   isOpen: z.boolean().optional(),
@@ -340,7 +345,7 @@ export const createPricingZoneSchema = z.object({
 
 export const createPricingRuleSchema = z.object({
   zoneId: z.string().uuid().optional(),
-  serviceType: z.enum(['BIKE', 'CAR', 'SEND']),
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND', 'MART']),
   baseFare: z.number().min(0, 'Tarif dasar tidak boleh negatif!'),
   pickupFee: z.number().min(0).optional(),
   perKmFee: z.number().min(0, 'Biaya per-km tidak boleh negatif!'),
@@ -383,7 +388,7 @@ export const createTariffVersionSchema = z.object({
 });
 
 export const previewFareSchema = z.object({
-  serviceType: z.enum(['BIKE', 'CAR', 'SEND']),
+  serviceType: z.enum(['BIKE', 'CAR', 'SEND', 'MART']),
   distanceKm: z.number().min(0),
   zoneName: z.string().optional(),
   waitMinutes: z.number().min(0).optional(),
@@ -406,7 +411,7 @@ export const confirmCashSchema = z.object({
 // ── Manual payment proof (QRIS/Transfer/E-Wallet, sebelum ada gateway) ────
 export const submitPaymentProofSchema = z.object({
   orderId: z.string().uuid('orderId harus berupa UUID yang valid!'),
-  method: z.enum(['QRIS', 'TRANSFER', 'EWALLET', 'CASH']),
+  method: z.enum(['QRIS', 'TRANSFER', 'EWALLET']),
   proofImageUrl: z.string().min(1, 'Bukti pembayaran wajib diupload!'),
   note: z.string().max(300).optional(),
 });

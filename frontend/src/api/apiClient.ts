@@ -62,8 +62,16 @@ let refreshInFlight: Promise<{ accessToken: string; refreshToken: string }> | nu
 // auth.controller.ts: `req.cookies?.refreshToken || req.body?.refreshToken`).
 async function performTokenRefresh(rToken?: string | null): Promise<{ accessToken: string; refreshToken: string }> {
   const res = await api.post(API_ENDPOINTS.auth.refresh, rToken ? { refreshToken: rToken } : {});
-  const newAccessToken = res.data?.accessToken;
-  const newRefreshToken = res.data?.refreshToken || rToken;
+  // 🆕 FIX P0 KONTRAK AUTH: `res` di sini adalah response axios MENTAH,
+  // jadi `res.data` = body JSON `{ success, data: { accessToken,
+  // refreshToken } }` (lihat auth.controller.ts refreshToken()) --
+  // BUKAN payload-nya langsung. Sebelumnya kode membaca res.data.accessToken
+  // yang selalu undefined, membuat SETIAP auto-refresh gagal dengan
+  // "Refresh token response tidak mengandung accessToken." walau request
+  // ke server sebenarnya sukses -- efeknya user ter-logout terus-menerus
+  // begitu access token 15 menit kedaluwarsa.
+  const newAccessToken = res.data?.data?.accessToken;
+  const newRefreshToken = res.data?.data?.refreshToken || rToken;
 
   if (!newAccessToken) {
     throw new Error("Refresh token response tidak mengandung accessToken.");

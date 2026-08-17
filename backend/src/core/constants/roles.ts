@@ -17,4 +17,5 @@ export enum ServiceType {
   BIKE = 'BIKE',
   CAR = 'CAR',
   SEND = 'SEND',
+  MART = 'MART',
 }

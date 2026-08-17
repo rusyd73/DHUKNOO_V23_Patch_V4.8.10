@@ -20,7 +20,7 @@ describe('GET /', () => {
     const res = await request(app).get('/');
 
     expect(res.status).toBe(200);
-    expect(res.body.message).toMatch(/OBAMA/i);
+    expect(res.body.message).toMatch(/DHUKNOO/i);
   });
 });
 

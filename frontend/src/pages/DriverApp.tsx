@@ -49,6 +49,8 @@ interface PortalProps {
 function DriverApp({ onBack, triggerToast }: PortalProps) {
   const { login, logout, user } = useAuthStore();
   const queryClient = useQueryClient();
+  const [activeTrip, setActiveTrip] = useState<any | null>(null);
+  const [offeredJob, setOfferedJob] = useState<any | null>(null);
 
   // Fetch real driver profile
   const { data: profileData, isLoading: isProfileLoading, refetch: refetchProfile } = useQuery({
@@ -62,6 +64,12 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     queryKey: ['driverJobs'],
     queryFn: DriverAPI.getJobs,
     enabled: !!user,
+    // P0 recovery: GET /jobs is the lifecycle source-of-truth after reconnect
+    // or a Socket.IO race. Poll only while the driver is online so a PENDING
+    // order cannot remain invisible merely because the offer event happened
+    // before the dashboard listener was ready.
+    refetchInterval: profileData?.profile?.isOnline ? 5000 : false,
+    refetchIntervalInBackground: true,
   });
 
   // Mutations
@@ -116,12 +124,17 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     // PERBARUAN: hentikan ring SEKETIKA saat driver tap "Terima Order" --
     // jangan tunggu response server dulu, supaya bel langsung berhenti persis
     // di momen mereka klik terima, sesuai permintaan.
-    onMutate: () => {
+    onMutate: (orderId) => {
       stopRingLoop();
+      setOfferedJob((current) => current?.id === orderId ? null : current);
     },
     onSuccess: (res) => {
       triggerToast(res.message);
+      if (res?.order && ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(res.order.status)) {
+        setActiveTrip(res.order);
+      }
       queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      refetchJobs();
     },
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal menerima orderan!');
@@ -152,8 +165,15 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
       DriverAPI.updateJobStatus(orderId, status),
     onSuccess: (res) => {
       triggerToast(res.message);
+      const nextOrder = res?.order;
+      if (nextOrder && ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(nextOrder.status)) {
+        setActiveTrip(nextOrder);
+      } else if (nextOrder && ['COMPLETED', 'CANCELLED'].includes(nextOrder.status)) {
+        setActiveTrip(null);
+      }
       queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
       queryClient.invalidateQueries({ queryKey: ['driverProfile'] });
+      refetchJobs();
     },
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal memperbarui status orderan!');
@@ -188,7 +208,35 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
 
   const currentDriverId = profileData?.profile?.id || user?.id;
   // Find if this driver is currently busy with an accepted order
-  const activeJob = jobsData?.jobs?.find((j: any) => j.driverId === currentDriverId && j.status !== 'COMPLETED' && j.status !== 'CANCELLED');
+  // P0: restore active trip from explicit activeJobs, with API compatibility fallback.
+  const normalizedJobs = Array.isArray(jobsData?.jobs)
+    ? jobsData.jobs
+    : Array.isArray(jobsData?.data)
+      ? jobsData.data
+      : [];
+
+  // V4: GET /jobs sekarang scoped ke driver yang login. Jangan membuat
+  // lifecycle bergantung pada kecocokan ID User vs DriverProfile secara
+  // diam-diam. Jika backend mengirim activeJob/activeJobs, gunakan itu;
+  // fallback ke daftar jobs yang juga sudah scoped.
+  const serverActiveJob =
+    (jobsData?.activeJob && ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(jobsData.activeJob.status))
+      ? jobsData.activeJob
+      : (Array.isArray(jobsData?.activeJobs) ? jobsData.activeJobs : normalizedJobs)
+          .find((j: any) =>
+            ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(j.status) &&
+            (!j.driverId || j.driverId === currentDriverId)
+          );
+
+  const activeJob = activeTrip || serverActiveJob;
+
+  useEffect(() => {
+    if (serverActiveJob) {
+      setActiveTrip(serverActiveJob);
+    } else if (!updateJobStatusMutation.isPending) {
+      setActiveTrip(null);
+    }
+  }, [serverActiveJob?.id, serverActiveJob?.status, updateJobStatusMutation.isPending]);
 
   // 🔥 WARMUP AUDIOCONTEXT - Dipanggil saat komponen mount (user gesture dari klik menu)
   useEffect(() => {
@@ -274,23 +322,25 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     // TIDAK PERNAH terpanggil sama sekali -- makanya bel/ring tidak pernah bunyi.
     const handleNewOrderOffered = (data: any) => {
       console.log('🛎️ ORDER BARU DITAWARKAN KE DRIVER:', data);
-      
-      // ✅ 1. MULAI RING LOOP
+
+      // P0: event ini adalah offer TARGETED dari DispatchService, bukan
+      // broadcast pool. Simpan sebagai local offer supaya driver memiliki
+      // tombol TERIMA yang langsung bekerja tanpa menunggu GET /jobs.
+      setOfferedJob({
+        ...data,
+        id: data.orderId,
+        status: 'PENDING',
+      });
+
       try {
         startRingLoop();
-        console.log('🔊 Ring loop started - order baru ditawarkan ke driver');
       } catch (error) {
         console.error('❌ Gagal memulai ring loop:', error);
       }
-      
-      // 2. Tampilkan toast notifikasi
-      // PERBAIKAN: payload dari backend tidak punya field customerName/total,
-      // yang ada 'price' (lihat dispatch.service.ts offerNextDriver).
-      const total = data.price || data.total || 0;
+
+      const total = Number(data.price || data.total || 0);
       const formattedTotal = total.toLocaleString('id-ID');
       triggerToast(`📦 Order baru! ${data.pickupAddress ? `Dari ${data.pickupAddress}. ` : ''}Total: Rp ${formattedTotal}`);
-      
-      // 3. Refresh daftar order
       refetchJobs();
     };
 
@@ -299,6 +349,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderTakenByOther = (data: any) => {
       console.log('🔄 Order diambil driver lain:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
       triggerToast(`⏳ Order #${data.orderId || 'unknown'} sudah diambil driver lain`);
       refetchJobs();
     };
@@ -309,6 +360,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderExpired = (data: any) => {
       console.log('⏰ Order expired:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
       triggerToast(`⏰ Order #${data.orderId || 'unknown'} telah kadaluwarsa`);
       refetchJobs();
     };
@@ -319,14 +371,40 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOfferTimeout = (data: any) => {
       console.log('⏱️ Offer order timeout untuk driver ini:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
     };
 
     // Daftarkan semua listener — nama event HARUS sama persis dengan yang
     // di-emit backend (lihat grep "SocketService.emitTo" di seluruh backend/src).
+    const handleAssignedOrStatusChanged = (data: any) => {
+      console.log('🔄 Driver active order sync:', data);
+      if (data?.orderId && data?.status) {
+        stopRingLoop();
+        setOfferedJob((current) => current?.id === data.orderId ? null : current);
+        if (['COMPLETED', 'CANCELLED'].includes(data.status)) {
+          setActiveTrip((current: any) => current?.id === data.orderId ? null : current);
+        } else if (data.order) {
+          setActiveTrip(data.order);
+        } else {
+          setActiveTrip((current: any) => {
+            if (!current || current.id === data.orderId) {
+              return current ? { ...current, status: data.status } : current;
+            }
+            return current;
+          });
+        }
+      }
+      refetchJobs();
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+    };
+
     socket.on('new_order_available', handleNewOrderOffered);
     socket.on('order_taken', handleOrderTakenByOther);
     socket.on('order_expired', handleOrderExpired);
     socket.on('order_timeout', handleOfferTimeout);
+    socket.on('order_accepted', handleAssignedOrStatusChanged);
+    socket.on('order_status_changed', handleAssignedOrStatusChanged);
+    socket.on('order_updated', handleAssignedOrStatusChanged);
 
     // Cleanup
     return () => {
@@ -335,6 +413,9 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
       socket.off('order_taken', handleOrderTakenByOther);
       socket.off('order_expired', handleOrderExpired);
       socket.off('order_timeout', handleOfferTimeout);
+      socket.off('order_accepted', handleAssignedOrStatusChanged);
+      socket.off('order_status_changed', handleAssignedOrStatusChanged);
+      socket.off('order_updated', handleAssignedOrStatusChanged);
       
       // ✅ STOP ring loop saat komponen unmount
       stopRingLoop();
@@ -641,36 +722,52 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 currentUserId={user?.id || ''}
                 currentUserRole="DRIVER"
                 otherPartyName={activeJob.customer?.user?.fullName}
-                otherPartyPhone={activeJob.customer?.phoneNumber}
+                otherPartyPhone={activeJob.customer?.phoneNumber || activeJob.customer?.user?.phoneNumber}
               />
 
-              {/* Progress Stepper Buttons */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {/* Progress Stepper Buttons — MART memiliki dua titik ARRIVED. */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ON_THE_WAY' })}
                   disabled={activeJob.status !== 'ACCEPTED'}
                   className="bg-amber-500 hover:bg-amber-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Menuju Jemput
+                  {activeJob.serviceType === 'MART' ? 'Menuju Merchant' : 'Menuju Jemput'}
                 </button>
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED' })}
                   disabled={activeJob.status !== 'ON_THE_WAY'}
                   className="bg-cyan-500 hover:bg-cyan-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Tiba di Lokasi
+                  {activeJob.serviceType === 'MART' ? 'Tiba di Merchant' : 'Tiba di Lokasi'}
                 </button>
                 <button
+                  onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'PICKED_UP' })}
+                  disabled={activeJob.serviceType !== 'MART' || activeJob.status !== 'ARRIVED'}
+                  className="bg-violet-500 hover:bg-violet-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                >
+                  Ambil & Menuju Customer
+                </button>
+                {activeJob.serviceType === 'MART' && (
+                  <button
+                    onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED_CUSTOMER' })}
+                    disabled={activeJob.status !== 'PICKED_UP'}
+                    className="bg-sky-500 hover:bg-sky-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  >
+                    Tiba di Customer
+                  </button>
+                )}
+                <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'COMPLETED' })}
-                  disabled={activeJob.status !== 'ARRIVED'}
+                  disabled={activeJob.serviceType === 'MART' ? activeJob.status !== 'ARRIVED_CUSTOMER' : activeJob.status !== 'ARRIVED'}
                   className="bg-[#00E575] hover:bg-[#00ff80] text-[#071F14] py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Selesaikan Trip
+                  Selesaikan Order
                 </button>
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'CANCELLED' })}
-                  disabled={activeJob.status === 'COMPLETED'}
-                  className="bg-red-500 hover:bg-red-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  disabled={activeJob.status === 'COMPLETED' || activeJob.status === 'CANCELLED'}
+                  className="bg-red-500 hover:bg-red-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30 col-span-2 md:col-span-5"
                 >
                   Batalkan Order
                 </button>
@@ -679,7 +776,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
           )}
 
           {/* Order Selesai — Menunggu Konfirmasi Cash */}
-          {jobsData?.jobs?.some((j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id) && (
+          {normalizedJobs.some((j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id) && (
             <div className="bg-[#0D2E1F] border border-[#FFD700]/40 p-6 rounded-3xl flex flex-col gap-3">
               <h3 className="font-black text-sm text-[#FFD700] flex items-center gap-1.5">
                 <DollarSign className="w-4 h-4" /> Order Selesai — Menunggu Konfirmasi Cash
@@ -708,6 +805,35 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
             </div>
           )}
 
+          {/* P0 MANUAL OFFER — actionable offer yang diterima lewat Socket.IO.
+              Jangan menggantungkan tombol Terima hanya pada GET /jobs karena
+              offer dispatch bisa datang lebih cepat daripada refresh query. */}
+          {offeredJob && !activeJob && (
+            <div className="bg-[#102F20] border-2 border-[#FFD700] p-5 rounded-3xl flex flex-col gap-3 shadow-lg">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="font-black text-lg text-[#FFD700]">🔔 Pesanan Masuk — Menunggu Anda</h3>
+                  <p className="text-[10px] text-[#A5C9B8]">Offer ini sudah diterima secara manual. Pengaturan Auto-Accept berlaku untuk offer berikutnya.</p>
+                </div>
+                <span className="text-[10px] font-black text-white bg-[#23583E] px-2 py-1 rounded-lg">{offeredJob.serviceType}</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                <div className="bg-[#06170E] border border-[#23583E] rounded-xl p-3"><span className="text-[#A5C9B8]">Jemput</span><div className="text-white font-bold mt-1">{offeredJob.pickupAddress || '-'}</div></div>
+                <div className="bg-[#06170E] border border-[#23583E] rounded-xl p-3"><span className="text-[#A5C9B8]">Tujuan</span><div className="text-white font-bold mt-1">{offeredJob.dropoffAddress || '-'}</div></div>
+              </div>
+              <div className="flex items-center justify-between gap-3 border-t border-[#23583E] pt-3">
+                <span className="font-black text-white">Rp {Number(offeredJob.price || 0).toLocaleString('id-ID')}</span>
+                <button
+                  onClick={() => acceptJobMutation.mutate(offeredJob.id)}
+                  disabled={acceptJobMutation.isPending}
+                  className="bg-[#00E575] hover:bg-[#00ff80] text-[#071F14] font-black px-5 py-2.5 rounded-xl disabled:opacity-50"
+                >
+                  {acceptJobMutation.isPending ? 'Menerima...' : 'Terima Order'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Job Pool (Available orders) */}
           <div className="bg-[#0D2E1F] border border-[#23583E] p-6 rounded-3xl flex flex-col gap-4">
             <h3 className="font-black text-lg text-[#00E575] flex items-center gap-1.5">
@@ -715,7 +841,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
             </h3>
             
             {(() => {
-              const hasUnconfirmedCash = jobsData?.jobs?.some(
+              const hasUnconfirmedCash = normalizedJobs.some(
                 (j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id
               );
 

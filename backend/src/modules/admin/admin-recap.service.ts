@@ -54,6 +54,44 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
     isAppInstalled: c.isAppInstalled,
   }));
 
+  // 3. Merchant terdaftar: identitas usaha, pemilik, lokasi, dan status.
+  // Status operasional memakai Merchant.isOpen; status akun pemilik memakai User.isActive.
+  // Keduanya ditampilkan terpisah agar Admin dapat membedakan toko tutup dengan akun pemilik nonaktif.
+  const merchants = await prisma.merchant.findMany({
+    include: {
+      owner: { select: { fullName: true, email: true, isActive: true } },
+      _count: { select: { products: true, orders: true } },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  const formattedMerchants = merchants.map((m) => ({
+    id: m.id,
+    name: m.name,
+    ownerName: m.owner?.fullName || 'Belum terhubung',
+    ownerEmail: m.owner?.email || '-',
+    category: m.category,
+    address: m.address,
+    latitude: m.latitude,
+    longitude: m.longitude,
+    phone: m.phone || '-',
+    isOpen: m.isOpen,
+    ownerIsActive: m.owner?.isActive ?? false,
+    status: !m.owner ? 'NO_OWNER' : !m.owner.isActive ? 'OWNER_INACTIVE' : m.isOpen ? 'ACTIVE' : 'INACTIVE',
+    registeredAt: m.createdAt,
+    productCount: m._count.products,
+    orderCount: m._count.orders,
+  }));
+
+  const merchantSummary = {
+    total: formattedMerchants.length,
+    active: formattedMerchants.filter((m) => m.status === 'ACTIVE').length,
+    inactive: formattedMerchants.filter((m) => m.status === 'INACTIVE').length,
+    ownerInactive: formattedMerchants.filter((m) => m.status === 'OWNER_INACTIVE').length,
+    noOwner: formattedMerchants.filter((m) => m.status === 'NO_OWNER').length,
+    registeredInTimeframe: formattedMerchants.filter((m) => new Date(m.registeredAt) >= startDate).length,
+  };
+
   // 2. Mitra pengemudi identitas, no HP, sekaligus perolehannya
   const drivers = await prisma.driverProfile.findMany({
     include: {
@@ -177,9 +215,16 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
       totalTransactionsCount: formattedTransactions.length,
       totalVolumeValue,
       totalPlatformRevenue,
+      totalMerchantsCount: merchantSummary.total,
+      activeMerchantsCount: merchantSummary.active,
+      inactiveMerchantsCount: merchantSummary.inactive,
+      ownerInactiveMerchantsCount: merchantSummary.ownerInactive,
+      merchantsRegisteredInTimeframe: merchantSummary.registeredInTimeframe,
     },
     customers: formattedCustomers,
     drivers: formattedDrivers,
+    merchants: formattedMerchants,
+    merchantSummary,
     transactions: formattedTransactions,
     platformRevenues: formattedRevenues,
     paymentMethodBreakdown,

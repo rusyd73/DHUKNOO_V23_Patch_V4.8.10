@@ -7,7 +7,7 @@ const SOCKET_URL = getApiBaseUrl();
 
 interface Order {
   id: string;
-  serviceType: 'BIKE' | 'CAR' | 'SEND';
+  serviceType: 'BIKE' | 'CAR' | 'SEND' | 'MART';
   status: string;
   price: number;
   pickupAddress: string;

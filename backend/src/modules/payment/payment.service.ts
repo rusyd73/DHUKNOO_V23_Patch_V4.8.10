@@ -5,6 +5,8 @@ import { WalletRepository } from '../wallet/wallet.repository';
 import { TariffEngineService } from '../tariff/tariff.service';
 import { AppError, NotFoundError, ForbiddenError } from '../../core/errors/AppError';
 import { SocketService } from '../../websocket/socket';
+import { LedgerService } from '../ledger/ledger.service';
+import { AuditLogger } from '../../core/logging/audit.logger';
 
 /**
  * Menghitung pembagian pembayaran satu order: berapa yang ditagih ke customer
@@ -79,6 +81,7 @@ export class PaymentService {
   private paymentRepo = new PaymentRepository();
   private walletRepo = new WalletRepository();
   private tariffEngine = new TariffEngineService();
+  private ledgerService = new LedgerService();
 
   private async resolveCommissionRateForOrder(order: { id: string; price: any; discount: any }) {
     const pricingHistory = await this.paymentRepo.findPricingHistoryByOrderId(order.id);
@@ -145,6 +148,9 @@ export class PaymentService {
     }
     if (order.isPaid) {
       throw new AppError('Order ini sudah dibayar sebelumnya!', 409);
+    }
+    if (order.paymentMethod !== 'WALLET') {
+      throw new AppError(`chargeOrder hanya berlaku untuk order dengan paymentMethod WALLET (saat ini: ${order.paymentMethod}).`, 400);
     }
     if (order.status !== 'COMPLETED') {
       throw new AppError('Order hanya bisa dibayar setelah perjalanan berstatus COMPLETED!', 400);
@@ -224,9 +230,14 @@ export class PaymentService {
           );
         }
 
+        // 🆕 FIX P0 "Financial State Machine" (audit a1.4): settlementStatus
+        // di-set SETTLED dalam TRANSAKSI ATOMIK YANG SAMA dengan debit/kredit
+        // di atas -- konsisten dengan prinsip "settlement harus atomic
+        // sebagai satu unit bisnis" (bukan langkah terpisah yang bisa gagal
+        // sendiri setelah uang sudah berpindah).
         const updatedOrder = await tx.order.update({
           where: { id: order.id },
-          data: { isPaid: true },
+          data: { isPaid: true, settlementStatus: 'SETTLED' },
         });
 
         return { debit, credit, merchantCredit, updatedOrder };
@@ -357,7 +368,8 @@ export class PaymentService {
           );
         }
 
-        const updatedOrder = await tx.order.update({ where: { id: order.id }, data: { isPaid: true } });
+        // 🆕 FIX P0 "Financial State Machine": lihat komentar di chargeOrder().
+        const updatedOrder = await tx.order.update({ where: { id: order.id }, data: { isPaid: true, settlementStatus: 'SETTLED' } });
         return { feeDeduction, merchantCredit, updatedOrder };
       });
 
@@ -438,6 +450,17 @@ export class PaymentService {
 
     if (status === 'REJECTED') {
       const updated = await this.paymentRepo.updatePaymentProofStatus(proofId, 'REJECTED', adminUserId, reviewNote);
+      // 🆕 FIX P0 "Financial State Machine" (audit a1.4): bukti bayar
+      // ditolak berarti percobaan settlement ini GAGAL tapi customer masih
+      // bisa upload ulang (lihat submitPaymentProof -- REJECTED boleh
+      // digantikan bukti baru) -- state paling akurat adalah
+      // RETRY_REQUIRED, bukan dibiarkan diam di PENDING (yang secara
+      // makna berarti "belum pernah dicoba sama sekali", padahal sudah
+      // ada satu percobaan yang eksplisit ditolak).
+      await prisma.order.update({
+        where: { id: proof.order.id },
+        data: { settlementStatus: 'RETRY_REQUIRED' },
+      });
       return { proof: updated, order: proof.order };
     }
 
@@ -499,7 +522,8 @@ export class PaymentService {
           );
         }
 
-        await tx.order.update({ where: { id: order.id }, data: { isPaid: true } });
+        // 🆕 FIX P0 "Financial State Machine": lihat komentar di chargeOrder().
+        await tx.order.update({ where: { id: order.id }, data: { isPaid: true, settlementStatus: 'SETTLED' } });
         const updatedProof = await tx.paymentProof.update({
           where: { id: proofId },
           data: { status: 'APPROVED', reviewedBy: adminUserId, reviewedAt: new Date(), reviewNote },
@@ -513,6 +537,61 @@ export class PaymentService {
         return { proof: refreshedProof, order: proof.order, alreadyProcessed: true } as any;
       }
       throw err;
+    }
+
+    // Accounting ledger untuk payment eksternal baru ditulis SETELAH approval.
+    // recordOnly=true penting: wallet sudah dikredit oleh transaction settlement
+    // di atas, sehingga Ledger hanya menjadi immutable accounting record dan
+    // tidak boleh memutasi saldo untuk kedua kalinya.
+    try {
+      const ledgerBreakdown = isMartOrder && martSplit
+        ? {
+            orderId: order.id,
+            customerPayment: Number(martSplit.amountToCharge),
+            driverEarning: Number(martSplit.deliveryFee),
+            merchantEarning: Number(martSplit.itemsSubtotal),
+            platformFee: Number(martSplit.platformFee),
+            merchantFee: Number(martSplit.merchantFee),
+            driverCommission: Number(martSplit.driverCommission),
+            breakdown: {
+              itemsSubtotal: Number(martSplit.itemsSubtotal),
+              deliveryFee: Number(martSplit.deliveryFee),
+              shippingFee: Number(martSplit.deliveryFee),
+              merchantFeeRate: martSplit.merchantFeeRate,
+              commissionRate: martSplit.driverCommissionRate,
+            },
+          }
+        : (() => {
+            const split = calculatePaymentSplit(order.price, order.discount, commissionRate);
+            return {
+              orderId: order.id,
+              customerPayment: Number(split.amountToCharge),
+              driverEarning: Number(split.amountToCharge),
+              merchantEarning: 0,
+              platformFee: Number(split.platformFee),
+              merchantFee: 0,
+              driverCommission: Number(split.platformFee),
+              breakdown: {
+                deliveryFee: Number(split.amountToCharge),
+                shippingFee: Number(split.amountToCharge),
+                commissionRate,
+              },
+            };
+          })();
+
+      await this.ledgerService.recordOrderLedger(ledgerBreakdown, { recordOnly: true });
+    } catch (ledgerError: any) {
+      // Settlement sudah committed; jangan rollback/ubah wallet di sini.
+      // Catat durable supaya reconciliation dapat menindaklanjuti ledger yang hilang.
+      try {
+        await AuditLogger.log(
+          adminUserId,
+          'LEDGER_RECORD_FAILED',
+          `Payment proof #${proofId} APPROVED tetapi ledger order #${order.id} gagal dicatat: ${ledgerError?.message || ledgerError}`
+        );
+      } catch {
+        // Logging terakhir tetap best-effort.
+      }
     }
 
     // Realtime: driver, merchant & customer langsung tahu bukti bayar disetujui, tanpa refresh.

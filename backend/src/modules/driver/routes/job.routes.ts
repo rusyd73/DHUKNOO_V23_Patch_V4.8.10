@@ -7,13 +7,15 @@ import {
 import { validateBody } from "../../../core/middleware/validation.middleware";
 import { prisma } from "../../../config/prisma";
 import { AuditLogger } from "../../../core/logging/audit.logger";
+import { AppError } from "../../../core/errors/AppError";
 import { SocketService } from "../../../websocket/socket";
 import { updateOrderStatusSchema } from "../../../core/validation/schemas";
 import { OrderStatus } from "@prisma/client";
 import { TariffEngineService } from "../../tariff/tariff.service";
 import { PaymentService } from "../../payment/payment.service";
 import { DriverEligibilityService } from "../services/driver-eligibility.service";
-import { JobService } from "../services/job.service";  // <-- TAMBAHKAN
+import { JobService } from "../services/job.service";
+import { getOrderNumber } from "../../../core/utils/order-number";  // <-- TAMBAHKAN
 
 const router = Router();
 const paymentService = new PaymentService();
@@ -24,10 +26,12 @@ const jobService = new JobService();  // <-- TAMBAHKAN
 export { router as jobRouter };
 
 const allowedTransitions: Record<OrderStatus, OrderStatus[]> = {
-  PENDING: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
+  PENDING: [],
   ACCEPTED: [OrderStatus.ON_THE_WAY, OrderStatus.CANCELLED],
   ON_THE_WAY: [OrderStatus.ARRIVED, OrderStatus.CANCELLED],
-  ARRIVED: [OrderStatus.COMPLETED],
+  ARRIVED: [OrderStatus.PICKED_UP, OrderStatus.COMPLETED, OrderStatus.CANCELLED],
+  PICKED_UP: [OrderStatus.ARRIVED_CUSTOMER, OrderStatus.CANCELLED],
+  ARRIVED_CUSTOMER: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
   COMPLETED: [],
   CANCELLED: [],
 };
@@ -36,6 +40,8 @@ const ACTIVE_STATUSES: OrderStatus[] = [
   OrderStatus.ACCEPTED,
   OrderStatus.ON_THE_WAY,
   OrderStatus.ARRIVED,
+  OrderStatus.PICKED_UP,
+  OrderStatus.ARRIVED_CUSTOMER,
 ];
 
 // ============================================================
@@ -60,9 +66,26 @@ router.get(
         Number(offset)
       );
 
-      return res.status(200).json({
+      // V4: response contract dibuat eksplisit agar dashboard driver tidak
+      // perlu menebak apakah active trip berada di data.jobs atau field lain.
+      // Normalisasi dilakukan rekursif untuk BigInt/Decimal tanpa JSON.parse
+      // + JSON.stringify yang dapat merusak tipe/menimbulkan error lanjutan.
+      const jsonSafe = (value: any): any => {
+        if (typeof value === 'bigint') return Number(value);
+        if (value && typeof value === 'object') {
+          if (typeof value.toNumber === 'function') return value.toNumber();
+          if (Array.isArray(value)) return value.map(jsonSafe);
+          return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jsonSafe(item)]));
+        }
+        return value;
+      };
+
+      return res.status(200).json(jsonSafe({
         success: true,
         data: result.jobs,
+        jobs: result.jobs,
+        activeJobs: result.activeJobs,
+        activeJob: result.activeJobs[0] ?? null,
         pagination: {
           total: result.total,
           limit: Number(limit),
@@ -73,14 +96,16 @@ router.get(
           minimumDeposit: result.minimumDeposit,
           balance: result.balance,
         },
-      });
+      }));
     } catch (err: any) {
-      console.error('[GET /jobs] Error:', err);
-      const status = err.message?.includes('not found') ? 404 :
-                     err.message?.includes('not active') ? 403 :
-                     err.message?.includes('offline') ? 403 :
-                     err.message?.includes('tidak mencukupi') ? 403 : 500;
-      return res.status(status).json({ error: err.message || 'Internal Server Error' });
+      // 🆕 FIX P0 "correlation/request ID dan logging terstruktur"
+      // (audit driver-jobs): route ini menangani errornya sendiri
+      // (tidak lewat next(err)/errorHandler global), jadi requestId
+      // disertakan manual di sini juga -- lihat requestId.middleware.ts.
+      (req.log || console).error({ err, requestId: req.requestId }, '[GET /jobs] Error:');
+      const status = err instanceof AppError ? err.statusCode : 500;
+      const code = err instanceof AppError ? err.code : undefined;
+      return res.status(status).json({ error: err.message || 'Internal Server Error', code, requestId: req.requestId });
     }
   }
 );
@@ -238,17 +263,34 @@ router.post(
       try {
         SocketService.emitToOrder(updatedOrder.id, "order_status_changed", {
           orderId: updatedOrder.id,
+          orderNumber: getOrderNumber(updatedOrder.id),
           status: updatedOrder.status,
           driverId: driverProfile.id,
         });
         SocketService.emitToUser(updatedOrder.customer.userId, "order_accepted", {
           orderId: updatedOrder.id,
+          orderNumber: getOrderNumber(updatedOrder.id),
           driverId: driverProfile.id,
           driver: {
             fullName: (updatedOrder as any).driver?.user?.fullName,
             vehicleModel: (updatedOrder as any).driver?.vehicleModel,
             vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
           },
+        });
+        if (updatedOrder.serviceType === 'MART') {
+          SocketService.emitToUser(updatedOrder.customer.userId, "mart_driver_heading_to_merchant", {
+            orderId: updatedOrder.id,
+            orderNumber: getOrderNumber(updatedOrder.id),
+            status: updatedOrder.status,
+            serviceType: updatedOrder.serviceType,
+            message: "Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.",
+          });
+        }
+        // P0: manual accept also refreshes the accepting driver's dashboard.
+        SocketService.emitToUser(userId, "order_accepted", {
+          orderId: updatedOrder.id,
+          orderNumber: getOrderNumber(updatedOrder.id),
+          driverId: driverProfile.id,
         });
         SocketService.emitToDriversPool("order_taken", { orderId: updatedOrder.id });
         SocketService.emitToAdmins("order_accepted", { orderId: updatedOrder.id });
@@ -327,6 +369,27 @@ router.post(
         });
       }
 
+      // MART mempunyai dua titik ARRIVED yang berbeda: merchant lalu customer.
+      // Setelah tiba di merchant, driver WAJIB melakukan pickup sebelum boleh
+      // menuju customer; order MART tidak boleh langsung COMPLETED dari ARRIVED.
+      if (order.serviceType === 'MART') {
+        const martAllowed: Record<OrderStatus, OrderStatus[]> = {
+          PENDING: [],
+          ACCEPTED: [OrderStatus.ON_THE_WAY, OrderStatus.CANCELLED],
+          ON_THE_WAY: [OrderStatus.ARRIVED, OrderStatus.CANCELLED],
+          ARRIVED: [OrderStatus.PICKED_UP, OrderStatus.CANCELLED],
+          PICKED_UP: [OrderStatus.ARRIVED_CUSTOMER, OrderStatus.CANCELLED],
+          ARRIVED_CUSTOMER: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
+          COMPLETED: [],
+          CANCELLED: [],
+        };
+        if (!(martAllowed[order.status] ?? []).includes(status)) {
+          return res.status(400).json({
+            error: `Lifecycle MART: status ${order.status} tidak boleh diubah menjadi ${status}.`,
+          });
+        }
+      }
+
       const updatedOrder = await prisma.$transaction(async (tx) => {
         const result = await tx.order.updateMany({
           where: { id: orderId, status: order.status },
@@ -360,14 +423,40 @@ router.post(
         const recipients = [order.customer.userId, userId];
         SocketService.emitToOrder(orderId, "order_status_changed", {
           orderId: updatedOrder.id,
+          orderNumber: getOrderNumber(updatedOrder.id),
           status: updatedOrder.status,
         });
         recipients.forEach((uid) =>
           SocketService.emitToUser(uid, "order_status_changed", {
             orderId: updatedOrder.id,
+            orderNumber: getOrderNumber(updatedOrder.id),
             status: updatedOrder.status,
           })
         );
+        if (updatedOrder.serviceType === 'MART' && status === OrderStatus.ON_THE_WAY) {
+          SocketService.emitToUser(order.customer.userId, "mart_driver_heading_to_merchant", {
+            orderId: updatedOrder.id, orderNumber: getOrderNumber(updatedOrder.id), status: updatedOrder.status, serviceType: updatedOrder.serviceType,
+            message: "Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.",
+          });
+        }
+        if (updatedOrder.serviceType === 'MART' && status === OrderStatus.ARRIVED) {
+          SocketService.emitToUser(order.customer.userId, "mart_driver_arrived_at_merchant", {
+            orderId: updatedOrder.id, orderNumber: getOrderNumber(updatedOrder.id), status: updatedOrder.status, serviceType: updatedOrder.serviceType,
+            message: "Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.",
+          });
+        }
+        if (updatedOrder.serviceType === 'MART' && status === OrderStatus.PICKED_UP) {
+          SocketService.emitToUser(order.customer.userId, "mart_driver_heading_to_customer", {
+            orderId: updatedOrder.id, orderNumber: getOrderNumber(updatedOrder.id), status: updatedOrder.status, serviceType: updatedOrder.serviceType,
+            message: "Pesanan sudah diambil driver dan sedang menuju lokasi Anda.",
+          });
+        }
+        if (updatedOrder.serviceType === 'MART' && status === OrderStatus.ARRIVED_CUSTOMER) {
+          SocketService.emitToUser(order.customer.userId, "mart_driver_arrived_at_customer", {
+            orderId: updatedOrder.id, orderNumber: getOrderNumber(updatedOrder.id), status: updatedOrder.status, serviceType: updatedOrder.serviceType,
+            message: "Driver telah tiba di lokasi Anda.",
+          });
+        }
         if (status === OrderStatus.COMPLETED) {
           SocketService.emitToOrder(orderId, "order_completed", { orderId });
           recipients.forEach((uid) => SocketService.emitToUser(uid, "order_completed", { orderId }));
@@ -376,7 +465,7 @@ router.post(
           SocketService.emitToOrder(orderId, "order_cancelled", { orderId });
           recipients.forEach((uid) => SocketService.emitToUser(uid, "order_cancelled", { orderId }));
         }
-        SocketService.emitToAdmins("order_status_changed", { orderId, status });
+        SocketService.emitToAdmins("order_status_changed", { orderId, orderNumber: getOrderNumber(orderId), status });
       } catch {
         // Socket.IO belum siap
       }
@@ -390,7 +479,41 @@ router.post(
           const refreshed = await prisma.order.findUnique({ where: { id: orderId } });
           if (refreshed) finalOrder = refreshed;
         } catch (err: any) {
+          // 🆕 FIX P0 "Financial State Machine" (audit a1.4 & audit
+          // driver-jobs): route ini adalah JALUR KEDUA yang memicu
+          // auto-debit saat order COMPLETED (terpisah dari
+          // OrderService.updateStatus() yang sudah lebih dulu diperbaiki
+          // -- lihat komentar lengkap di sana) -- SEBELUMNYA jalur ini
+          // TERLEWAT dari fix yang sama: kegagalan auto-debit di sini
+          // HANYA memicu event Socket.IO sesaat, TANPA settlementStatus
+          // eksplisit, TANPA AuditLogger durable, TANPA alert admin.
+          // Order yang COMPLETED lewat endpoint driver INI (bukan lewat
+          // OrderService) bisa diam-diam menggantung tanpa jejak apa
+          // pun kalau customer sedang offline saat itu terjadi.
+          //
+          // Disamakan sekarang dengan pola di OrderService.updateStatus():
+          // settlementStatus -> RETRY_REQUIRED (durable, muncul di
+          // ReconciliationService.listPendingReconciliation()), dicatat
+          // AuditLogger, dan alert real-time ke admin.
           autoDebitFailed = true;
+          try {
+            await prisma.order.update({
+              where: { id: orderId },
+              data: { settlementStatus: 'RETRY_REQUIRED' },
+            });
+            await AuditLogger.log(
+              order.customer.userId,
+              'PAYMENT_SETTLEMENT_FAILED',
+              `Order #${orderId} COMPLETED (lewat driver job status) tapi auto-debit wallet gagal: ${err?.message || err}. settlementStatus=RETRY_REQUIRED, PERLU DIRETRY (lihat ReconciliationService).`
+            );
+            SocketService.emitToAdmins('payment_settlement_failed', {
+              orderId,
+              error: err?.message || String(err),
+            });
+          } catch (recordError) {
+            console.error(`[SETTLEMENT] Gagal mencatat RETRY_REQUIRED untuk order ${orderId}:`, recordError);
+          }
+
           try {
             SocketService.emitToUser(order.customer.userId, 'auto_debit_failed', {
               orderId,

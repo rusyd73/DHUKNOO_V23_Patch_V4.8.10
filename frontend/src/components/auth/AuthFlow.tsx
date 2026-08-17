@@ -29,7 +29,19 @@ export default function AuthFlow({ role, onBack, onSuccess, triggerToast }: Auth
   const [driverVehicleType, setDriverVehicleType] = useState<'BIKE' | 'CAR'>('BIKE');
   const [vehicleModel, setVehicleModel] = useState('');
   const [vehiclePlate, setVehiclePlate] = useState('');
-  const [adminPasskey, setAdminPasskey] = useState('');
+  // 🆕 FIX P0 "Admin passkey di frontend bundle" (audit): sebelumnya ada
+  // secret hardcoded ('DHUKNOO_SECRET_2026') langsung di source ini yang
+  // otomatis ikut ter-bundle ke JS yang dikirim ke browser SIAPA SAJA --
+  // gampang ditemukan lewat DevTools/view-source, bukan proteksi sama
+  // sekali. Provisioning ADMIN sekarang murni server-side: akun admin
+  // pertama dibuat lewat seed database, dan admin baru berikutnya HANYA
+  // bisa dibuat oleh admin yang SUDAH LOGIN lewat POST
+  // /api/admin/create-admin (dilindungi authenticateToken +
+  // authorizeRoles('ADMIN') di backend) -- bukan lewat form publik ini.
+  // Backend registerSchema juga sudah menolak role:"ADMIN" di endpoint
+  // /api/auth/register (lihat core/validation/schemas.ts), jadi gate
+  // client-side ini tidak pernah benar-benar melindungi apa pun, cuma
+  // membocorkan secret.
   const [loading, setLoading] = useState(false);
 
   // Time limit login session (60 detik)
@@ -96,31 +108,37 @@ export default function AuthFlow({ role, onBack, onSuccess, triggerToast }: Auth
           payload.vehiclePlate = vehiclePlate ? vehiclePlate.trim() : 'N 4321 OB';
           payload.driverServiceType = driverVehicleType;
         } else if (role === 'ADMIN') {
-          if (adminPasskey !== 'DHUKNOO_SECRET_2026') {
-            triggerToast('Kunci otorisasi pendaftaran admin salah!');
-            setLoading(false);
-            return;
-          }
+          // Pendaftaran admin publik tidak pernah didukung backend (lihat
+          // catatan di atas) -- tolak di sini juga supaya pesannya jelas,
+          // bukan cuma gagal 400 generik dari server.
+          triggerToast('Akun ADMIN tidak dapat didaftarkan lewat form ini. Hubungi admin yang sudah aktif.');
+          setLoading(false);
+          return;
         }
 
         await AuthAPI.register(payload);
         triggerToast('Pendaftaran sukses! Silakan login.');
         setIsRegisterMode(false);
       } else {
-        if (role === 'ADMIN' && adminPasskey !== 'DHUKNOO_SECRET_2026') {
-          triggerToast('Kunci otorisasi masuk admin salah!');
-          setLoading(false);
-          return;
-        }
-
+        // 🆕 FIX P0 KONTRAK AUTH: backend membungkus hasil login di
+        // { success, message, data: { accessToken, refreshToken, user } }
+        // (lihat backend/src/modules/auth/auth.controller.ts + konvensi
+        // ApiResponse<T> yang sama dipakai modul lain, contoh
+        // api/response.helper.ts extractData()). Sebelumnya kode ini
+        // membaca response.user / response.accessToken di LEVEL TERATAS
+        // -- selalu undefined, bikin `response.user.role` throw
+        // TypeError setiap login berhasil sekalipun. Sekarang unwrap
+        // lewat response.data sesuai kontrak final yang sama dipakai di
+        // seluruh app.
         const response = await AuthAPI.login({ email, password });
-        if (response.user.role !== role) {
-          triggerToast(`Gagal: Akun terdaftar sebagai ${response.user.role}, bukan ${role}!`);
+        const { accessToken, refreshToken, user } = response.data;
+        if (user.role !== role) {
+          triggerToast(`Gagal: Akun terdaftar sebagai ${user.role}, bukan ${role}!`);
           setLoading(false);
           return;
         }
-        triggerToast(`Selamat datang kembali, ${response.user.fullName}!`);
-        onSuccess(response.user, response.accessToken, response.refreshToken);
+        triggerToast(`Selamat datang kembali, ${user.fullName}!`);
+        onSuccess(user, accessToken, refreshToken);
       }
     } catch (err: any) {
       triggerToast(err.response?.data?.error || 'Terjadi kesalahan sistem.');
@@ -352,18 +370,11 @@ export default function AuthFlow({ role, onBack, onSuccess, triggerToast }: Auth
           </>
         )}
 
-        {role === 'ADMIN' && (
+        {role === 'ADMIN' && isRegisterMode && (
           <div className="flex flex-col gap-1">
-            <label className="text-xs font-bold text-[#A5C9B8] text-red-400">Passkey Keamanan Admin</label>
-            <input 
-              type="password" 
-              required
-              value={adminPasskey}
-              onChange={(e) => setAdminPasskey(e.target.value)}
-              placeholder="Masukkan kode otorisasi internal..." 
-              className="bg-[#06170E] border border-[#23583E] text-white rounded-xl px-4 py-2.5 text-xs focus:outline-none focus:border-red-500"
-            />
-            {isRegisterMode && <span className="text-[10px] text-red-300">Gunakan: DHUKNOO_SECRET_2026</span>}
+            <span className="text-[10px] text-red-300">
+              Akun ADMIN tidak bisa didaftarkan sendiri di sini. Minta admin yang sudah aktif untuk membuatkan akun Anda.
+            </span>
           </div>
         )}
 

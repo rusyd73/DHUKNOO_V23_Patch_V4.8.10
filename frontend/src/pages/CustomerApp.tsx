@@ -121,10 +121,11 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
     mutationFn: (payload: any) => CustomerAPI.createOrder(payload),
     onSuccess: (res: any) => {
       const finalFare = res?.breakdown?.finalFare;
+      const orderNumber = res?.order?.orderNumber || (res?.order?.id ? `DHN-${String(res.order.id).replace(/-/g, '').slice(0, 8).toUpperCase()}` : '');
       triggerToast(
         finalFare !== undefined
-          ? `Order dipublikasikan! Tarif final (Tariff Engine): ${formatRupiah(finalFare)}`
-          : res.message || 'Order ojek berhasil dipublikasikan!'
+          ? `Order ${orderNumber} dipublikasikan! Tarif final: ${formatRupiah(finalFare)}`
+          : `${orderNumber ? `Order ${orderNumber}` : 'Order'} berhasil dipublikasikan!`
       );
       // Auto clear pencarian alamat setelah sukses membuat order
       setPickup('');
@@ -218,11 +219,50 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   // berhasil dibuat), sehingga kotak pencariannya benar-benar ikut bersih.
   const [routeResetKey, setRouteResetKey] = useState(0);
   const [driverCoords, setDriverCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [martPickupNotice, setMartPickupNotice] = useState<{ kind: 'heading' | 'arrived' | 'headingCustomer' | 'arrivedCustomer'; orderNumber?: string; message: string } | null>(null);
 
   // Active order detection
   const activeOrder = ordersData?.orders?.find(
-    (o: any) => ['PENDING', 'ACCEPTED', 'ON_THE_WAY', 'ARRIVED'].includes(o.status)
+    (o: any) => ['PENDING', 'ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(o.status)
   );
+
+  // Durable UI fallback: if the customer opens/reloads the dashboard after
+  // the realtime event was emitted, reconstruct the MART pickup notification
+  // from the authoritative order status instead of relying on Socket.IO only.
+  useEffect(() => {
+    if (!activeOrder || activeOrder.serviceType !== 'MART') {
+      setMartPickupNotice(null);
+      return;
+    }
+    const orderNumber = activeOrder.orderNumber || `DHN-${String(activeOrder.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+    if (activeOrder.status === 'ACCEPTED' || activeOrder.status === 'ON_THE_WAY') {
+      setMartPickupNotice({
+        kind: 'heading',
+        orderNumber,
+        message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+      });
+    } else if (activeOrder.status === 'ARRIVED') {
+      setMartPickupNotice({
+        kind: 'arrived',
+        orderNumber,
+        message: 'Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.',
+      });
+    } else if (activeOrder.status === 'PICKED_UP') {
+      setMartPickupNotice({
+        kind: 'headingCustomer',
+        orderNumber,
+        message: 'Pesanan sudah diambil driver dan sedang menuju lokasi Anda.',
+      });
+    } else if (activeOrder.status === 'ARRIVED_CUSTOMER') {
+      setMartPickupNotice({
+        kind: 'arrivedCustomer',
+        orderNumber,
+        message: 'Driver telah tiba di lokasi Anda.',
+      });
+    } else if (activeOrder.status === 'PENDING') {
+      setMartPickupNotice(null);
+    }
+  }, [activeOrder?.id, activeOrder?.status, activeOrder?.serviceType, activeOrder?.orderNumber]);
 
   // Join active order socket room
   useEffect(() => {
@@ -256,9 +296,49 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
       // ter-load, jadi tetap ada fallback pesan generik.
       triggerToast(
         data?.driver?.fullName
-          ? `🎉 Orderan DITERIMA oleh ${data.driver.fullName}! (${data.driver.vehiclePlate || 'Mitra Driver'})`
-          : '🎉 Orderan Anda telah diterima oleh Mitra Driver!'
+          ? `🎉 ${data.orderNumber ? `Order ${data.orderNumber}` : 'Orderan'} DITERIMA oleh ${data.driver.fullName}! (${data.driver.vehiclePlate || 'Mitra Driver'})`
+          : `🎉 ${data.orderNumber ? `Order ${data.orderNumber}` : 'Orderan Anda'} telah diterima oleh Mitra Driver!`
       );
+    };
+
+    const handleMartDriverHeading = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'heading',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+      });
+      triggerToast(`🏪 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver menuju merchant.`);
+    };
+
+    const handleMartDriverArrived = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'arrived',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.',
+      });
+      triggerToast(`📍 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver telah tiba di merchant.`);
+    };
+
+    const handleMartDriverHeadingCustomer = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'headingCustomer',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Pesanan sudah diambil driver dan sedang menuju lokasi Anda.',
+      });
+      triggerToast(`🚚 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver menuju customer.`);
+    };
+
+    const handleMartDriverArrivedCustomer = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'arrivedCustomer',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver telah tiba di lokasi Anda.',
+      });
+      triggerToast(`📍 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver telah tiba di customer.`);
     };
 
     const handleOrderStatusChanged = (data: any) => {
@@ -267,6 +347,10 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
       if (data?.status) {
         const statusMap: Record<string, string> = {
           ACCEPTED: 'Driver menerima pesanan',
+          ON_THE_WAY: 'Driver sedang menuju merchant/customer',
+          ARRIVED: 'Driver telah tiba di merchant',
+          PICKED_UP: 'Pesanan diambil, driver menuju customer',
+          ARRIVED_CUSTOMER: 'Driver telah tiba di customer',
           ARRIVED_PICKUP: 'Driver telah Tiba di Lokasi Penjemputan',
           IN_PROGRESS: 'Dalam perjalanan menuju Lokasi Tujuan',
           COMPLETED: 'Perjalanan Selesai. Terima kasih!',
@@ -278,11 +362,19 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
 
     socket.on('location_changed', handleLocationChanged);
     socket.on('order_accepted', handleOrderAccepted);
+    socket.on('mart_driver_heading_to_merchant', handleMartDriverHeading);
+    socket.on('mart_driver_arrived_at_merchant', handleMartDriverArrived);
+    socket.on('mart_driver_heading_to_customer', handleMartDriverHeadingCustomer);
+    socket.on('mart_driver_arrived_at_customer', handleMartDriverArrivedCustomer);
     socket.on('order_status_changed', handleOrderStatusChanged);
 
     return () => {
       socket.off('location_changed', handleLocationChanged);
       socket.off('order_accepted', handleOrderAccepted);
+      socket.off('mart_driver_heading_to_merchant', handleMartDriverHeading);
+      socket.off('mart_driver_arrived_at_merchant', handleMartDriverArrived);
+      socket.off('mart_driver_heading_to_customer', handleMartDriverHeadingCustomer);
+      socket.off('mart_driver_arrived_at_customer', handleMartDriverArrivedCustomer);
       socket.off('order_status_changed', handleOrderStatusChanged);
     };
   }, [queryClient, triggerToast]);
@@ -492,6 +584,9 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 <span className="text-xs font-black text-[#00E575] uppercase tracking-wider flex items-center gap-1.5 animate-pulse">
                   {activeOrder.serviceType === 'MART' ? '🏪 Pesanan Belanja Sedang Diproses' : '🏍️ Perjalanan Aktif Sedang Berlangsung'}
                 </span>
+                <span className="text-[11px] bg-[#06170E] border border-[#FFD700]/40 text-[#FFD700] px-2.5 py-1 rounded-lg font-black">
+                  {activeOrder.orderNumber || `DHN-${String(activeOrder.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`}
+                </span>
                 <span className="text-[10px] bg-[#00E575]/20 text-[#00E575] px-2.5 py-0.5 rounded font-bold uppercase">
                   Status: {activeOrder.status}
                 </span>
@@ -511,6 +606,17 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {activeOrder.serviceType === 'MART' && martPickupNotice && (
+                <div className={`p-4 rounded-2xl border ${martPickupNotice.kind === 'arrived' || martPickupNotice.kind === 'arrivedCustomer' ? 'border-[#00E575] bg-[#00E575]/10' : 'border-cyan-400/60 bg-cyan-400/10'}`}>
+                  <div className="flex items-center gap-2 text-xs font-black uppercase tracking-wide">
+                    <span>{martPickupNotice.kind === 'arrived' || martPickupNotice.kind === 'arrivedCustomer' ? '📍' : '🏍️'}</span>
+                    <span>{martPickupNotice.kind === 'arrived' ? 'Driver Tiba di Merchant' : martPickupNotice.kind === 'headingCustomer' ? 'Driver Menuju Customer' : martPickupNotice.kind === 'arrivedCustomer' ? 'Driver Tiba di Customer' : 'Driver Menuju Merchant'}</span>
+                    {martPickupNotice.orderNumber && <span className="ml-auto text-[#FFD700]">{martPickupNotice.orderNumber}</span>}
+                  </div>
+                  <p className="text-[11px] text-[#D6F5E6] mt-2">{martPickupNotice.message}</p>
                 </div>
               )}
 
@@ -919,7 +1025,7 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 {ordersData.orders.map((o: any) => (
                   <div key={o.id} className="bg-[#06170E] border border-[#23583E] p-3.5 rounded-xl flex flex-col gap-2">
                     <div className="flex justify-between items-center text-[10px]">
-                      <span className="font-bold text-[#FFD700]">{o.serviceType} / ID: {o.id.substring(0, 8)}</span>
+                      <span className="font-bold text-[#FFD700]">{o.serviceType} / {o.orderNumber || `DHN-${String(o.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`}</span>
                       <span className={`px-2 py-0.5 rounded font-black ${
                         o.status === 'COMPLETED' ? 'bg-[#00E575]/20 text-[#00E575]' :
                         o.status === 'PENDING' ? 'bg-amber-500/20 text-amber-500 animate-pulse' :

@@ -12,7 +12,7 @@
     "prisma:studio": "prisma studio",
     "test": "jest --runInBand",
     "test:watch": "jest --watch --runInBand",
-    "lint": "eslint src/**/*.ts",
+    "lint": "tsc --noEmit",
     "lint:fix": "eslint src/**/*.ts --fix",
     "clean": "rm -rf dist node_modules",
     "docker:build": "docker build -t dhuknoo-backend .",

@@ -23,6 +23,18 @@ const storage = multer.diskStorage({
 });
 
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+// 🆕 FIX P1 "Upload security": ekstensi file HARUS konsisten dengan
+// mimetype yang diklaim -- mencegah file bernama "shell.php.jpg" (atau
+// bahkan "shell.php" dengan mimetype dipalsukan jadi image/jpeg) lolos
+// hanya berdasarkan header Content-Type. Ini validasi TAMBAHAN di sisi
+// nama file; validasi UTAMA (isi file sungguhan lewat magic bytes) ada
+// di upload.routes.ts SETELAH file tersimpan -- lihat
+// shared/security/fileSignature.ts.
+const ALLOWED_EXTENSIONS: Record<string, string[]> = {
+  'image/jpeg': ['.jpg', '.jpeg'],
+  'image/png': ['.png'],
+  'image/webp': ['.webp'],
+};
 
 export const uploadImage = multer({
   storage,
@@ -30,6 +42,11 @@ export const uploadImage = multer({
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
       return cb(new Error('Hanya file gambar (JPEG/PNG/WebP) yang diizinkan!'));
+    }
+    const ext = path.extname(file.originalname).toLowerCase();
+    const allowedExts = ALLOWED_MIME_TYPES.includes(file.mimetype) ? ALLOWED_EXTENSIONS[file.mimetype] : [];
+    if (!allowedExts || !allowedExts.includes(ext)) {
+      return cb(new Error('Ekstensi file tidak sesuai dengan jenis gambar yang diklaim!'));
     }
     cb(null, true);
   },

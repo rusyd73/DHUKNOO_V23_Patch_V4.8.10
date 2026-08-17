@@ -90,35 +90,59 @@ export class MerchantService {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(ownerPassword, salt);
 
-    // 3. Buat user dengan role MERCHANT (✅ TANPA CustomerProfile)
-    const user = await prisma.user.create({
-      data: {
-        email: ownerEmail,
-        passwordHash,
-        fullName: ownerFullName,
-        role: 'MERCHANT',
-        // ✅ TIDAK ADA customerProfile
-      },
-    });
+    // 🆕 FIX P1 "Merchant registration harus atomic" (audit): SEBELUMNYA
+    // User, Wallet, dan Merchant dibuat lewat TIGA panggilan prisma
+    // TERPISAH (masing-masing auto-commit sendiri) -- kalau langkah
+    // ke-3 (createMerchant, mis. gagal karena constraint/validasi toko)
+    // gagal SETELAH User & Wallet sudah terlanjur dibuat, hasilnya
+    // ORPHAN RECORD: User dengan role MERCHANT tanpa profil Merchant
+    // sama sekali (tidak bisa dipakai untuk apa pun -- tidak ada toko
+    // untuk dikelola), Wallet menggantung tanpa pemilik yang benar-benar
+    // aktif, DAN email ownerEmail sudah "terpakai" permanen sehingga
+    // user tidak bisa mendaftar ulang dari awal untuk memperbaikinya
+    // sendiri -- perlu intervensi manual admin ke database.
+    //
+    // Sekarang ketiganya dibungkus SATU prisma.$transaction -- kalau
+    // langkah manapun gagal, SEMUANYA rollback bersamaan, tidak ada
+    // lagi User/Wallet yang "berhasil" dibuat tanpa Merchant yang
+    // menyertainya.
+    const { user, merchant } = await prisma.$transaction(async (tx) => {
+      // 3. Buat user dengan role MERCHANT (✅ TANPA CustomerProfile)
+      const user = await tx.user.create({
+        data: {
+          email: ownerEmail,
+          passwordHash,
+          fullName: ownerFullName,
+          role: 'MERCHANT',
+          // ✅ TIDAK ADA customerProfile
+        },
+      });
 
-    // 4. Buat wallet untuk merchant
-    await prisma.wallet.create({
-      data: {
-        userId: user.id,
-        balance: 0,
-      },
-    });
+      // 4. Buat wallet untuk merchant
+      await tx.wallet.create({
+        data: {
+          userId: user.id,
+          balance: 0,
+        },
+      });
 
-    // 5. Buat merchant via repository
-    const merchant = await this.merchantRepo.createMerchant({
-      name,
-      category,
-      address,
-      latitude,
-      longitude,
-      phone,
-      isOpen,
-      ownerId: user.id,
+      // 5. Buat merchant via repository (dalam transaksi yang sama --
+      // lihat parameter `tx` baru di MerchantRepository.createMerchant()).
+      const merchant = await this.merchantRepo.createMerchant(
+        {
+          name,
+          category,
+          address,
+          latitude,
+          longitude,
+          phone,
+          isOpen,
+          ownerId: user.id,
+        },
+        tx
+      );
+
+      return { user, merchant };
     });
 
     // 6. Audit log
@@ -346,6 +370,12 @@ export class MerchantService {
 
     if (merchant.ownerId !== ownerId) {
       throw new ForbiddenError('Anda tidak berhak mengubah merchant ini!');
+    }
+
+    // Lokasi merchant adalah master pickup point dan hanya ditetapkan saat
+    // registrasi/initial setup. Dashboard merchant tidak boleh memindahkannya.
+    if (input.latitude !== undefined || input.longitude !== undefined || input.address !== undefined) {
+      throw new AppError('Alamat dan lokasi merchant dikunci setelah registrasi dan tidak dapat diubah dari dashboard.', 409);
     }
 
     // 2. Update via repository

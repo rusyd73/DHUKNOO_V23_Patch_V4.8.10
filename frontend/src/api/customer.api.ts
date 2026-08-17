@@ -6,7 +6,7 @@ export const CustomerAPI = {
     (await api.get(API_ENDPOINTS.customer.profile)).data,
 
   createOrder: async (payload: any) =>
-    (await api.post(API_ENDPOINTS.customer.orders, payload)).data,
+    (await api.post(API_ENDPOINTS.order.create, payload)).data,
 
   getOrders: async () =>
     (await api.get(API_ENDPOINTS.customer.orders)).data,

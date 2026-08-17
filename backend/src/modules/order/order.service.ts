@@ -1,4 +1,4 @@
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, Prisma } from '@prisma/client';
 import { OrderRepository } from './order.repository';
 import { PromoService } from '../promo/promo.service';
 import { TariffEngineService } from '../tariff/tariff.service';
@@ -13,9 +13,10 @@ import { PaymentService } from '../payment/payment.service';
 import { logger } from '../../config/logger';
 import { DriverEligibilityService } from '../driver/services/driver-eligibility.service';
 import { LedgerService } from '../ledger/ledger.service';
+import { getOrderNumber } from '../../core/utils/order-number';
 
 interface CreateOrderInput {
-  serviceType: 'BIKE' | 'CAR' | 'SEND';
+  serviceType: 'BIKE' | 'CAR' | 'SEND' | 'MART';
   distanceKm: number;
   pickupAddress: string;
   pickupLat: number;
@@ -49,6 +50,8 @@ const ALLOWED_DRIVER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   ACCEPTED: [OrderStatus.ON_THE_WAY],
   ON_THE_WAY: [OrderStatus.ARRIVED],
   ARRIVED: [OrderStatus.COMPLETED],
+  PICKED_UP: [],
+  ARRIVED_CUSTOMER: [],
   COMPLETED: [],
   CANCELLED: [],
 };
@@ -234,7 +237,7 @@ export class OrderService {
     const existingActiveOrder = await prisma.order.findFirst({
       where: {
         customerId: customerProfile.id,
-        status: { in: [OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED] },
+        status: { in: [OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED, OrderStatus.PICKED_UP, OrderStatus.ARRIVED_CUSTOMER] },
       },
       select: { id: true, status: true },
     });
@@ -390,14 +393,14 @@ export class OrderService {
 
     let dispatch;
     try {
-      SocketService.emitToDriversPool('new_order_available', {
-        orderId: order.id,
-        serviceType: order.serviceType,
-        pickupAddress: order.pickupAddress,
-        dropoffAddress: order.dropoffAddress,
-        price: order.price,
-      });
-      SocketService.emitToAdmins('order_created', { orderId: order.id, serviceType: order.serviceType });
+      // P0 DISPATCH CONTRACT: jangan broadcast `new_order_available` ke
+      // drivers_pool. Offer yang actionable HARUS hanya dikirim oleh
+      // DispatchService ke driver kandidat yang benar-benar eligible.
+      // Broadcast pool sebelumnya membuat semua driver membunyikan ring,
+      // termasuk driver yang tidak eligible, sementara UI belum memiliki
+      // offer yang bisa diterima. Ini yang membuat pengalaman ride terlihat
+      // seperti "hanya ring loop".
+      SocketService.emitToAdmins('order_created', { orderId: order.id, orderNumber: getOrderNumber(order.id), serviceType: order.serviceType });
 
       const autoAccepted = await this.tryAutoAcceptOnCreation(order.id, order.serviceType);
 
@@ -407,11 +410,49 @@ export class OrderService {
         dispatch = { status: 'AUTO_ACCEPTED' as const };
       }
     } catch (err: any) {
+      // 🆕 FIX P0 "Redis/Dispatch policy production yang jelas" (audit):
+      // SEBELUMNYA kegagalan dispatch (termasuk Redis fail-closed --
+      // lihat dispatch.redis.ts getRedisOrThrow()) HANYA di-logger.error()
+      // -- order tetap dibuat dan dikembalikan SUKSES (201) ke customer
+      // seolah semuanya normal, TANPA jejak durable, TANPA alert admin,
+      // TANPA mekanisme retry apa pun. Order ini akan diam-diam STUCK di
+      // status PENDING TANPA PERNAH ditawarkan ke driver manapun --
+      // "ilusi dispatch sehat" persis yang diperingatkan audit P0 #9,
+      // sekarang makin mungkin terjadi karena Redis yang tidak
+      // ready/terputus sekarang GAGAL EKSPLISIT (bukan diam-diam pakai
+      // fallback yang salah secara semantik).
+      //
+      // Sekarang kegagalan dicatat DURABLE (AuditLogger.log -> tabel
+      // ActivityLog, bisa di-query admin kapan saja) dengan action
+      // khusus 'DISPATCH_FAILED', DAN dikirim alert real-time ke admin
+      // yang online lewat Socket.IO -- pola yang sama persis dengan
+      // 'LEDGER_RECORD_FAILED' di updateStatus() untuk kegagalan ledger.
+      // Order TETAP dibuat (membatalkan order karena dispatch gagal
+      // bukan solusi yang benar -- customer bisa retry manual/order-nya
+      // masih valid), tapi sekarang ada jejak yang bisa ditindaklanjuti
+      // admin, bukan cuma baris log yang gampang hilang.
       logger.error(`[AUTO-ACCEPT/DISPATCH] Gagal memproses order ${order.id}: ${err?.message || err}`);
       dispatch = null;
+      try {
+        await AuditLogger.log(
+          userId,
+          'DISPATCH_FAILED',
+          `Order #${order.id} (${order.serviceType}) dibuat tapi gagal di-dispatch: ${err?.message || err}. PERLU DITINJAU MANUAL (order mungkin stuck tanpa driver).`
+        );
+        SocketService.emitToAdmins('dispatch_failed', {
+          orderId: order.id,
+          orderNumber: getOrderNumber(order.id),
+          serviceType: order.serviceType,
+          error: err?.message || String(err),
+        });
+      } catch {
+        // Kalaupun pencatatan durable/alert-nya sendiri gagal, jangan
+        // sampai menjatuhkan alur pembuatan order -- logger.error di
+        // atas sudah jadi jaring pengaman terakhir.
+      }
     }
 
-    return { order, breakdown: finalBreakdown, dispatch };
+    return { order: { ...order, orderNumber: getOrderNumber(order.id) }, breakdown: finalBreakdown, dispatch };
   }
 
   // ============================================================
@@ -430,7 +471,7 @@ export class OrderService {
     const existingActiveOrder = await prisma.order.findFirst({
       where: {
         customerId: customerProfile.id,
-        status: { in: [OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED] },
+        status: { in: [OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED, OrderStatus.PICKED_UP, OrderStatus.ARRIVED_CUSTOMER] },
       },
       select: { id: true, status: true },
     });
@@ -605,17 +646,14 @@ export class OrderService {
 
     let dispatch;
     try {
-      SocketService.emitToDriversPool('new_order_available', {
-        orderId: order.id,
-        serviceType: order.serviceType,
-        pickupAddress: order.pickupAddress,
-        dropoffAddress: order.dropoffAddress,
-        price: order.price,
-      });
-      SocketService.emitToAdmins('order_created', { orderId: order.id, serviceType: order.serviceType });
+      // P0 DISPATCH CONTRACT: actionable offer dikirim hanya oleh
+      // DispatchService kepada kandidat driver yang eligible. Jangan
+      // broadcast ke drivers_pool karena itu memicu ring untuk semua driver.
+      SocketService.emitToAdmins('order_created', { orderId: order.id, orderNumber: getOrderNumber(order.id), serviceType: order.serviceType });
       if (merchant.ownerId) {
         SocketService.emitToUser(merchant.ownerId, 'merchant_new_order', {
           orderId: order.id,
+          orderNumber: getOrderNumber(order.id),
           itemCount: orderItemsData.length,
           total: totalPayable,
         });
@@ -628,11 +666,29 @@ export class OrderService {
         dispatch = { status: 'AUTO_ACCEPTED' as const };
       }
     } catch (err: any) {
+      // 🆕 FIX P0 "Redis/Dispatch policy production yang jelas" (audit)
+      // -- pola sama persis dengan createOrder() di atas, lihat
+      // komentar lengkap di sana.
       logger.error(`[AUTO-ACCEPT/DISPATCH] Gagal memproses order MART ${order.id}: ${err?.message || err}`);
       dispatch = null;
+      try {
+        await AuditLogger.log(
+          userId,
+          'DISPATCH_FAILED',
+          `Order MART #${order.id} (${order.serviceType}) dibuat tapi gagal di-dispatch: ${err?.message || err}. PERLU DITINJAU MANUAL (order mungkin stuck tanpa driver).`
+        );
+        SocketService.emitToAdmins('dispatch_failed', {
+          orderId: order.id,
+          orderNumber: getOrderNumber(order.id),
+          serviceType: order.serviceType,
+          error: err?.message || String(err),
+        });
+      } catch {
+        // Jaring pengaman terakhir -- logger.error di atas sudah cukup.
+      }
     }
 
-    return { order, breakdown: { itemsSubtotal, deliveryFee, totalPayable }, dispatch };
+    return { order: { ...order, orderNumber: getOrderNumber(order.id) }, breakdown: { itemsSubtotal, deliveryFee, totalPayable }, dispatch };
   }
 
   private calculateHaversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -672,7 +728,15 @@ export class OrderService {
     const minimumDeposit = await this.tariffEngine.getMinimumDriverDeposit();
 
     const isSendOrMart = serviceType === 'SEND' || serviceType === 'MART';
-    const serviceTypeFilter = isSendOrMart ? '' : `AND d."serviceType" = '${serviceType}'`;
+
+    // 🆕 FIX "Raw SQL" (audit lanjutan): diganti dari $queryRawUnsafe
+    // (string dibangun manual) ke $queryRaw tagged template -- semua
+    // ${...} sekarang parameter terikat asli, bukan teks SQL yang
+    // digabung. Fragment kondisional filter serviceType dibangun lewat
+    // Prisma.sql/Prisma.empty, konsisten dengan job.service.ts.
+    const serviceTypeFilter = isSendOrMart
+      ? Prisma.empty
+      : Prisma.sql`AND d."serviceType" = ${serviceType}::"ServiceType"`;
 
     // 🆕 FIX KRITIS "Ledger SQL schema" (pola sistemik yang sama --
     // ditemukan juga di job.service.ts & ledger.service.ts): query ini
@@ -687,7 +751,7 @@ export class OrderService {
     // SAAT DIBUAT TIDAK PERNAH BERHASIL SEKALIPUN sejak awal (selalu
     // gagal diam-diam lalu fallback ke Dispatch Engine biasa -- lihat
     // catch di caller). Diperbaiki dengan quote yang benar.
-    const query = `
+    const candidates = await prisma.$queryRaw<any[]>`
       SELECT 
         d.id,
         d."userId" as "userId",
@@ -718,7 +782,7 @@ export class OrderService {
         AND NOT EXISTS (
           SELECT 1 FROM "Order" o 
           WHERE o."driverId" = d.id 
-            AND o.status IN ('ACCEPTED', 'ON_THE_WAY', 'ARRIVED')
+            AND o.status IN ('ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER')
         )
         AND NOT EXISTS (
           SELECT 1 FROM "Order" o 
@@ -730,8 +794,6 @@ export class OrderService {
       ORDER BY distance_meters ASC
       LIMIT 1
     `;
-
-    const candidates = await prisma.$queryRawUnsafe(query) as any[];
 
     if (!candidates || candidates.length === 0) {
       logger.info(`[AUTO-ACCEPT-ON-CREATE] order ${orderId}: 0 kandidat -- lanjut ke Dispatch Engine.`);
@@ -777,11 +839,13 @@ export class OrderService {
       try {
         SocketService.emitToOrder(orderId, 'order_status_changed', {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           status: updatedOrder.status,
           driverId: chosen.id,
         });
         SocketService.emitToUser((updatedOrder as any).customer.userId, 'order_accepted', {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           driverId: chosen.id,
           driver: {
             fullName: (updatedOrder as any).driver?.user?.fullName,
@@ -789,7 +853,35 @@ export class OrderService {
             vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
           },
         });
-        SocketService.emitToUser(chosen.userId, 'order_accepted', { orderId, autoAccepted: true });
+        if (updatedOrder.serviceType === 'MART') {
+          SocketService.emitToUser((updatedOrder as any).customer.userId, 'mart_driver_heading_to_merchant', {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            status: updatedOrder.status,
+            serviceType: updatedOrder.serviceType,
+            message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+          });
+        }
+        SocketService.emitToUser(chosen.userId, 'order_accepted', {
+          orderId,
+          orderNumber: getOrderNumber(orderId),
+          driverId: chosen.id,
+          status: updatedOrder.status,
+          autoAccepted: true,
+          order: {
+            id: updatedOrder.id,
+            status: updatedOrder.status,
+            serviceType: updatedOrder.serviceType,
+            pickupAddress: updatedOrder.pickupAddress,
+            pickupLat: updatedOrder.pickupLat,
+            pickupLng: updatedOrder.pickupLng,
+            dropoffAddress: updatedOrder.dropoffAddress,
+            dropoffLat: updatedOrder.dropoffLat,
+            dropoffLng: updatedOrder.dropoffLng,
+            price: updatedOrder.price,
+            discount: updatedOrder.discount,
+          },
+        });
         SocketService.emitToDriversPool('order_taken', { orderId });
         SocketService.emitToAdmins('order_accepted', { orderId });
       } catch {
@@ -880,11 +972,44 @@ export class OrderService {
       });
       SocketService.emitToUser((updatedOrder as any).customer.userId, 'order_accepted', {
         orderId,
+        orderNumber: getOrderNumber(updatedOrder.id),
         driverId: driverProfile.id,
         driver: {
           fullName: (updatedOrder as any).driver?.user?.fullName,
           vehicleModel: (updatedOrder as any).driver?.vehicleModel,
           vehiclePlate: (updatedOrder as any).driver?.vehiclePlate,
+        },
+      });
+      if (updatedOrder.serviceType === 'MART') {
+        SocketService.emitToUser((updatedOrder as any).customer.userId, 'mart_driver_heading_to_merchant', {
+          orderId: updatedOrder.id,
+          orderNumber: getOrderNumber(updatedOrder.id),
+          status: updatedOrder.status,
+          serviceType: updatedOrder.serviceType,
+          message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+        });
+      }
+      // V4: accepting driver juga menerima event canonical yang sama.
+      // Manual accept dan auto-accept kini memiliki realtime contract yang
+      // konsisten; GET /jobs tetap menjadi source of truth saat reconnect.
+      SocketService.emitToUser(userId, 'order_accepted', {
+        orderId: updatedOrder.id,
+        orderNumber: getOrderNumber(updatedOrder.id),
+        driverId: driverProfile.id,
+        status: updatedOrder.status,
+        autoAccepted: false,
+        order: {
+          id: updatedOrder.id,
+          status: updatedOrder.status,
+          serviceType: updatedOrder.serviceType,
+          pickupAddress: updatedOrder.pickupAddress,
+          pickupLat: updatedOrder.pickupLat,
+          pickupLng: updatedOrder.pickupLng,
+          dropoffAddress: updatedOrder.dropoffAddress,
+          dropoffLat: updatedOrder.dropoffLat,
+          dropoffLng: updatedOrder.dropoffLng,
+          price: updatedOrder.price,
+          discount: updatedOrder.discount,
         },
       });
       SocketService.emitToDriversPool('order_taken', { orderId });
@@ -923,7 +1048,7 @@ export class OrderService {
   // ============================================================
   // 🔥 UPDATE STATUS - DENGAN LEDGER
   // ============================================================
-  async updateStatus(userId: string, orderId: string, status: 'ON_THE_WAY' | 'ARRIVED' | 'COMPLETED' | 'CANCELLED') {
+  async updateStatus(userId: string, orderId: string, status: 'ON_THE_WAY' | 'ARRIVED' | 'PICKED_UP' | 'ARRIVED_CUSTOMER' | 'COMPLETED' | 'CANCELLED') {
     const order = await this.orderRepo.findById(orderId);
     if (!order) {
       throw new NotFoundError('Order tidak ditemukan!');
@@ -954,7 +1079,19 @@ export class OrderService {
       if (!isAssignedDriver) {
         throw new ForbiddenError('Hanya driver yang ditugaskan yang bisa mengubah status ini!');
       }
-      const allowedNext = ALLOWED_DRIVER_TRANSITIONS[order.status] ?? [];
+      const martTransitions: Record<OrderStatus, OrderStatus[]> = {
+        PENDING: [],
+        ACCEPTED: [OrderStatus.ON_THE_WAY],
+        ON_THE_WAY: [OrderStatus.ARRIVED],
+        ARRIVED: [OrderStatus.PICKED_UP],
+        PICKED_UP: [OrderStatus.ARRIVED_CUSTOMER],
+        ARRIVED_CUSTOMER: [OrderStatus.COMPLETED],
+        COMPLETED: [],
+        CANCELLED: [],
+      };
+      const allowedNext = order.serviceType === 'MART'
+        ? (martTransitions[order.status] ?? [])
+        : (ALLOWED_DRIVER_TRANSITIONS[order.status] ?? []);
       if (!allowedNext.includes(status as OrderStatus)) {
         throw new AppError(`Status ${order.status} tidak boleh diubah langsung menjadi ${status}.`, 400);
       }
@@ -1002,6 +1139,43 @@ export class OrderService {
             `auto-wallet-${orderId}`
           );
         } catch (err: any) {
+          // 🆕 FIX P0 "Financial State Machine" (audit a1.4): SEBELUMNYA
+          // kegagalan auto-debit HANYA memicu event Socket.IO
+          // 'auto_debit_failed' -- sinyal sesaat yang HILANG kalau
+          // customer sedang tidak online, TIDAK PERNAH tersimpan
+          // durable di database, dan TIDAK ADA cara sistematis untuk
+          // query "order mana saja yang settlement-nya masih
+          // menggantung". Order tetap COMPLETED (perjalanan selesai)
+          // TAPI status finansialnya jadi ambigu -- persis "keadaan
+          // finansial ambigu" yang diperingatkan audit P0.
+          //
+          // Sekarang settlementStatus di-set EKSPLISIT ke
+          // RETRY_REQUIRED (state machine terpisah dari OrderStatus --
+          // lihat enum SettlementStatus di schema.prisma), DAN dicatat
+          // durable lewat AuditLogger (bisa di-query admin/reconciliation
+          // job kapan saja) dengan alert real-time ke admin yang online.
+          // Order INI sekarang otomatis muncul di
+          // ReconciliationService.listPendingReconciliation() untuk
+          // di-retry -- baik manual oleh admin maupun (di masa depan)
+          // oleh scheduled job.
+          try {
+            await prisma.order.update({
+              where: { id: orderId },
+              data: { settlementStatus: 'RETRY_REQUIRED' },
+            });
+            await AuditLogger.log(
+              (order as any).customer.userId,
+              'PAYMENT_SETTLEMENT_FAILED',
+              `Order #${orderId} COMPLETED tapi auto-debit wallet gagal: ${err?.message || err}. settlementStatus=RETRY_REQUIRED, PERLU DIRETRY (lihat ReconciliationService).`
+            );
+            SocketService.emitToAdmins('payment_settlement_failed', {
+              orderId,
+              error: err?.message || String(err),
+            });
+          } catch (recordError) {
+            logger.error(`[SETTLEMENT] Gagal mencatat RETRY_REQUIRED untuk order ${orderId}:`, recordError);
+          }
+
           try {
             SocketService.emitToUser((order as any).customer.userId, 'auto_debit_failed', {
               orderId,
@@ -1015,54 +1189,70 @@ export class OrderService {
 
       // ============================================================
       // 🔒 RECORD LEDGER UNTUK ORDER COMPLETED
+      //
+      // 🆕 FIX "Financial error masih ditelan setelah order COMPLETED"
+      // (audit lanjutan): SEBELUMNYA kegagalan recordOrderLedger() di
+      // sini HANYA di-logger.error() -- order tetap COMPLETED, uang
+      // customer tetap tercharge/dianggap lunas, TAPI catatan ledger-nya
+      // (satu-satunya sumber kebenaran akuntansi platform) TIDAK PERNAH
+      // tertulis, dan TIDAK ADA JEJAK DURABLE APA PUN selain baris log
+      // yang gampang hilang tertimbun volume log rutin -- tidak ada
+      // admin yang tahu, tidak ada cara query "order mana saja yang
+      // ledger-nya gagal", tidak ada retry. Ini "silent financial data
+      // loss" -- order ini akan HILANG dari reconcileOrder()/
+      // getPlatformRevenueSummary() TANPA JEJAK.
+      //
+      // Sekarang kegagalan dicatat DURABLE (AuditLogger.log -> tabel
+      // ActivityLog, bukan cuma baris log) dengan action khusus
+      // 'LEDGER_RECORD_FAILED' yang bisa di-query admin kapan saja,
+      // DAN dikirim alert real-time ke admin yang sedang online lewat
+      // Socket.IO -- supaya kegagalan ini kelihatan SAAT ITU JUGA,
+      // bukan cuma ketemu kalau ada yang iseng grep log berbulan-bulan
+      // kemudian. Order tetap COMPLETED (membatalkan status order
+      // karena bookkeeping gagal bukan solusi yang benar -- order-nya
+      // sendiri memang selesai, cuma catatannya yang perlu diperbaiki
+      // manual/lewat retry job terpisah).
       // ============================================================
       try {
         const breakdown = await this.calculateOrderBreakdown(orderId);
-        await this.ledgerService.recordOrderLedger(breakdown);
-        logger.info(`[LEDGER] Recorded for order ${orderId} (COMPLETED - WALLET)`);
-      } catch (ledgerError) {
+        // 🆕 FIX KONSEPTUAL "Ledger tidak boleh menjadi mesin kedua yang
+        // memindahkan saldo": chargeOrder() (dipanggil beberapa baris di
+        // atas) SUDAH MEMINDAHKAN SELURUH UANG order ini secara atomik
+        // (debit customer, kredit driver, kredit merchant). Panggilan
+        // recordOrderLedger() di sini SEKARANG recordOnly:true -- HANYA
+        // menulis baris Ledger sebagai jejak audit dari apa yang chargeOrder
+        // sudah lakukan, TIDAK memindahkan wallet lagi. Sebelumnya (tanpa
+        // recordOnly), driver & merchant DIKREDIT DUA KALI untuk SETIAP
+        // order WALLET -- bug paling serius yang ditemukan di audit ini.
+        await this.ledgerService.recordOrderLedger(breakdown, { recordOnly: true });
+        logger.info(`[LEDGER] Recorded (record-only) for order ${orderId} (COMPLETED - WALLET)`);
+      } catch (ledgerError: any) {
         logger.error(`[LEDGER] Failed to record for order ${orderId}:`, ledgerError);
+        try {
+          await AuditLogger.log(
+            (order as any).customer.userId,
+            'LEDGER_RECORD_FAILED',
+            `Order #${orderId} (WALLET) COMPLETED tapi gagal dicatat ke ledger: ${ledgerError?.message || ledgerError}. PERLU REKONSILIASI MANUAL.`
+          );
+          SocketService.emitToAdmins('ledger_record_failed', {
+            orderId,
+            paymentMethod: 'WALLET',
+            error: ledgerError?.message || String(ledgerError),
+          });
+        } catch {
+          // Kalaupun pencatatan durable/alert-nya sendiri gagal, jangan
+          // sampai menjatuhkan alur update status order -- logger.error
+          // di atas sudah jadi jaring pengaman terakhir.
+        }
       }
     }
 
     // ============================================================
-    // 🔒 COMPLETED - QRIS/TRANSFER/EWALLET (LEDGER TETAP DI-RECORD)
-    //
-    // 🆕 FIX "Cash accounting": blok ini SEBELUMNYA jalan untuk SEMUA
-    // metode pembayaran non-WALLET TERMASUK CASH -- padahal order CASH
-    // sudah punya jalur settlement SENDIRI yang benar di
-    // PaymentService.confirmCash() (potong komisi dari DEPOSIT driver,
-    // setor bagian merchant langsung -- karena uang cash sudah di
-    // tangan driver, platform TIDAK PERNAH memegang uangnya).
-    //
-    // recordOrderLedger() mengasumsikan platform yang mengumpulkan uang
-    // dan perlu MENDISTRIBUSIKANNYA (makanya men-generate entri
-    // DRIVER_EARNING/MERCHANT_EARNING positif ke wallet) -- asumsi ini
-    // BENAR untuk WALLET/QRIS/TRANSFER/EWALLET (customer bayar ke
-    // platform), TAPI SALAH TOTAL untuk CASH (customer bayar tunai
-    // LANGSUNG ke driver, platform tidak pernah menyentuh uangnya).
-    // Kalau tetap dijalankan untuk CASH, driver & merchant (untuk MART)
-    // KEPUTUSAN GANDA -- pertama lewat entri ledger yang salah asumsi
-    // ini, KEDUA lewat confirmCash() yang benar -- wallet mereka
-    // ke-inflate dengan uang yang sebenarnya tidak pernah dikumpulkan
-    // platform. Sekarang CASH dikecualikan total dari blok ini;
-    // satu-satunya sumber kebenaran akuntansi untuk order CASH adalah
-    // confirmCash().
+    // 🔒 COMPLETED - QRIS/TRANSFER/EWALLET
     // ============================================================
-    if (status === 'COMPLETED' && (updatedOrder as any).paymentMethod !== 'WALLET' && (updatedOrder as any).paymentMethod !== 'CASH') {
-      try {
-        const existingLedger = await prisma.ledger.findFirst({
-          where: { orderId: orderId },
-        });
-        if (!existingLedger) {
-          const breakdown = await this.calculateOrderBreakdown(orderId);
-          await this.ledgerService.recordOrderLedger(breakdown);
-          logger.info(`[LEDGER] Recorded for order ${orderId} (COMPLETED - ${(updatedOrder as any).paymentMethod})`);
-        }
-      } catch (ledgerError) {
-        logger.error(`[LEDGER] Failed to record for order ${orderId}:`, ledgerError);
-      }
-    }
+    // Payment eksternal BELUM settled pada saat trip COMPLETED.
+    // Tidak ada wallet mutation dan tidak ada ledger settlement di sini.
+    // Settlement baru terjadi setelah bukti pembayaran disetujui Admin.
 
     await AuditLogger.log(
       userId,
@@ -1072,8 +1262,40 @@ export class OrderService {
 
     try {
       const recipients = [(order as any).customer.userId, (order as any).driver?.userId].filter(Boolean) as string[];
-      SocketService.emitToOrder(orderId, 'order_status_changed', { orderId, status });
-      recipients.forEach((uid) => SocketService.emitToUser(uid, 'order_status_changed', { orderId, status }));
+      const statusPayload = {
+        orderId,
+        orderNumber: getOrderNumber(orderId),
+        status,
+        serviceType: updatedOrder.serviceType,
+        pickupType: updatedOrder.serviceType === 'MART' ? 'MERCHANT' : 'CUSTOMER',
+      };
+      SocketService.emitToOrder(orderId, 'order_status_changed', statusPayload);
+      recipients.forEach((uid) => SocketService.emitToUser(uid, 'order_status_changed', statusPayload));
+
+      if (updatedOrder.serviceType === 'MART' && status === 'ON_THE_WAY') {
+        SocketService.emitToUser((order as any).customer.userId, 'mart_driver_heading_to_merchant', {
+          ...statusPayload,
+          message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+        });
+      }
+      if (updatedOrder.serviceType === 'MART' && status === 'ARRIVED') {
+        SocketService.emitToUser((order as any).customer.userId, 'mart_driver_arrived_at_merchant', {
+          ...statusPayload,
+          message: 'Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.',
+        });
+      }
+      if (updatedOrder.serviceType === 'MART' && status === 'PICKED_UP') {
+        SocketService.emitToUser((order as any).customer.userId, 'mart_driver_heading_to_customer', {
+          ...statusPayload,
+          message: 'Pesanan sudah diambil driver dan sedang menuju lokasi Anda.',
+        });
+      }
+      if (updatedOrder.serviceType === 'MART' && status === 'ARRIVED_CUSTOMER') {
+        SocketService.emitToUser((order as any).customer.userId, 'mart_driver_arrived_at_customer', {
+          ...statusPayload,
+          message: 'Driver telah tiba di lokasi Anda.',
+        });
+      }
 
       if (status === 'COMPLETED') {
         SocketService.emitToOrder(orderId, 'order_completed', { orderId });

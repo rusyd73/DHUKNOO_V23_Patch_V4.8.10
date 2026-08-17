@@ -9,6 +9,7 @@ import { initSentry, registerSentryErrorHandler } from './config/sentry';
 import { SocketService } from './websocket/socket';
 import { BackgroundJobs } from './jobs/cron';
 import { errorHandler } from './core/middleware/error.middleware';
+import { requestIdMiddleware } from './core/middleware/requestId.middleware';
 import { generalRateLimiter } from './core/middleware/rateLimit.middleware';
 import cookieParser from 'cookie-parser';
 
@@ -114,6 +115,13 @@ app.use(express.json());
 app.use(MetricsService.middleware());
 app.use(cookieParser());
 
+// 🆕 FIX P0 "correlation/request ID dan logging terstruktur" (audit
+// driver-jobs): dipasang sedini mungkin (setelah body/cookie parser,
+// sebelum route apa pun) supaya SEMUA request -- termasuk yang gagal di
+// middleware auth/rate-limit sebelum sempat masuk ke route handler --
+// tetap punya requestId yang konsisten untuk dilacak di log.
+app.use(requestIdMiddleware);
+
 // 3. Initialize Realtime WebSockets (Socket.IO) — di-skip saat test agar
 //    tidak membuka handle yang membuat proses Jest menggantung.
 if (process.env.NODE_ENV !== 'test') {
@@ -164,8 +172,16 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-// Foto KTP/STNK & bukti bayar disajikan statis dari sini (mis. /uploads/xxxx.jpg)
-//app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE));
+// Media hasil /api/upload/image dikembalikan sebagai URL backend /uploads/... .
+// WAJIB disajikan di backend agar preview dari Vite (localhost:5173) tidak
+// jatuh ke SPA fallback dan berubah menjadi halaman dashboard/landing page.
+// Catatan: ini mempertahankan kontrak upload legacy V4.7.x. Endpoint /api/files
+// tetap menjadi jalur protected untuk file yang sudah tercatat di tabel File.
+app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE, {
+  fallthrough: true,
+  index: false,
+  maxAge: 0,
+}));
 
 // Serve Vite frontend in development, or static build in production
 import fs from 'fs';

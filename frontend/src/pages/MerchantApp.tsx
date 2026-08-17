@@ -54,7 +54,7 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
       const total = data.price || data.total || 0;
       const formattedTotal = total.toLocaleString('id-ID');
       
-      triggerToast(`📦 Pesanan baru! Total: Rp ${formattedTotal} ⏰ Menunggu driver...`);
+      triggerToast(`📦 Pesanan ${data.orderNumber || ''} baru! Total: Rp ${formattedTotal} ⏰ Menunggu driver...`);
       
       // 3. Update counter order masuk
       setOrderCount(prev => prev + 1);
@@ -72,7 +72,7 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
       
       // ✅ STOP RING LOOP jika order sudah di-accept atau selesai
       const status = data.status || '';
-      if (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'COMPLETED', 'CANCELLED'].includes(status)) {
+      if (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER', 'COMPLETED', 'CANCELLED'].includes(status)) {
         stopRingLoop();
         console.log('🔇 Ring loop stopped - order status changed to:', status);
       }
