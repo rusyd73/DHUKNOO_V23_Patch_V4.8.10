@@ -1,4 +1,5 @@
 // modules/ledger/ledger.service.ts
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { logger } from '../../config/logger';
 import { WalletRepository } from '../wallet/wallet.repository';
@@ -11,6 +12,15 @@ export interface LedgerEntry {
   description: string;
   reference: string;
   metadata?: any;
+  // 🆕 FIX KONSEPTUAL "Ledger tidak boleh menjadi mesin kedua yang
+  // memindahkan saldo": lihat komentar lengkap di recordOrderLedger().
+  // Kalau true, entry ini HANYA ditulis sebagai catatan (baris
+  // Ledger), TIDAK memanggil updateWallet() sama sekali -- dipakai
+  // untuk order yang uangnya SUDAH dipindahkan tuntas oleh
+  // PaymentService.chargeOrder() (WALLET), supaya Ledger murni jadi
+  // JEJAK AUDIT dari apa yang sudah terjadi, bukan APLIKATOR kedua
+  // yang menggerakkan saldo lagi.
+  recordOnly?: boolean;
 }
 
 export interface OrderFeeBreakdown {
@@ -21,6 +31,7 @@ export interface OrderFeeBreakdown {
   platformFee: number;
   merchantFee: number;
   driverCommission: number;
+  driverPickupCompensation?: number;
   breakdown: {
     itemsSubtotal?: number;
     deliveryFee?: number;
@@ -28,6 +39,8 @@ export interface OrderFeeBreakdown {
     discount?: number;
     merchantFeeRate?: number;
     commissionRate?: number;
+    driverPickupDistanceKm?: number;
+    driverPickupRatePerKm?: number;
   };
 }
 
@@ -36,6 +49,40 @@ export class LedgerService {
 
   // ============================================================
   // 🔒 RECORD ORDER LEDGER
+  //
+  // 🆕 FIX KONSEPTUAL KRITIS "Ledger tidak boleh menjadi mesin kedua
+  // yang memindahkan saldo" (audit lanjutan):
+  //
+  // SEBELUMNYA method ini SELALU menggerakkan wallet (lewat
+  // createLedgerEntry -> updateWallet -> applyDelta) untuk SEMUA order
+  // COMPLETED non-CASH -- TERMASUK order WALLET. Padahal untuk order
+  // WALLET, PaymentService.chargeOrder() SUDAH LEBIH DULU melakukan
+  // SELURUH pemindahan uang secara atomik & lengkap (debit customer,
+  // kredit driver, kredit merchant, dengan commission rate yang
+  // dikunci dari PricingHistory yang sama) SEBELUM recordOrderLedger()
+  // ini dipanggil dari order.service.ts. Akibatnya driver & merchant
+  // DIKREDIT DUA KALI untuk SETIAP order WALLET -- sekali oleh
+  // chargeOrder() (benar), sekali lagi oleh Ledger (redundan, pakai
+  // perhitungan independen yang bisa saja beda angka).
+  //
+  // Ini PERSIS bug konseptual yang sama dengan "Cash accounting" yang
+  // sudah diperbaiki sebelumnya (CASH dikecualikan dari blok generic
+  // ini) -- tapi WALLET belum ikut dikecualikan karena chargeOrder()
+  // tidak diperiksa cukup teliti saat itu. Root cause-nya sama: Ledger
+  // seharusnya TIDAK PERNAH jadi "mesin kedua" yang mengambil keputusan
+  // sendiri untuk memindahkan uang -- hanya PaymentService/WalletRepository
+  // (lewat applyDelta) yang boleh benar-benar mengubah balance.
+  //
+  // FIX: parameter `recordOnly` baru. Kalau true, method ini (dan
+  // createLedgerEntry di bawahnya) HANYA menulis baris Ledger sebagai
+  // JEJAK AUDIT dari uang yang SUDAH dipindahkan pihak lain --
+  // updateWallet() SAMA SEKALI TIDAK dipanggil. Dipakai order.service.ts
+  // untuk order WALLET (chargeOrder sudah memindahkan uangnya).
+  // Untuk QRIS/TRANSFER/EWALLET (belum ada engine pembayaran khusus
+  // seperti chargeOrder), recordOnly TETAP false -- Ledger di sini
+  // MASIH jadi satu-satunya jalur yang memindahkan uang, sampai ada
+  // PaymentService setara untuk metode-metode itu (perbaikan lanjutan
+  // di luar scope sesi ini).
   //
   // 🆕 FIX BUG KRITIS (double-deduction): breakdown.driverEarning &
   // breakdown.merchantEarning sekarang GROSS (lihat komentar di
@@ -47,12 +94,14 @@ export class LedgerService {
   // oleh sistem wallet (updateWallet increment per entri), BUKAN
   // dipotong dua kali seperti versi sebelumnya.
   //
-  // Total uang harus reconcile:
-  //   customerPayment = (deliveryFee - driverCommission)
-  //                    + (itemsSubtotal - merchantFee)
-  //                    + (merchantFee + driverCommission)   [=platformFee]
+    // Total uang MART harus reconcile:
+    //   customerPayment = (deliveryFee - driverCommission)
+    //                    + itemsSubtotal
+    //                    + driverCommission                    [=platformFee]
+    // Nilai pokok produk 100% hak merchant; merchantFee selalu 0.
   // ============================================================
-  async recordOrderLedger(breakdown: OrderFeeBreakdown): Promise<void> {
+  async recordOrderLedger(breakdown: OrderFeeBreakdown, options?: { recordOnly?: boolean }): Promise<void> {
+    const recordOnly = options?.recordOnly ?? false;
     const order = await prisma.order.findUnique({
       where: { id: breakdown.orderId },
       include: {
@@ -76,6 +125,7 @@ export class LedgerService {
       amount: -breakdown.customerPayment,
       description: `Pembayaran order #${breakdown.orderId}`,
       reference: `order-${breakdown.orderId}-customer`,
+      recordOnly,
       metadata: {
         paymentMethod: order.paymentMethod,
       },
@@ -90,9 +140,44 @@ export class LedgerService {
         amount: breakdown.driverEarning,
         description: `Pendapatan driver order #${breakdown.orderId} (kotor, sebelum komisi platform)`,
         reference: `order-${breakdown.orderId}-driver`,
+        recordOnly,
         metadata: {
           shippingFee: breakdown.breakdown.shippingFee,
           note: 'Jumlah ini GROSS -- lihat entri DRIVER_COMMISSION untuk potongan komisi platform.',
+        },
+      });
+    }
+
+    // FIX7. DRIVER -> PICKUP COMPENSATION. Ini bukan bagian dari tarif
+    // customer dan tidak commissionable. Wallet sudah dibayar PaymentService,
+    // sehingga pasangan ledger ini SELALU recordOnly agar tidak double-credit.
+    const driverPickupCompensation = Math.max(0, Number(breakdown.driverPickupCompensation || 0));
+    if (order.driverId && order.driver && driverPickupCompensation > 0) {
+      entries.push({
+        orderId: breakdown.orderId,
+        userId: order.driver.userId,
+        type: 'DRIVER_PICKUP_COMPENSATION',
+        amount: driverPickupCompensation,
+        description: `Kompensasi driver menuju pickup order #${breakdown.orderId}`,
+        reference: `order-${breakdown.orderId}-driver-pickup-compensation`,
+        recordOnly: true,
+        metadata: {
+          distanceKm: breakdown.breakdown.driverPickupDistanceKm || 0,
+          ratePerKm: breakdown.breakdown.driverPickupRatePerKm || 0,
+          commissionable: false,
+        },
+      });
+      entries.push({
+        orderId: breakdown.orderId,
+        userId: 'platform',
+        type: 'PLATFORM_PICKUP_SUBSIDY',
+        amount: -driverPickupCompensation,
+        description: `Subsidi platform untuk pickup driver order #${breakdown.orderId}`,
+        reference: `order-${breakdown.orderId}-platform-pickup-subsidy`,
+        recordOnly: true,
+        metadata: {
+          distanceKm: breakdown.breakdown.driverPickupDistanceKm || 0,
+          ratePerKm: breakdown.breakdown.driverPickupRatePerKm || 0,
         },
       });
     }
@@ -107,6 +192,7 @@ export class LedgerService {
         amount: breakdown.merchantEarning,
         description: `Pendapatan merchant order #${breakdown.orderId} (kotor, sebelum fee platform)`,
         reference: `order-${breakdown.orderId}-merchant`,
+        recordOnly,
         metadata: {
           itemsSubtotal: breakdown.breakdown.itemsSubtotal,
           note: 'Jumlah ini GROSS -- lihat entri MERCHANT_FEE untuk potongan fee platform.',
@@ -123,6 +209,7 @@ export class LedgerService {
         amount: breakdown.platformFee,
         description: `Platform fee order #${breakdown.orderId}`,
         reference: `order-${breakdown.orderId}-platform`,
+        recordOnly,
         metadata: {
           merchantFee: breakdown.merchantFee,
           driverCommission: breakdown.driverCommission,
@@ -140,6 +227,7 @@ export class LedgerService {
         amount: -breakdown.merchantFee,
         description: `Biaya platform merchant order #${breakdown.orderId}`,
         reference: `order-${breakdown.orderId}-merchant-fee`,
+        recordOnly,
         metadata: {
           rate: breakdown.breakdown.merchantFeeRate || 0,
         },
@@ -155,15 +243,55 @@ export class LedgerService {
         amount: -breakdown.driverCommission,
         description: `Komisi platform driver order #${breakdown.orderId}`,
         reference: `order-${breakdown.orderId}-driver-commission`,
+        recordOnly,
         metadata: {
           rate: breakdown.breakdown.commissionRate || 0,
         },
       });
     }
 
-    // Save all entries
-    for (const entry of entries) {
-      await this.createLedgerEntry(entry);
+    // ============================================================
+    // 🆕 FIX P0 "Ledger settlement harus atomic sebagai batch" (audit):
+    // SEBELUMNYA setiap entry di atas ditulis lewat panggilan
+    // createLedgerEntry() TERPISAH, dan createLedgerEntry() membungkus
+    // dirinya sendiri dalam prisma.$transaction() SENDIRI-SENDIRI --
+    // artinya satu settlement order (bisa sampai 6 entry: customer
+    // payment, driver earning, merchant earning, platform fee,
+    // merchant fee, driver commission) sebenarnya adalah 6 TRANSAKSI
+    // DATABASE TERPISAH, bukan satu. Kalau entry ke-3 gagal (mis. DB
+    // hiccup sesaat, connection pool exhausted, constraint lain yang
+    // tidak terduga), entry 1-2 SUDAH TERLANJUR COMMIT permanen dan
+    // entry 4-6 TIDAK PERNAH ditulis -- settlement order itu jadi
+    // SETENGAH JADI SELAMANYA (mis. customer sudah "dicatat membayar"
+    // tapi driver tidak pernah dikreditkan), dan tidak ada mekanisme
+    // otomatis untuk mendeteksi/memperbaikinya. Ini persis skenario
+    // yang diperingatkan audit P0 #7: satu settlement finansial harus
+    // all-or-nothing.
+    //
+    // FIX: seluruh batch sekarang ditulis dalam SATU prisma.$transaction
+    // -- writeLedgerEntryInTx() melakukan langkah yang sama persis
+    // dengan createLedgerEntry() (dedupe check, update wallet kalau
+    // berlaku, insert baris Ledger) tapi memakai `tx` yang di-share,
+    // BUKAN membuka transaksi baru per entry. Kalau entry manapun
+    // gagal, SELURUH batch (termasuk entry yang sudah "berhasil"
+    // sebelumnya di loop yang sama) di-rollback bersamaan -- tidak ada
+    // lagi settlement setengah jadi.
+    // ============================================================
+    try {
+      await prisma.$transaction(async (tx) => {
+        for (const entry of entries) {
+          await this.writeLedgerEntryInTx(tx, entry);
+        }
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        // Seluruh batch ini sudah pernah ditulis sebelumnya (retry/replay
+        // dari luar) -- reference @unique bentrok di salah satu entry.
+        // Bukan error nyata, tapi tidak ada yang perlu ditulis ulang.
+        logger.warn(`[LEDGER] Batch untuk order ${breakdown.orderId} sudah pernah dicatat sebelumnya -- dilewati (idempotent).`);
+        return;
+      }
+      throw err;
     }
 
     logger.info(`[LEDGER] Recorded ${entries.length} entries for order ${breakdown.orderId}`);
@@ -193,32 +321,18 @@ export class LedgerService {
   // sekaligus menghilangkan seluruh kelas bug nama-kolom seperti ini.
   // ============================================================
   async createLedgerEntry(entry: LedgerEntry): Promise<void> {
-    // Cek apakah ledger sudah ada (skip jika duplicate) -- reference
-    // sudah @unique di skema, tapi dicek dulu supaya tidak throw P2002
-    // dan log-nya lebih jelas ("duplicate skipped" vs error generik).
-    const existing = await prisma.ledger.findUnique({
-      where: { reference: entry.reference },
-    });
-
-    if (existing) {
-      logger.warn(`[LEDGER] Duplicate entry skipped: ${entry.reference}`);
-      return;
-    }
-
+    // Dipakai untuk penulisan SATU entry ledger yang berdiri sendiri
+    // (di luar batch settlement order) -- membungkus writeLedgerEntryInTx
+    // dalam transaksi barunya sendiri. Untuk batch settlement order,
+    // lihat recordOrderLedger() yang memakai writeLedgerEntryInTx()
+    // langsung di dalam SATU transaksi bersama demi atomicity batch
+    // (P0 #7 -- lihat komentar lengkap di recordOrderLedger()).
     try {
-      await prisma.ledger.create({
-        data: {
-          orderId: entry.orderId || null,
-          userId: entry.userId,
-          type: entry.type,
-          amount: entry.amount,
-          description: entry.description,
-          reference: entry.reference,
-          metadata: entry.metadata || {},
-        },
+      await prisma.$transaction(async (tx) => {
+        await this.writeLedgerEntryInTx(tx, entry);
       });
     } catch (err: any) {
-      // Race: dua request nyaris bersamaan lolos findUnique di atas
+      // Race: dua request nyaris bersamaan lolos dedupe check di atas
       // tapi tabrakan di @unique constraint reference -- P2002. Ini
       // sama-sama berarti "sudah pernah dicatat", bukan error nyata.
       if (err?.code === 'P2002') {
@@ -227,60 +341,71 @@ export class LedgerService {
       }
       throw err;
     }
-
-    // Update wallet jika userId bukan 'platform'
-    if (entry.userId !== 'platform') {
-      await this.updateWallet(entry.userId, entry.amount, entry);
-    }
   }
 
   // ============================================================
-  // 🔒 UPDATE WALLET
-  // ============================================================
-  // ============================================================
-  // 🔒 UPDATE WALLET
+  // 🔒 WRITE SINGLE LEDGER ENTRY WITHIN A SHARED TRANSACTION
   //
-  // 🆕 FIX "Wallet architecture": sebelumnya method ini menulis LANGSUNG
-  // ke Prisma (`tx.wallet.update({data:{balance:{increment}}})`) tanpa
-  // guard sama sekali -- BEDA jalur dari WalletRepository.applyDelta()
-  // yang sudah dibuat khusus untuk mencegah saldo jadi negatif (lihat
-  // AUDIT NOTE di wallet.repository.ts). Dua jalur mutasi wallet dengan
-  // jaminan keamanan berbeda untuk resource yang sama = arsitektur yang
-  // rapuh -- gampang lupa salah satu jalur pas ada perubahan aturan di
-  // masa depan (persis seperti ini: rule "saldo tidak boleh negatif"
-  // cuma berlaku di satu jalur, tidak di jalur lain yang JUSTRU dipakai
-  // di SETIAP order selesai). Representasi juga tidak konsisten:
-  // Transaction.amount dari sini SELALU positif (Math.abs), sementara
-  // dari applyDelta() ikut tanda asli (bisa negatif) -- membingungkan
-  // untuk apa pun yang menjumlah Transaction.amount mengasumsikan tanda
-  // konsisten (mis. validateTopupRequest's dailyTotal aggregate).
-  // Sekarang delegasikan total ke applyDelta() -- satu sumber
-  // kebenaran untuk mutasi wallet, guard & representasi konsisten.
+  // Logika inti (dedupe check, update wallet kalau berlaku, insert
+  // baris Ledger) diekstrak ke sini SUPAYA bisa dipanggil berkali-kali
+  // di dalam SATU transaksi Prisma yang sama -- baik dari
+  // createLedgerEntry() (transaksi baru per panggilan, untuk entry
+  // tunggal) maupun dari recordOrderLedger() (satu transaksi untuk
+  // SELURUH batch entry per order, demi atomicity -- P0 #7).
+  // `tx` WAJIB berupa Prisma transaction client yang sedang aktif,
+  // bukan `prisma` top-level -- method ini TIDAK membuka transaksi
+  // sendiri.
   // ============================================================
-  private async updateWallet(userId: string, amount: number, entry: LedgerEntry): Promise<void> {
-    await prisma.$transaction(async (tx) => {
-      let wallet = await tx.wallet.findUnique({
-        where: { userId },
-      });
+  private async writeLedgerEntryInTx(tx: Prisma.TransactionClient, entry: LedgerEntry): Promise<void> {
+    // Cek apakah ledger sudah ada (skip jika duplicate) -- reference
+    // sudah @unique di skema, tapi dicek dulu supaya tidak throw P2002
+    // dan log-nya lebih jelas ("duplicate skipped" vs error generik).
+    const existing = await tx.ledger.findUnique({
+      where: { reference: entry.reference },
+    });
 
+    if (existing) {
+      logger.warn(`[LEDGER] Duplicate entry skipped: ${entry.reference}`);
+      return;
+    }
+
+    let balanceAfter: number | null = null;
+
+    // 🆕 FIX KONSEPTUAL "Ledger tidak boleh menjadi mesin kedua
+    // yang memindahkan saldo": kalau entry.recordOnly=true, wallet
+    // TIDAK disentuh sama sekali -- uangnya sudah dipindahkan
+    // pihak lain (PaymentService.chargeOrder), entry ini murni
+    // jejak audit (balanceAfter tetap null, karena entry ini
+    // bukan penyebab perubahan saldo).
+    if (entry.userId !== 'platform' && !entry.recordOnly) {
+      let wallet = await tx.wallet.findUnique({ where: { userId: entry.userId } });
       if (!wallet) {
-        wallet = await tx.wallet.create({
-          data: {
-            userId,
-            balance: 0,
-          },
-        });
+        wallet = await tx.wallet.create({ data: { userId: entry.userId, balance: 0 } });
       }
 
-      await this.walletRepo.applyDelta(
+      const { wallet: updatedWallet } = await this.walletRepo.applyDelta(
         tx,
         wallet.id,
-        amount,
+        entry.amount,
         this.mapLedgerTypeToTransactionType(entry.type),
         entry.description,
         entry.orderId,
         entry.reference
       );
+      balanceAfter = Number(updatedWallet.balance);
+    }
+
+    await tx.ledger.create({
+      data: {
+        orderId: entry.orderId || null,
+        userId: entry.userId,
+        type: entry.type,
+        amount: entry.amount,
+        description: entry.description,
+        reference: entry.reference,
+        metadata: entry.metadata || {},
+        balanceAfter,
+      },
     });
   }
 
@@ -291,6 +416,8 @@ export class LedgerService {
     const mapping: Record<string, string> = {
       'CUSTOMER_PAYMENT': 'PAYMENT',
       'DRIVER_EARNING': 'EARNING',
+      'DRIVER_PICKUP_COMPENSATION': 'EARNING',
+      'PLATFORM_PICKUP_SUBSIDY': 'PLATFORM_FEE',
       'MERCHANT_EARNING': 'MERCHANT_EARNING',
       'PLATFORM_FEE': 'PLATFORM_FEE',
       'MERCHANT_FEE': 'PLATFORM_FEE',
@@ -314,13 +441,14 @@ export class LedgerService {
     totalPlatformFee: number;
     totalMerchantFee: number;
     totalDriverCommission: number;
+    totalPickupSubsidy: number;
     totalRevenue: number;
     byOrder: any[];
   }> {
     const fees = await prisma.ledger.groupBy({
       by: ['orderId', 'type'],
       where: {
-        type: { in: ['PLATFORM_FEE', 'MERCHANT_FEE', 'DRIVER_COMMISSION'] },
+        type: { in: ['PLATFORM_FEE', 'MERCHANT_FEE', 'DRIVER_COMMISSION', 'PLATFORM_PICKUP_SUBSIDY'] },
         createdAt: { gte: startDate, lte: endDate },
       },
       _sum: { amount: true },
@@ -335,12 +463,14 @@ export class LedgerService {
     const platformFees = normalized.filter(f => f.type === 'PLATFORM_FEE');
     const merchantFees = normalized.filter(f => f.type === 'MERCHANT_FEE');
     const driverCommissions = normalized.filter(f => f.type === 'DRIVER_COMMISSION');
+    const pickupSubsidies = normalized.filter(f => f.type === 'PLATFORM_PICKUP_SUBSIDY');
 
     return {
       totalPlatformFee: platformFees.reduce((sum, f) => sum + f.total, 0),
       totalMerchantFee: merchantFees.reduce((sum, f) => sum + Math.abs(f.total), 0),
       totalDriverCommission: driverCommissions.reduce((sum, f) => sum + Math.abs(f.total), 0),
-      totalRevenue: platformFees.reduce((sum, f) => sum + f.total, 0),
+      totalPickupSubsidy: pickupSubsidies.reduce((sum, f) => sum + Math.abs(f.total), 0),
+      totalRevenue: platformFees.reduce((sum, f) => sum + f.total, 0) + pickupSubsidies.reduce((sum, f) => sum + f.total, 0),
       byOrder: normalized,
     };
   }
@@ -363,6 +493,8 @@ export class LedgerService {
     merchantEarning: number;
     merchantFee: number;
     driverCommission: number;
+    driverPickupCompensation: number;
+    platformPickupSubsidy: number;
     platformFee: number;
     totalDebit: number;
     totalCredit: number;
@@ -378,6 +510,8 @@ export class LedgerService {
     let merchantEarning = 0;
     let merchantFee = 0;
     let driverCommission = 0;
+    let driverPickupCompensation = 0;
+    let platformPickupSubsidy = 0;
     let platformFee = 0;
 
     for (const entry of entries) {
@@ -397,6 +531,12 @@ export class LedgerService {
         case 'DRIVER_COMMISSION':
           driverCommission += Number(entry.amount); // sudah negatif
           break;
+        case 'DRIVER_PICKUP_COMPENSATION':
+          driverPickupCompensation += Number(entry.amount);
+          break;
+        case 'PLATFORM_PICKUP_SUBSIDY':
+          platformPickupSubsidy += Number(entry.amount); // negatif: biaya platform
+          break;
         case 'PLATFORM_FEE':
           platformFee += Number(entry.amount);
           break;
@@ -408,8 +548,10 @@ export class LedgerService {
     // NET merchant = merchantEarning(gross) + merchantFee(negatif)
     const totalCredit =
       (driverEarning + driverCommission) +
+      driverPickupCompensation +
       (merchantEarning + merchantFee) +
-      platformFee;
+      platformFee +
+      platformPickupSubsidy;
 
     return {
       customerPayment,
@@ -417,6 +559,8 @@ export class LedgerService {
       merchantEarning,
       merchantFee,
       driverCommission,
+      driverPickupCompensation,
+      platformPickupSubsidy,
       platformFee,
       totalDebit,
       totalCredit,

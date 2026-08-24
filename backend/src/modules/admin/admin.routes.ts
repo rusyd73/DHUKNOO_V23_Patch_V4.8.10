@@ -3,14 +3,81 @@ import { authenticateToken, AuthenticatedRequest, authorizeRoles } from '../../c
 import { prisma } from '../../config/prisma';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { validateBody } from '../../core/middleware/validation.middleware';
+import { sensitiveAdminActionRateLimiter } from '../../core/middleware/rateLimit.middleware';
 import { reviewDriverDocumentSchema, createAdminSchema, adminWalletCreditSchema } from '../../core/validation/schemas';
 import { AuthService } from '../auth/auth.service';
 import { WalletAdminController } from '../wallet/wallet.admin.controller';
+import { ReconciliationController } from '../reconciliation/reconciliation.controller';
+import { buildAdminRecap } from './admin-recap.service';
+import { buildRecapExcel, buildRecapPdf } from './admin-export.service';
 
 const authService = new AuthService();
 const walletAdminControllerForAdminRoutes = new WalletAdminController();
+const reconciliationController = new ReconciliationController();
 
 const router = Router();
+
+// ============================================================
+// V4.8.7 ADMIN HIERARCHY — FAIL-SAFE
+//
+// SUPER ADMIN bukan role Prisma baru. Semua akun tetap ROLE=ADMIN.
+// Pembeda hak akses ditentukan oleh identitas Super Admin.
+//
+// Prioritas:
+// 1) SUPER_ADMIN_EMAIL bila di-set di .env dan akun tersebut masih aktif.
+// 2) Jika ENV kosong/tidak cocok/tidak aktif, gunakan ADMIN AKTIF
+//    PALING LAMA sebagai Super Admin agar instalasi lama V4.8.5
+//    langsung bekerja tanpa konfigurasi tambahan.
+//
+// Dengan demikian patch tidak membutuhkan migration/schema baru dan
+// tidak dapat membuat dashboard terkunci hanya karena ENV belum diisi.
+// ============================================================
+const normalizedEmail = (value?: string | null) => String(value || '').trim().toLowerCase();
+const configuredSuperAdminEmail = () => normalizedEmail(process.env.SUPER_ADMIN_EMAIL);
+
+const resolveSuperAdmin = async () => {
+  const configuredEmail = configuredSuperAdminEmail();
+
+  if (configuredEmail) {
+    const configured = await prisma.user.findFirst({
+      where: {
+        role: 'ADMIN',
+        isActive: true,
+        email: { equals: configuredEmail, mode: 'insensitive' },
+      },
+      select: { id: true, email: true, fullName: true },
+    });
+    if (configured) return configured;
+  }
+
+  // Fallback V4.8.5 compatibility: ADMIN aktif tertua menjadi Super Admin.
+  return prisma.user.findFirst({
+    where: { role: 'ADMIN', isActive: true },
+    select: { id: true, email: true, fullName: true },
+    orderBy: { createdAt: 'asc' },
+  });
+};
+
+const requireSuperAdmin = async (req: AuthenticatedRequest, res: Response, next: any) => {
+  if (!req.user) return res.status(401).json({ error: 'Akses tidak sah.' });
+  if (req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Hanya ADMIN yang dapat mengakses menu ini.' });
+
+  try {
+    const superAdmin = await resolveSuperAdmin();
+    if (!superAdmin || superAdmin.id !== req.user.id) {
+      return res.status(403).json({
+        error: 'Akses ditolak. Hanya SUPER ADMIN yang dapat menambah atau menonaktifkan administrator lain.',
+        code: 'SUPER_ADMIN_REQUIRED',
+      });
+    }
+    next();
+  } catch (err: any) {
+    return res.status(503).json({
+      error: 'Gagal memverifikasi otorisasi SUPER ADMIN.',
+      code: 'SUPER_ADMIN_RESOLUTION_FAILED',
+    });
+  }
+};
 
 // GET /api/admin/dashboard - Fetch global platform statistics and lists
 router.get(
@@ -298,6 +365,64 @@ router.get(
 );
 
 router.get(
+  '/driver-documents/:documentId/file',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { documentId } = req.params;
+      const document = await prisma.driverDocument.findUnique({
+        where: { id: documentId },
+        select: { id: true, imageUrl: true },
+      });
+
+      if (!document) {
+        return res.status(404).json({ error: 'Dokumen driver tidak ditemukan!' });
+      }
+
+      const rawUrl = String(document.imageUrl || '').trim();
+      if (!rawUrl) {
+        return res.status(404).json({ error: 'File dokumen tidak tersedia!' });
+      }
+
+      // Driver document uploads are stored under the backend /uploads directory.
+      // Resolve ONLY the /uploads/<filename> path; never fetch arbitrary URLs.
+      let pathname = rawUrl;
+      try {
+        pathname = new URL(rawUrl, 'http://dhuknoo.local').pathname;
+      } catch {
+        pathname = rawUrl;
+      }
+
+      const uploadsMarker = '/uploads/';
+      const markerIndex = pathname.indexOf(uploadsMarker);
+      if (markerIndex < 0) {
+        return res.status(400).json({ error: 'Lokasi file dokumen tidak valid!' });
+      }
+
+      const filename = decodeURIComponent(pathname.slice(markerIndex + uploadsMarker.length));
+      if (!filename || filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+        return res.status(400).json({ error: 'Nama file dokumen tidak valid!' });
+      }
+
+      const path = await import('path');
+      const fs = await import('fs');
+      const { UPLOAD_DIR_ABSOLUTE } = await import('../upload/upload.config');
+      const absolutePath = path.join(UPLOAD_DIR_ABSOLUTE, filename);
+
+      if (!fs.existsSync(absolutePath)) {
+        return res.status(404).json({ error: 'File dokumen tidak ditemukan di server!' });
+      }
+
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.sendFile(absolutePath);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal mengambil file dokumen.' });
+    }
+  }
+);
+
+router.get(
   '/driver-documents/:documentId/review',
   authenticateToken as any,
   authorizeRoles('ADMIN') as any,
@@ -473,6 +598,13 @@ router.get(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const timeframe = (req.query.timeframe as string) || 'daily'; // 'daily' | 'weekly' | 'monthly'
+      // Satu sumber kebenaran untuk tampilan dan export. Implementasi lama di
+      // bawah belum memuat withdrawal dan masih menghitung komisi tetap 8%.
+      // Return ini memastikan endpoint memakai rekap berbasis ledger terbaru.
+      return res.status(200).json(await buildAdminRecap(timeframe as any));
+
+      /* istanbul ignore next -- legacy recap dipertahankan sementara untuk
+         kompatibilitas patch, tetapi tidak lagi dieksekusi. */
       const now = new Date();
       let startDate = new Date();
 
@@ -563,6 +695,31 @@ router.get(
         };
       });
 
+      // 2b. Rekap merchant: total, status operasional, pemilik, dan lokasi.
+      const merchants = await prisma.merchant.findMany({
+        include: {
+          owner: { select: { fullName: true, email: true, isActive: true } },
+          _count: { select: { products: true, orders: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      const formattedMerchants = merchants.map((m) => ({
+        id: m.id, name: m.name, ownerName: m.owner?.fullName || 'Belum terhubung',
+        ownerEmail: m.owner?.email || '-', category: m.category, address: m.address,
+        latitude: m.latitude, longitude: m.longitude, phone: m.phone || '-', isOpen: m.isOpen,
+        ownerIsActive: m.owner?.isActive ?? false,
+        status: !m.owner ? 'NO_OWNER' : !m.owner.isActive ? 'OWNER_INACTIVE' : m.isOpen ? 'ACTIVE' : 'INACTIVE',
+        registeredAt: m.createdAt, productCount: m._count.products, orderCount: m._count.orders,
+      }));
+      const merchantSummary = {
+        total: formattedMerchants.length,
+        active: formattedMerchants.filter((m) => m.status === 'ACTIVE').length,
+        inactive: formattedMerchants.filter((m) => m.status === 'INACTIVE').length,
+        ownerInactive: formattedMerchants.filter((m) => m.status === 'OWNER_INACTIVE').length,
+        noOwner: formattedMerchants.filter((m) => m.status === 'NO_OWNER').length,
+        registeredInTimeframe: formattedMerchants.filter((m) => new Date(m.registeredAt) >= startDate).length,
+      };
+
       // 3. Volume transaksi dari mana kemana oleh siapa
       const orders = await prisma.order.findMany({
         where: { createdAt: { gte: startDate } },
@@ -618,6 +775,7 @@ router.get(
           dropoffAddress: o.dropoffAddress,
           customerName: o.customer?.user?.fullName || 'Pelanggan OBAMA',
           driverName: o.driver?.user?.fullName || 'Mitra Pengemudi',
+          distanceKm: Number(o.distanceKm || 0),
           grossPrice,
           discount,
           netPrice,
@@ -637,9 +795,16 @@ router.get(
           totalTransactionsCount: formattedTransactions.length,
           totalVolumeValue,
           totalPlatformRevenue,
+          totalMerchantsCount: merchantSummary.total,
+          activeMerchantsCount: merchantSummary.active,
+          inactiveMerchantsCount: merchantSummary.inactive,
+          ownerInactiveMerchantsCount: merchantSummary.ownerInactive,
+          merchantsRegisteredInTimeframe: merchantSummary.registeredInTimeframe,
         },
         customers: formattedCustomers,
         drivers: formattedDrivers,
+        merchants: formattedMerchants,
+        merchantSummary,
         transactions: formattedTransactions,
         platformRevenues: formattedRevenues,
       });
@@ -650,6 +815,105 @@ router.get(
 );
 
 
+// ── Export Rekapitulasi Laporan (Excel / PDF) ─────────────────────────────
+// Endpoint ini sengaja memakai sumber data yang sama dengan GET /recap agar
+// tampilan dashboard dan file unduhan tidak menghasilkan angka yang berbeda.
+const normalizeRecapTimeframe = (value: unknown): 'daily' | 'weekly' | 'monthly' => {
+  const timeframe = String(value || 'daily');
+  if (!['daily', 'weekly', 'monthly'].includes(timeframe)) return 'daily';
+  return timeframe as 'daily' | 'weekly' | 'monthly';
+};
+
+router.get(
+  '/export/excel',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const timeframe = normalizeRecapTimeframe(req.query.timeframe);
+      const recap = await buildAdminRecap(timeframe);
+      const file = await buildRecapExcel(recap);
+      const filename = `dhuknoo-rekap-${timeframe}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.status(200).send(file);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal membuat file Excel.' });
+    }
+  }
+);
+
+router.get(
+  '/export/pdf',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const timeframe = normalizeRecapTimeframe(req.query.timeframe);
+      const recap = await buildAdminRecap(timeframe);
+      const file = await buildRecapPdf(recap);
+      const filename = `dhuknoo-rekap-${timeframe}-${new Date().toISOString().slice(0, 10)}.pdf`;
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.status(200).send(file);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal membuat file PDF.' });
+    }
+  }
+);
+
+
+// ============================================================
+// 👥 GET /api/admin/admins
+// Semua ADMIN boleh melihat daftar administrator.
+// Hak mutasi tetap dikunci oleh requireSuperAdmin di backend.
+// ============================================================
+router.get(
+  '/admins',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const [admins, superAdmin] = await Promise.all([
+        prisma.user.findMany({
+          where: { role: 'ADMIN' },
+          select: {
+            id: true,
+            email: true,
+            fullName: true,
+            role: true,
+            isActive: true,
+            createdAt: true,
+            updatedAt: true,
+            deactivatedAt: true,
+            deactivatedBy: true,
+            deactivationReason: true,
+          },
+          orderBy: [{ isActive: 'desc' }, { createdAt: 'asc' }],
+        }),
+        resolveSuperAdmin(),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+        isSuperAdmin: Boolean(superAdmin && superAdmin.id === req.user?.id),
+        superAdminConfigured: Boolean(configuredSuperAdminEmail()),
+        superAdminId: superAdmin?.id || null,
+        admins: admins.map((admin) => ({
+          ...admin,
+          isSuperAdmin: Boolean(superAdmin && admin.id === superAdmin.id),
+        })),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal memuat daftar administrator.' });
+    }
+  }
+);
+
 // ============================================================
 // 🔒 POST /api/admin/create-admin
 // Satu-satunya jalur lain (selain seed database) untuk membuat akun
@@ -659,6 +923,8 @@ router.post(
   '/create-admin',
   authenticateToken as any,
   authorizeRoles('ADMIN') as any,
+  requireSuperAdmin,
+  sensitiveAdminActionRateLimiter,
   validateBody(createAdminSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -675,12 +941,12 @@ router.post(
       await AuditLogger.log(
         creatorId,
         'ADMIN_CREATED',
-        `Admin ${creatorId} membuat akun admin baru: ${newAdmin.id} (${newAdmin.email})`
+        `SUPER ADMIN membuat akun ADMIN BIASA: ${newAdmin.id} (${newAdmin.email})`
       );
 
       return res.status(201).json({
         success: true,
-        message: 'Akun admin baru berhasil dibuat.',
+        message: 'Akun ADMIN BIASA berhasil dibuat.',
         data: newAdmin,
       });
     } catch (err: any) {
@@ -689,6 +955,83 @@ router.post(
         success: false,
         error: err.message || 'Gagal membuat akun admin baru.',
       });
+    }
+  }
+);
+
+// ============================================================
+// 🔐 PATCH /api/admin/admins/:adminId/deactivate
+// Soft-disable. Histori tetap tersimpan.
+// SUPER ADMIN tidak dapat menonaktifkan dirinya sendiri maupun
+// akun yang sedang menjadi SUPER ADMIN.
+// ============================================================
+router.patch(
+  '/admins/:adminId/deactivate',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  requireSuperAdmin,
+  sensitiveAdminActionRateLimiter,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const creatorId = req.user!.id;
+      const { adminId } = req.params;
+      const reason = String(req.body?.reason || 'Administrator tidak lagi aktif').trim().slice(0, 255);
+
+      if (adminId === creatorId) {
+        return res.status(400).json({ error: 'SUPER ADMIN tidak dapat menonaktifkan akunnya sendiri.' });
+      }
+
+      const superAdmin = await resolveSuperAdmin();
+      if (superAdmin?.id === adminId) {
+        return res.status(400).json({ error: 'SUPER ADMIN tidak dapat dinonaktifkan melalui menu ini.' });
+      }
+
+      const target = await prisma.user.findUnique({
+        where: { id: adminId },
+        select: { id: true, email: true, fullName: true, role: true, isActive: true },
+      });
+
+      if (!target || target.role !== 'ADMIN') {
+        return res.status(404).json({ error: 'Administrator tidak ditemukan.' });
+      }
+
+      if (!target.isActive) {
+        return res.status(400).json({ error: 'Administrator tersebut sudah nonaktif.' });
+      }
+
+      const updated = await prisma.user.update({
+        where: { id: adminId },
+        data: {
+          isActive: false,
+          deactivatedAt: new Date(),
+          deactivatedBy: creatorId,
+          deactivationReason: reason,
+        },
+        select: {
+          id: true,
+          email: true,
+          fullName: true,
+          role: true,
+          isActive: true,
+          deactivatedAt: true,
+          deactivatedBy: true,
+          deactivationReason: true,
+        },
+      });
+
+      await AuditLogger.log(
+        creatorId,
+        'ADMIN_DEACTIVATED',
+        `SUPER ADMIN menonaktifkan ADMIN BIASA: ${target.fullName} (${target.email}). Alasan: ${reason}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: `Akses admin ${target.fullName} berhasil dinonaktifkan.`,
+        data: updated,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Gagal menonaktifkan administrator.' });
     }
   }
 );
@@ -705,10 +1048,31 @@ router.post(
   '/wallet/credit',
   authenticateToken as any,
   authorizeRoles('ADMIN') as any,
+  sensitiveAdminActionRateLimiter,
   validateBody(adminWalletCreditSchema),
   walletAdminControllerForAdminRoutes.credit as any
 );
 
+// ============================================================
+// 🔒 GET /api/admin/reconciliation/pending
+// POST /api/admin/reconciliation/:orderId/retry
+// 🆕 FIX P1 "Reconciliation/retry workflow" (audit a1.4) -- lihat
+// komentar lengkap di reconciliation.service.ts. Daftar order yang
+// settlement-nya masih menggantung (RETRY_REQUIRED/FAILED), dan
+// endpoint untuk memicu retry-nya secara terkendali oleh admin.
+// ============================================================
+router.get(
+  '/reconciliation/pending',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  reconciliationController.listPending as any
+);
+router.post(
+  '/reconciliation/:orderId/retry',
+  authenticateToken as any,
+  authorizeRoles('ADMIN') as any,
+  sensitiveAdminActionRateLimiter,
+  reconciliationController.retry as any
+);
+
 export const adminRouter = router;
-
-

@@ -14,6 +14,9 @@ export const DriverAPI = {
   acceptJob: async (jobId: string) =>
     (await api.patch(API_ENDPOINTS.order.accept(jobId))).data,
 
+  updateStopStatus: async (jobId: string, stopId: string, status: 'ARRIVED' | 'COMPLETED') =>
+    (await api.patch(`/api/order/${jobId}/stops/${stopId}/status`, { status })).data,
+
   updateJobStatus: async (jobId: string, status: string) =>
     (
       await api.post(

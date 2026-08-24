@@ -83,15 +83,56 @@ export class DispatchController {
   | Dispatch Status
   |--------------------------------------------------------------------------
   | Dibaca oleh customer/driver yang terlibat, atau admin.
+  |
+  | 🆕 FIX P1 "Dispatch status authorization" (audit): SEBELUMNYA endpoint
+  | ini HANYA dilindungi authenticateToken di route (dispatch.route.ts) --
+  | siapa pun yang sudah login (role apa pun, termasuk customer lain yang
+  | SAMA SEKALI TIDAK TERLIBAT di order ini) bisa membaca status dispatch
+  | order MANA PUN cukup dengan menebak/mengiterasi orderId. Komentar di
+  | atas endpoint ini SUDAH menyatakan niatnya ("customer/driver yang
+  | terlibat, atau admin") tapi implementasinya tidak pernah benar-benar
+  | menegakkan itu -- authentication (siapa Anda) saja tidak cukup, harus
+  | ada authorization (apakah Anda berhak lihat order INI).
+  |
+  | Sekarang order diambil dulu dari DB, lalu requester HARUS salah satu
+  | dari: customer pemilik order, driver yang ditugaskan (kalau sudah
+  | ada), atau ADMIN -- sama seperti pola yang sudah dipakai di
+  | OrderService.updateStatus() untuk endpoint order lainnya.
   */
   status = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
+      const userId = req.user?.id;
+      const role = req.user?.role;
+
+      if (!userId) {
+        throw new AppError("Tidak terautentikasi", 401);
+      }
       if (!orderId) {
         throw new AppError("orderId wajib diisi", 400);
       }
 
-      const result = this.dispatchService.getStatus(orderId);
+      const order = await prisma.order.findUnique({
+        where: { id: orderId },
+        include: { customer: true, driver: true },
+      });
+      if (!order) {
+        throw new NotFoundError("Order tidak ditemukan!");
+      }
+
+      const isOwningCustomer = order.customer?.userId === userId;
+      const isAssignedDriver = order.driver?.userId === userId;
+      const isAdmin = role === "ADMIN";
+
+      if (!isOwningCustomer && !isAssignedDriver && !isAdmin) {
+        throw new ForbiddenError("Anda tidak berhak melihat status dispatch order ini!");
+      }
+
+      // 🆕 FIX BUG BERSEBELAHAN: getStatus() adalah method async (return
+      // Promise) tapi sebelumnya dipanggil TANPA await -- res.json()
+      // akan men-serialize objek Promise itu sendiri (jadi `{}` kosong
+      // di response), bukan data status yang sebenarnya.
+      const result = await this.dispatchService.getStatus(orderId);
       return res.json({ success: true, data: result });
     } catch (error) {
       next(error);

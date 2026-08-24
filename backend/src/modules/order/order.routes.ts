@@ -3,20 +3,30 @@ import { OrderController } from './order.controller';
 import { authenticateToken, authorizeRoles } from '../../core/middleware/auth.middleware';
 import { validateBody } from '../../core/middleware/validation.middleware';
 import { createOrderSchema, updateOrderStatusSchema, merchantCheckoutSchema } from '../../core/validation/schemas';
+import { orderCreationRateLimiter } from '../../core/middleware/rateLimit.middleware';
 
 const router = Router();
 const orderController = new OrderController();
 
-router.post('/', authenticateToken as any, validateBody(createOrderSchema), orderController.create as any);
+router.post('/', authenticateToken as any, orderCreationRateLimiter, validateBody(createOrderSchema), orderController.create as any);
 // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari toko.
+router.post(
+  '/merchant-checkout/preview',
+  authenticateToken as any,
+  validateBody(merchantCheckoutSchema),
+  orderController.previewMerchantCheckout as any
+);
 router.post(
   '/merchant-checkout',
   authenticateToken as any,
+  orderCreationRateLimiter,
   validateBody(merchantCheckoutSchema),
   orderController.checkoutMerchant as any
 );
 router.get('/', authenticateToken as any, orderController.list as any);
+router.post('/:id/tip', authenticateToken as any, authorizeRoles('CUSTOMER') as any, orderController.giveTip as any);
 router.patch('/:id/accept', authenticateToken as any, authorizeRoles('DRIVER') as any, orderController.accept as any);
+router.patch('/:id/stops/:stopId/status', authenticateToken as any, authorizeRoles('DRIVER') as any, orderController.updateStopStatus as any);
 router.patch(
   '/:id/status',
   authenticateToken as any,

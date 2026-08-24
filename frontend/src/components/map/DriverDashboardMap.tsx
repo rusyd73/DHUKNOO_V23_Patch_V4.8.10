@@ -13,6 +13,7 @@ interface DriverDashboardMapProps {
   isOnline: boolean;
   initialCoords?: LatLng | null;
   onLocationUpdate: (coords: LatLng) => void;
+  compact?: boolean;
 }
 
 // ✅ PERBAIKAN 1: Tambahkan guard clause di RecenterOnMove
@@ -40,7 +41,8 @@ function RecenterOnMove({ position }: { position: LatLng | null }) {
 export default function DriverDashboardMap({ 
   isOnline, 
   initialCoords, 
-  onLocationUpdate 
+  onLocationUpdate,
+  compact = false,
 }: DriverDashboardMapProps) {
   const [coords, setCoords] = useState<LatLng | null>(initialCoords || null);
   const [accuracy, setAccuracy] = useState<number | null>(null);
@@ -122,6 +124,24 @@ export default function DriverDashboardMap({
 
   // ✅ PERBAIKAN 3: Pastikan selalu ada koordinat valid untuk MapContainer
   const displayCoords = coords || { lat: -7.9666, lng: 112.6326 };
+
+  if (compact) {
+    const gpsConnected = isOnline && Boolean(coords) && !permissionError;
+    return (
+      <div
+        className={`flex h-9 min-w-9 items-center justify-center sm:justify-between gap-1.5 px-2 sm:px-3 rounded-xl border ${permissionError ? 'bg-red-950/30 border-red-500/40 text-red-300' : gpsConnected ? 'bg-[#00E575]/10 border-[#00E575]/40 text-[#00E575]' : 'bg-[#06170E] border-[#23583E] text-[#A5C9B8]'}`}
+        title={permissionError || (gpsConnected ? 'GPS perangkat terhubung dan lokasi diperbarui otomatis.' : 'GPS belum terhubung.')}
+      >
+        <span className="flex items-center gap-1.5 text-[10px] font-bold">
+          {permissionError ? <WifiOff className="w-4 h-4" /> : <Navigation className={`w-4 h-4 ${gpsConnected ? 'animate-pulse' : ''}`} />}
+          <span className="hidden md:inline">{permissionError ? 'GPS tidak tersedia' : gpsConnected ? 'GPS terhubung' : isOnline ? 'Mencari GPS...' : 'GPS offline'}</span>
+        </span>
+        <span className="hidden xl:inline text-[9px] opacity-75">
+          {gpsConnected && lastUpdatedAt ? lastUpdatedAt.toLocaleTimeString('id-ID') : isOnline ? 'otomatis' : '—'}
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-[#0D2E1F] border border-[#23583E] p-4 rounded-3xl flex flex-col gap-3">

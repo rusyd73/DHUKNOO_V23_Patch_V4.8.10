@@ -1,6 +1,0 @@
-{
-  "name": "Dhuknoo Ride",
-  "description": "Integrated ride-hailing and delivery platform for Batu - Malang",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

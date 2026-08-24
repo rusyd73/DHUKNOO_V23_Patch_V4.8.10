@@ -110,3 +110,39 @@ export const authorizeRoles = (...allowedRoles: ('CUSTOMER' | 'DRIVER' | 'ADMIN'
     }
   };
 };
+
+// ============================================================
+// 🆕 FIX P1 "Logout pernah 401 tanpa auth; pastikan logout
+// idempotent/ditangani saat token sudah invalid" (audit driver-jobs).
+// Middleware TOLERAN -- kalau access token ADA dan valid, isi req.user
+// (sama seperti authenticateToken). Kalau TIDAK ADA atau tidak valid
+// (kedaluwarsa, malformed, dst), JANGAN tolak request -- lanjutkan saja
+// dengan req.user tetap undefined. Dipakai KHUSUS untuk endpoint yang
+// harus tetap bisa diproses dengan aman tanpa access token yang masih
+// hidup (logout adalah contoh utamanya -- lihat auth.controller.ts).
+// TIDAK dipakai untuk endpoint yang benar-benar butuh identitas user
+// (pakai authenticateToken biasa untuk itu).
+// ============================================================
+export const optionalAuthenticateToken = (
+  req: AuthenticatedRequest,
+  _res: Response,
+  next: NextFunction
+) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return next();
+  }
+
+  jwt.verify(token, ENV.JWT_SECRET, (err, decoded) => {
+    if (!err && decoded) {
+      req.user = decoded as AuthenticatedRequest['user'];
+    }
+    // Token tidak valid/kedaluwarsa -> diam-diam lanjut TANPA req.user,
+    // bukan 401. Sengaja TIDAK melakukan cek isActive/Redis di sini
+    // (beda dengan authenticateToken) karena tujuan middleware ini
+    // murni "identifikasi kalau bisa", bukan gerbang otorisasi.
+    next();
+  });
+};

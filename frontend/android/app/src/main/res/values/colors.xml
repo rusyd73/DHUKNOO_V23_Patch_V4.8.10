@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 🆕 File ini sebelumnya TIDAK ADA sama sekali, padahal styles.xml
+         mereferensikan @color/colorPrimary, @color/colorPrimaryDark, dan
+         @color/colorAccent -- resource yang hilang bisa bikin build APK
+         gagal. Warna di bawah disamakan dengan tema brand DHUKNOO baru
+         (hijau gelap, senada splash screen & app icon). -->
+    <color name="colorPrimary">#0B170F</color>
+    <color name="colorPrimaryDark">#06170E</color>
+    <color name="colorAccent">#00E575</color>
+</resources>

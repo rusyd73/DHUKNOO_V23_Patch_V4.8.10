@@ -3,19 +3,22 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { socket, joinRoom } from '../services/socket';
 import { formatRupiah, calculateHaversineDistance } from '@obama/shared-utils';
 import { useAuthStore } from '../store/useAuthStore';
-import { CustomerAPI, UploadAPI, OrderAPI, PaymentAPI } from '../api';
+import { CustomerAPI, UploadAPI, OrderAPI, PaymentAPI, LocationAPI } from '../api';
 import { OrderChatBox } from '../components/chat/OrderChatBox';
 import { TopupModal, QrisCameraScannerModal } from '../components/modals/SharedModals';
 import AuthFlow from '../components/auth/AuthFlow';
 import { SkeletonList } from '../components/common/Skeleton';
 import { QueryErrorState } from '../components/common/QueryErrorState';
 import MerchantOrderModal from '../components/customer/MerchantOrderModal';
+import { playBellRingSound, warmupAudioContext } from '../utils/audio';
 import {
   Camera,
+  ChevronDown,
   Clock,
   Copy,
   History,
   Lock,
+  MapPin,
   MessageCircle,
   PlusCircle,
   QrCode,
@@ -46,6 +49,13 @@ function MapLoadingFallback() {
 const LocationPicker = React.lazy(() => import('../components/map/LocationPicker'));
 const LiveTripMap = React.lazy(() => import('../components/map/LiveTripMap'));
 
+
+const EXTERNAL_PROOF_METHODS = ['QRIS', 'TRANSFER', 'EWALLET'];
+const isExternalPaymentPending = (order: any) =>
+  order?.status === 'COMPLETED' &&
+  !order?.isPaid &&
+  EXTERNAL_PROOF_METHODS.includes(order?.paymentMethod);
+
 interface PortalProps {
   onBack: () => void;
   triggerToast: (m: string) => void;
@@ -72,6 +82,11 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   const [pickup, setPickup] = useState('');
   const [dropoff, setDropoff] = useState('');
   const [service, setService] = useState<'BIKE' | 'CAR' | 'SEND'>('BIKE');
+  const [sendItemDescription, setSendItemDescription] = useState('');
+  const [sendPackageSize, setSendPackageSize] = useState<'SMALL' | 'MEDIUM' | 'LARGE'>('SMALL');
+  const [sendWeightKg, setSendWeightKg] = useState('');
+  const [sendHandlingNotes, setSendHandlingNotes] = useState('');
+  const [sendVehicleRequirement, setSendVehicleRequirement] = useState<'AUTO' | 'BIKE' | 'CAR'>('AUTO');
   // 🆕 (Link Merchant <-> Order): toggle modal belanja dari toko.
   const [showMerchantModal, setShowMerchantModal] = useState(false);
   const [topupAmount, setTopupAmount] = useState('');
@@ -93,6 +108,20 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   // Modal states & mutations
   const [showQrisScanner, setShowQrisScanner] = useState(false);
   const [isTopupModalOpen, setIsTopupModalOpen] = useState(false);
+  // 🆕 AUTO-HIDE (perbaikan): sebelumnya widget Saldo Dompet & Riwayat Order
+  // hanya disembunyikan KETIKA ada perjalanan aktif — jadi di kondisi normal
+  // (tidak ada perjalanan) keduanya tetap tampil penuh seperti semula. Sesuai
+  // masukan, sekarang keduanya collapsed/tersembunyi SECARA DEFAULT (persis
+  // seperti panel "Pengaturan Tampilan & Aksesibilitas" di dashboard utama),
+  // dan baru terbuka kalau customer sengaja mengetuk headernya. Saat ada
+  // perjalanan aktif, keduanya tetap otomatis disembunyikan total (Mode
+  // Fokus) tanpa bisa dibuka manual.
+  const [showWalletDetails, setShowWalletDetails] = useState(false);
+  const [showRideHistory, setShowRideHistory] = useState(false);
+  const [showPickupMap, setShowPickupMap] = useState(false);
+  const [showDropoffMap, setShowDropoffMap] = useState(false);
+  const activeOrderFocusRef = React.useRef<HTMLDivElement | null>(null);
+  const focusedOrderIdRef = React.useRef<string | null>(null);
 
   const cancelOrderMutation = useMutation({
     mutationFn: (orderId: string) => OrderAPI.updateStatus(orderId, 'CANCELLED'),
@@ -121,16 +150,31 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
     mutationFn: (payload: any) => CustomerAPI.createOrder(payload),
     onSuccess: (res: any) => {
       const finalFare = res?.breakdown?.finalFare;
+      const orderNumber = res?.order?.orderNumber || (res?.order?.id ? `DHN-${String(res.order.id).replace(/-/g, '').slice(0, 8).toUpperCase()}` : '');
       triggerToast(
         finalFare !== undefined
-          ? `Order dipublikasikan! Tarif final (Tariff Engine): ${formatRupiah(finalFare)}`
-          : res.message || 'Order ojek berhasil dipublikasikan!'
+          ? `Order ${orderNumber} dipublikasikan! Tarif final: ${formatRupiah(finalFare)}`
+          : `${orderNumber ? `Order ${orderNumber}` : 'Order'} berhasil dipublikasikan!`
       );
+      // 🆕 FIX: sebelumnya publikasi order (semua layanan, termasuk
+      // ride/BIKE/CAR) sama sekali tidak berbunyi apa pun -- hanya toast
+      // teks tanpa suara, beda dengan dashboard Merchant yang selalu
+      // berbunyi bel untuk order masuk. Sekarang dikasih 1x bunyi bel
+      // singkat sebagai konfirmasi audible bahwa order berhasil
+      // dipublikasikan & sedang dicarikan driver.
+      try {
+        playBellRingSound();
+      } catch (error) {
+        console.error('❌ Gagal memutar bunyi konfirmasi order:', error);
+      }
       // Auto clear pencarian alamat setelah sukses membuat order
       setPickup('');
       setDropoff('');
       setPickupCoords(null);
       setDropoffCoords(null);
+      setShowPickupMap(false);
+      setShowDropoffMap(false);
+      setExtraStops([]);
       setRouteResetKey((k) => k + 1);
       queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
     },
@@ -157,6 +201,9 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
     setDropoff('');
     setPickupCoords(null);
     setDropoffCoords(null);
+    setShowPickupMap(false);
+    setShowDropoffMap(false);
+    setExtraStops([]);
     setRouteResetKey((k) => k + 1);
     triggerToast('🧹 Pencarian alamat rute berhasil di-reset!');
   };
@@ -181,6 +228,18 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal memproses pembayaran!');
     },
+  });
+
+  const [tipAmounts, setTipAmounts] = useState<Record<string, string>>({});
+  const tipMutation = useMutation({
+    mutationFn: ({ orderId, amount }: { orderId: string; amount: number }) => CustomerAPI.giveDriverTip(orderId, amount),
+    onSuccess: (res: any, variables) => {
+      triggerToast(res?.message || 'Tips berhasil dikirim kepada driver.');
+      setTipAmounts((current) => ({ ...current, [variables.orderId]: '' }));
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      queryClient.invalidateQueries({ queryKey: ['customerProfile'] });
+    },
+    onError: (err: any) => triggerToast(err.response?.data?.error || 'Gagal mengirim tips.'),
   });
 
   // Upload bukti bayar manual (QRIS/Transfer/E-Wallet) — belum ada gateway otomatis,
@@ -210,6 +269,29 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   // cuma estimasi kasar untuk pratinjau sebelum submit.
   const [pickupCoords, setPickupCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [dropoffCoords, setDropoffCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [deviceCoords, setDeviceCoords] = useState<{ lat: number; lng: number } | null>(null);
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (position) => setDeviceCoords({ lat: position.coords.latitude, lng: position.coords.longitude }),
+      () => undefined,
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 },
+    );
+  }, []);
+  const availabilityCoords = pickupCoords || deviceCoords;
+  const { data: nearbyDriversData, isFetching: isCheckingNearbyDrivers } = useQuery({
+    queryKey: ['nearbyDriverAvailability', availabilityCoords?.lat, availabilityCoords?.lng, service, sendVehicleRequirement, sendPackageSize, sendWeightKg],
+    queryFn: () => LocationAPI.getNearbyAvailability(
+      availabilityCoords!.lat,
+      availabilityCoords!.lng,
+      service,
+      5,
+      service === 'SEND' && (sendPackageSize === 'LARGE' || Number(sendWeightKg || 0) > 20) ? 'CAR' : service === 'SEND' ? sendVehicleRequirement : 'AUTO',
+    ),
+    enabled: !!user && Boolean(availabilityCoords),
+    refetchInterval: availabilityCoords ? 15000 : false,
+    refetchIntervalInBackground: true,
+  });
   // PERBAIKAN: LocationPicker punya kotak pencarian internal sendiri (uncontrolled) —
   // memanggil setPickup('')/setPickupCoords(null) dari parent TIDAK otomatis
   // mengosongkan teks yang sudah diketik di kotak pencariannya. resetKey dipakai
@@ -217,12 +299,66 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   // rute direset (baik lewat tombol "Reset Alamat" maupun otomatis setelah order
   // berhasil dibuat), sehingga kotak pencariannya benar-benar ikut bersih.
   const [routeResetKey, setRouteResetKey] = useState(0);
+  const [extraStops, setExtraStops] = useState<Array<{ address: string; coords: { lat: number; lng: number } | null; note: string; key: number }>>([]);
+  const addExtraStop = () => {
+    if (extraStops.length >= 4) return triggerToast('Maksimal 4 tujuan tambahan.');
+    setExtraStops((items) => [...items, { address: '', coords: null, note: '', key: Date.now() + items.length }]);
+  };
+  const updateExtraStop = (index: number, patch: any) => setExtraStops((items) => items.map((item, i) => i === index ? { ...item, ...patch } : item));
+  const removeExtraStop = (index: number) => setExtraStops((items) => items.filter((_, i) => i !== index));
   const [driverCoords, setDriverCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [martPickupNotice, setMartPickupNotice] = useState<{ kind: 'heading' | 'arrived' | 'headingCustomer' | 'arrivedCustomer'; orderNumber?: string; message: string } | null>(null);
 
   // Active order detection
   const activeOrder = ordersData?.orders?.find(
-    (o: any) => ['PENDING', 'ACCEPTED', 'ON_THE_WAY', 'ARRIVED'].includes(o.status)
+    (o: any) =>
+      ['PENDING', 'ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(o.status) ||
+      isExternalPaymentPending(o)
   );
+
+  useEffect(() => {
+    if (!activeOrder?.id || focusedOrderIdRef.current === activeOrder.id) return;
+    focusedOrderIdRef.current = activeOrder.id;
+    window.setTimeout(() => activeOrderFocusRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 150);
+  }, [activeOrder?.id]);
+
+  // Durable UI fallback: if the customer opens/reloads the dashboard after
+  // the realtime event was emitted, reconstruct the MART pickup notification
+  // from the authoritative order status instead of relying on Socket.IO only.
+  useEffect(() => {
+    if (!activeOrder || activeOrder.serviceType !== 'MART') {
+      setMartPickupNotice(null);
+      return;
+    }
+    const orderNumber = activeOrder.orderNumber || `DHN-${String(activeOrder.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+    if (activeOrder.status === 'ACCEPTED' || activeOrder.status === 'ON_THE_WAY') {
+      setMartPickupNotice({
+        kind: 'heading',
+        orderNumber,
+        message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+      });
+    } else if (activeOrder.status === 'ARRIVED') {
+      setMartPickupNotice({
+        kind: 'arrived',
+        orderNumber,
+        message: 'Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.',
+      });
+    } else if (activeOrder.status === 'PICKED_UP') {
+      setMartPickupNotice({
+        kind: 'headingCustomer',
+        orderNumber,
+        message: 'Pesanan sudah diambil driver dan sedang menuju lokasi Anda.',
+      });
+    } else if (activeOrder.status === 'ARRIVED_CUSTOMER') {
+      setMartPickupNotice({
+        kind: 'arrivedCustomer',
+        orderNumber,
+        message: 'Driver telah tiba di lokasi Anda.',
+      });
+    } else if (activeOrder.status === 'PENDING') {
+      setMartPickupNotice(null);
+    }
+  }, [activeOrder?.id, activeOrder?.status, activeOrder?.serviceType, activeOrder?.orderNumber]);
 
   // Join active order socket room
   useEffect(() => {
@@ -250,49 +386,149 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderAccepted = (data: any) => {
       console.log('Order accepted socket event:', data);
       queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      // 🆕 FIX: sebelumnya event ini (order diterima driver) tidak berbunyi
+      // sama sekali -- hanya toast teks. Untuk layanan ride (BIKE/CAR) ini
+      // momen penting yang layak dikasih notifikasi bunyi, sama seperti
+      // notifikasi order masuk di dashboard Merchant.
+      try {
+        playBellRingSound();
+      } catch (error) {
+        console.error('❌ Gagal memutar bunyi notifikasi order diterima:', error);
+      }
       // Backend sekarang mengirim driver.fullName & driver.vehiclePlate
       // (lihat order.service.ts / dispatch.service.ts / job.routes.ts) —
       // field ini memang bisa kosong sesaat kalau relasi driver belum
       // ter-load, jadi tetap ada fallback pesan generik.
       triggerToast(
         data?.driver?.fullName
-          ? `🎉 Orderan DITERIMA oleh ${data.driver.fullName}! (${data.driver.vehiclePlate || 'Mitra Driver'})`
-          : '🎉 Orderan Anda telah diterima oleh Mitra Driver!'
+          ? `🎉 ${data.orderNumber ? `Order ${data.orderNumber}` : 'Orderan'} DITERIMA oleh ${data.driver.fullName}! (${data.driver.vehiclePlate || 'Mitra Driver'})`
+          : `🎉 ${data.orderNumber ? `Order ${data.orderNumber}` : 'Orderan Anda'} telah diterima oleh Mitra Driver!`
       );
     };
 
+    const handleMartDriverHeading = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'heading',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+      });
+      triggerToast(`🏪 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver menuju merchant.`);
+    };
+
+    const handleMartDriverArrived = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'arrived',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver telah tiba di lokasi merchant dan sedang mengambil pesanan Anda.',
+      });
+      triggerToast(`📍 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver telah tiba di merchant.`);
+    };
+
+    const handleMartDriverHeadingCustomer = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'headingCustomer',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Pesanan sudah diambil driver dan sedang menuju lokasi Anda.',
+      });
+      triggerToast(`🚚 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver menuju customer.`);
+    };
+
+    const handleMartDriverArrivedCustomer = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      setMartPickupNotice({
+        kind: 'arrivedCustomer',
+        orderNumber: data?.orderNumber,
+        message: data?.message || 'Driver telah tiba di lokasi Anda.',
+      });
+      triggerToast(`📍 ${data?.orderNumber ? `Order ${data.orderNumber}: ` : ''}Driver telah tiba di customer.`);
+    };
+
+    const handleOrderStopChanged = (payload: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      const stop = payload?.stop;
+      if (stop) triggerToast(stop.status === 'ARRIVED' ? `📍 Driver tiba di tujuan ${stop.sequence}` : `✅ Tujuan ${stop.sequence} selesai`);
+    };
     const handleOrderStatusChanged = (data: any) => {
       console.log('Order status changed socket event:', data);
       queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
       if (data?.status) {
+        const isMart = data?.serviceType === 'MART';
+        const isSend = data?.serviceType === 'SEND';
         const statusMap: Record<string, string> = {
           ACCEPTED: 'Driver menerima pesanan',
-          ARRIVED_PICKUP: 'Driver telah Tiba di Lokasi Penjemputan',
-          IN_PROGRESS: 'Dalam perjalanan menuju Lokasi Tujuan',
-          COMPLETED: 'Perjalanan Selesai. Terima kasih!',
-          CANCELLED: 'Pesanan telah Dibatalkan',
+          ON_THE_WAY: isMart ? 'Driver sedang menuju merchant' : isSend ? 'Driver sedang menuju lokasi pengambilan barang' : 'Driver sedang menuju lokasi jemput customer',
+          ARRIVED: isMart ? 'Driver telah tiba di lokasi merchant' : isSend ? 'Driver telah tiba di lokasi pengambilan barang' : 'Driver telah tiba di lokasi jemput customer',
+          PICKED_UP: isMart ? 'Pesanan diambil, driver menuju customer' : isSend ? 'Barang telah diambil dan sedang menuju penerima' : 'Customer telah dijemput dan perjalanan menuju tujuan',
+          ARRIVED_CUSTOMER: isMart ? 'Driver telah tiba di lokasi customer' : isSend ? 'Driver telah tiba di lokasi penerima barang' : 'Driver telah tiba di lokasi tujuan customer',
+          ARRIVED_PICKUP: 'Driver telah tiba di lokasi penjemputan',
+          IN_PROGRESS: 'Dalam perjalanan menuju lokasi tujuan',
+          COMPLETED: 'Order telah selesai',
+          CANCELLED: 'Pesanan telah dibatalkan',
         };
         triggerToast(`🔔 Update Perjalanan: ${statusMap[data.status] || data.status}`);
       }
     };
 
+    const handlePaymentProofRequired = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      playBellRingSound();
+      triggerToast(`💳 ${data?.message || 'Perjalanan sudah tiba di tujuan. Silakan upload bukti bayar agar order dapat diselesaikan.'}`);
+    };
+    const handlePaymentProofSubmitted = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      triggerToast(`⏳ ${data?.message || 'Bukti bayar sedang ditinjau Admin.'}`);
+    };
+    const handlePaymentProofRejected = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      playBellRingSound();
+      triggerToast(`⚠️ ${data?.message || 'Bukti bayar ditolak. Silakan upload ulang.'}`);
+    };
+    const handlePaymentConfirmed = () => {
+      queryClient.invalidateQueries({ queryKey: ['customerOrders'] });
+      triggerToast('✅ Pembayaran disetujui. Order sekarang benar-benar selesai.');
+    };
+
     socket.on('location_changed', handleLocationChanged);
     socket.on('order_accepted', handleOrderAccepted);
+    socket.on('mart_driver_heading_to_merchant', handleMartDriverHeading);
+    socket.on('mart_driver_arrived_at_merchant', handleMartDriverArrived);
+    socket.on('mart_driver_heading_to_customer', handleMartDriverHeadingCustomer);
+    socket.on('mart_driver_arrived_at_customer', handleMartDriverArrivedCustomer);
     socket.on('order_status_changed', handleOrderStatusChanged);
+    socket.on('order_stop_changed', handleOrderStopChanged);
+    socket.on('payment_proof_required', handlePaymentProofRequired);
+    socket.on('payment_proof_submitted', handlePaymentProofSubmitted);
+    socket.on('payment_proof_rejected', handlePaymentProofRejected);
+    socket.on('payment_confirmed', handlePaymentConfirmed);
+    socket.on('order_paid', handlePaymentConfirmed);
 
     return () => {
       socket.off('location_changed', handleLocationChanged);
       socket.off('order_accepted', handleOrderAccepted);
+      socket.off('mart_driver_heading_to_merchant', handleMartDriverHeading);
+      socket.off('mart_driver_arrived_at_merchant', handleMartDriverArrived);
+      socket.off('mart_driver_heading_to_customer', handleMartDriverHeadingCustomer);
+      socket.off('mart_driver_arrived_at_customer', handleMartDriverArrivedCustomer);
+      socket.off('order_stop_changed', handleOrderStopChanged);
       socket.off('order_status_changed', handleOrderStatusChanged);
+      socket.off('payment_proof_required', handlePaymentProofRequired);
+      socket.off('payment_proof_submitted', handlePaymentProofSubmitted);
+      socket.off('payment_proof_rejected', handlePaymentProofRejected);
+      socket.off('payment_confirmed', handlePaymentConfirmed);
+      socket.off('order_paid', handlePaymentConfirmed);
     };
   }, [queryClient, triggerToast]);
 
 
   const [paymentMethod, setPaymentMethod] = useState<'WALLET' | 'CASH' | 'QRIS' | 'TRANSFER' | 'EWALLET'>('WALLET');
-  const estimatedDistanceKm =
-    pickupCoords && dropoffCoords
-      ? calculateHaversineDistance(pickupCoords.lat, pickupCoords.lng, dropoffCoords.lat, dropoffCoords.lng)
-      : 0;
+  const estimatedDistanceKm = (() => {
+    if (!pickupCoords || !dropoffCoords) return 0;
+    const points = [pickupCoords, dropoffCoords, ...extraStops.map((s) => s.coords).filter(Boolean) as { lat: number; lng: number }[]];
+    return points.slice(1).reduce((total, point, index) => total + calculateHaversineDistance(points[index].lat, points[index].lng, point.lat, point.lng), 0);
+  })();
   // Estimasi kasar hanya untuk pratinjau UI — bukan harga final (final dihitung server).
   const calculatedPrice =
     service === 'BIKE' ? 5000 + estimatedDistanceKm * 2000 :
@@ -367,6 +603,18 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
       triggerToast('Mohon pilih titik penjemputan DAN tujuan di peta (klik pada peta)!');
       return;
     }
+    if (extraStops.some((stop) => !stop.address || !stop.coords)) {
+      triggerToast('Lengkapi semua tujuan tambahan atau hapus tujuan yang belum diisi.');
+      return;
+    }
+    if (service === 'SEND') {
+      const weight = Number(sendWeightKg);
+      if (sendItemDescription.trim().length < 3) return triggerToast('Isi deskripsi barang minimal 3 karakter.');
+      if (!Number.isFinite(weight) || weight <= 0) return triggerToast('Isi perkiraan berat barang yang valid.');
+      if ((sendPackageSize === 'LARGE' || weight > 20) && sendVehicleRequirement === 'BIKE') {
+        return triggerToast('Barang besar atau di atas 20 kg wajib menggunakan mobil.');
+      }
+    }
 
     orderMutation.mutate({
       serviceType: service,
@@ -377,7 +625,15 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
       dropoffAddress: dropoff,
       dropoffLat: dropoffCoords.lat,
       dropoffLng: dropoffCoords.lng,
+      extraStops: extraStops.map((stop) => ({ address: stop.address, lat: stop.coords!.lat, lng: stop.coords!.lng, note: stop.note || undefined })),
       paymentMethod,
+      ...(service === 'SEND' ? {
+        itemDescription: sendItemDescription.trim(),
+        packageSize: sendPackageSize,
+        estimatedWeightKg: Number(sendWeightKg),
+        handlingNotes: sendHandlingNotes.trim() || undefined,
+        vehicleRequirement: sendVehicleRequirement,
+      } : {}),
     });
   };
 
@@ -395,105 +651,191 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
   return (
     <div className="w-full max-w-7xl mx-auto px-4 py-8 flex flex-col gap-6 flex-1">
       {/* Title Panel */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-[#0D2E1F] p-6 rounded-3xl border border-[#23583E]">
-        <div>
-          <h2 className="text-3xl font-black text-[#FFD700]">Client Portal - Dhuknoo Customer</h2>
-          <p className="text-xs text-[#A5C9B8]">Konektivitas langsung ke API Endpoint Customer: `/api/customer/*`</p>
+      <div className="sticky top-[70px] z-30 flex items-center justify-between gap-2 bg-[#0D2E1F] px-3 sm:px-4 py-2.5 rounded-2xl border border-[#23583E] shadow-lg shadow-[#06170E]/30">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-9 h-9 rounded-xl bg-[#FFD700]/15 flex items-center justify-center text-lg shrink-0">👤</span>
+          <div className="min-w-0">
+            <h2 className="text-sm sm:text-base font-black text-[#FFD700] truncate">Portal Customer</h2>
+            <p className="text-[9px] text-white font-bold truncate">{profileData?.fullName || user?.fullName || user?.email || 'Memuat akun...'}</p>
+            <p className="hidden sm:block text-[8px] text-[#A5C9B8] truncate">Layanan DHUKNOO</p>
+          </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2 shrink-0">
+          <div
+            className="h-9 flex items-center gap-1.5 rounded-xl border border-[#00E575]/40 bg-[#00E575]/10 px-2 sm:px-3 text-[#00E575]"
+            title="Integrasi genggam OS aktif"
+          >
+            <Smartphone className="w-4 h-4" />
+            <span className="hidden md:inline text-[10px] font-bold">OS Terhubung</span>
+          </div>
           <button 
             onClick={() => {
               refetchProfile();
               refetchOrders();
               triggerToast('Sinkronisasi data backend berhasil!');
             }}
-            className="flex items-center gap-2 bg-[#23583E] hover:bg-[#23583E]/80 text-[#00E575] text-xs font-bold px-4 py-2.5 rounded-xl transition-all"
+            className="flex items-center gap-1.5 bg-[#23583E] hover:bg-[#23583E]/80 text-[#00E575] text-[10px] font-bold px-3 py-2 rounded-xl transition-all"
           >
             <RefreshCw className="w-4 h-4" />
-            <span>Segarkan</span>
+            <span className="hidden sm:inline">Segarkan</span>
           </button>
         </div>
       </div>
 
+      {/* Indikator privat: hanya jumlah driver eligible dan jarak terdekat,
+          tanpa membuka identitas maupun koordinat driver. */}
+      <div className="flex items-center justify-between gap-3 bg-[#0D2E1F] border border-[#23583E] px-3 py-2.5 rounded-2xl text-[10px]">
+        <span className="flex items-center gap-2 text-[#A5C9B8] min-w-0">
+          <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${Number(nearbyDriversData?.data?.availableCount || 0) > 0 ? 'bg-[#00E575] animate-pulse' : 'bg-[#FFD700]'}`} />
+          <span className="truncate">Driver {service} online di sekitar {pickupCoords ? 'titik jemput' : 'lokasi Anda'}</span>
+        </span>
+        <span className="font-black text-white shrink-0">
+          {!availabilityCoords
+            ? 'Aktifkan GPS / pilih jemput'
+            : isCheckingNearbyDrivers
+              ? 'Memeriksa...'
+              : `${Number(nearbyDriversData?.data?.availableCount || 0)} tersedia${nearbyDriversData?.data?.nearestDistanceKm != null ? ` • ±${nearbyDriversData.data.nearestDistanceKm} km` : ''}`}
+        </span>
+      </div>
+
+      {/* 🎯 MODE FOKUS PERJALANAN AKTIF
+          🆕 FIX: sebelumnya banner ini ditaruh di PALING BAWAH grid
+          (menggantikan kolom kanan), jadi customer harus scroll melewati
+          seluruh kartu perjalanan + chat driver dulu baru terlihat — nyaris
+          tidak kebaca. Sekarang dipindah ke PALING ATAS halaman (tepat di
+          bawah judul portal, sebelum kartu perjalanan/chat) dan dibuat
+          `sticky` supaya tetap terlihat di tengah layar walau discroll. */}
+      {activeOrder && (
+        <div ref={activeOrderFocusRef} className="bg-[#0D2E1F] border-2 border-[#00E575] shadow-[0_0_25px_-5px_rgba(0,229,117,0.4)] p-4 rounded-3xl flex flex-col items-center gap-1 text-center scroll-mt-24">
+          <span className="text-2xl leading-none">🎯</span>
+          <span className="text-sm font-black text-[#00E575]">Mode Fokus Perjalanan Aktif</span>
+          <p className="text-[11px] text-[#A5C9B8]/80 max-w-md">
+            Saldo Dompet & Riwayat Order Perjalanan disembunyikan sementara supaya Anda fokus memantau perjalanan yang sedang berlangsung di bawah ini. Panel akan muncul kembali setelah perjalanan selesai.
+          </p>
+        </div>
+      )}
+
       {/* Main Layout Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
-        {/* Left Column: Wallet & Bookings */}
-        <div className="flex flex-col gap-6 lg:col-span-2">
-          {/* Wallet Balance Widget */}
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-6 rounded-3xl grid grid-cols-1 md:grid-cols-2 gap-6 relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-[#FFD700]/5 rounded-full transform translate-x-10 -translate-y-10"></div>
-            
-            <div className="flex flex-col justify-between gap-4">
-              <div className="flex items-center gap-2 text-[#00E575]">
-                <Wallet className="w-5 h-5" />
-                <span className="font-bold text-sm tracking-wider uppercase">Saldo Dompet DHUKNOO</span>
-              </div>
-              {/* 🆕 Nama customer — ditampilkan tepat di atas ID Dompet/saldo,
-                  mengisi ruang kosong sejajar dengan status saldo di atasnya. */}
-              <div>
-                <span className="text-[10px] text-[#A5C9B8] block">Nama: {profileData?.fullName || 'Memuat...'}</span>
-                <span className="text-[10px] text-[#A5C9B8] block">ID Dompet: {profileData?.wallet?.id || 'Memuat...'}</span>
-                <span className="text-4xl font-black text-white">
-                  {formatRupiah(Number(profileData?.wallet?.balance || 0))}
-                </span>
-              </div>
-              <p className="text-[10px] text-[#A5C9B8]/70">Dapat diisi ulang secara langsung untuk transaksi ojek otonom.</p>
-            </div>
-
-            {/* Top-up Form */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                setIsTopupModalOpen(true);
-              }}
-              className="bg-[#06170E] p-4 rounded-2xl border border-[#23583E] flex flex-col gap-3 justify-center"
+        {/* Left Column: Wallet & Bookings
+            🎯 MODE FOKUS PERJALANAN: saat ada activeOrder, kolom ini melebar
+            penuh (lg:col-span-3) supaya perjalanan yang sedang berlangsung
+            jadi pusat perhatian, sementara kolom kanan (riwayat, dsb) auto-hide
+            — lihat kondisi di bawah. */}
+        <div className={`flex flex-col gap-6 ${activeOrder ? 'lg:col-span-3' : 'lg:col-span-2'}`}>
+          {/* Wallet Balance Widget
+              🆕 AUTO-HIDE (perbaikan): sekarang collapsed/tersembunyi SECARA
+              DEFAULT — hanya header ringkas (saldo + tombol expand) yang
+              selalu terlihat. Detail lengkap (ID Dompet, form isi ulang)
+              baru muncul kalau customer mengetuk headernya. Saat ada
+              perjalanan aktif, seluruh widget ini (termasuk headernya)
+              disembunyikan total — bagian dari Mode Fokus Perjalanan. */}
+          {!activeOrder && (
+          <div className="bg-[#0D2E1F] border border-[#23583E] rounded-3xl relative overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowWalletDetails((v) => !v)}
+              aria-expanded={showWalletDetails}
+              className="w-full flex items-center justify-between gap-3 p-6 text-left cursor-pointer relative z-10"
             >
-              <span className="text-xs font-bold text-[#FFD700] flex items-center gap-1">
-                <PlusCircle className="w-4 h-4" /> Isi Ulang Saldo (Pilihan Metode)
-              </span>
-              <div className="flex gap-2">
-                <input 
-                  type="number" 
-                  value={topupAmount}
-                  onChange={(e) => setTopupAmount(e.target.value)}
-                  placeholder="Nominal (Contoh: 50000)" 
-                  className="bg-[#0D2E1F] border border-[#23583E] text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-[#FFD700] flex-1"
-                />
-                <button 
-                  type="submit"
-                  className="bg-[#00E575] text-[#071F14] hover:bg-[#00ff80] px-4 py-2 rounded-xl text-xs font-bold transition-all whitespace-nowrap"
-                >
-                  Pilih Bayar
-                </button>
+              <div className="flex items-center gap-2 text-[#00E575] min-w-0">
+                <Wallet className="w-5 h-5 shrink-0" />
+                <div className="flex flex-col min-w-0">
+                  <span className="font-bold text-sm tracking-wider uppercase">Saldo Dompet DHUKNOO</span>
+                  <span className="text-lg font-black text-white truncate">
+                    {formatRupiah(Number(profileData?.wallet?.balance || 0))}
+                  </span>
+                </div>
               </div>
-              <div className="flex gap-2 justify-between">
-                {[20000, 50000, 100000].map((amt) => (
-                  <button 
-                    key={amt}
-                    type="button"
-                    onClick={() => {
-                      setTopupAmount(String(amt));
-                      setIsTopupModalOpen(true);
-                    }}
-                    className="bg-[#0D2E1F]/60 border border-[#23583E]/50 hover:border-[#FFD700] text-white text-[10px] px-2 py-1 rounded-lg flex-1 text-center font-bold"
-                  >
-                    +{formatRupiah(amt)}
-                  </button>
-                ))}
-              </div>
-            </form>
-          </div>
+              <ChevronDown
+                className={`w-4 h-4 shrink-0 text-[#A5C9B8] transition-transform ${showWalletDetails ? 'rotate-180' : ''}`}
+              />
+            </button>
 
-          {/* Active Order Live Tracking Map */}
+            {showWalletDetails && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 px-6 pb-6">
+              <div className="absolute top-0 right-0 w-32 h-32 bg-[#FFD700]/5 rounded-full transform translate-x-10 -translate-y-10 pointer-events-none"></div>
+              
+              <div className="flex flex-col justify-between gap-4">
+                {/* 🆕 Nama customer — ditampilkan tepat di atas ID Dompet/saldo,
+                    mengisi ruang kosong sejajar dengan status saldo di atasnya. */}
+                <div>
+                  <span className="text-[10px] text-[#A5C9B8] block">Nama: {profileData?.fullName || 'Memuat...'}</span>
+                  <span className="text-[10px] text-[#A5C9B8] block">ID Dompet: {profileData?.wallet?.id || 'Memuat...'}</span>
+                </div>
+                <p className="text-[10px] text-[#A5C9B8]/70">Dapat diisi ulang secara langsung untuk transaksi ojek otonom.</p>
+              </div>
+
+              {/* Top-up Form */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  setIsTopupModalOpen(true);
+                }}
+                className="bg-[#06170E] p-4 rounded-2xl border border-[#23583E] flex flex-col gap-3 justify-center"
+              >
+                <span className="text-xs font-bold text-[#FFD700] flex items-center gap-1">
+                  <PlusCircle className="w-4 h-4" /> Isi Ulang Saldo (Pilihan Metode)
+                </span>
+                <div className="flex flex-col sm:flex-row gap-2 w-full">
+                  <input 
+                    type="number" 
+                    value={topupAmount}
+                    onChange={(e) => setTopupAmount(e.target.value)}
+                    placeholder="Nominal (Contoh: 50000)" 
+                    className="bg-[#0D2E1F] border border-[#23583E] text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-[#FFD700] w-full min-w-0 sm:flex-1"
+                  />
+                  <button 
+                    type="submit"
+                    className="bg-[#00E575] text-[#071F14] hover:bg-[#00ff80] px-4 py-2 rounded-xl text-xs font-bold transition-all whitespace-nowrap w-full sm:w-auto min-h-10"
+                  >
+                    Pilih Bayar
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-2 w-full">
+                  {[20000, 50000, 100000].map((amt) => (
+                    <button 
+                      key={amt}
+                      type="button"
+                      onClick={() => {
+                        setTopupAmount(String(amt));
+                        setIsTopupModalOpen(true);
+                      }}
+                      className="bg-[#0D2E1F]/60 border border-[#23583E]/50 hover:border-[#FFD700] text-white text-[10px] px-2 py-1 rounded-lg flex-1 text-center font-bold"
+                    >
+                      +{formatRupiah(amt)}
+                    </button>
+                  ))}
+                </div>
+              </form>
+            </div>
+            )}
+          </div>
+          )}
+
+          {/* Active Order Live Tracking Map
+              🆕 FIX: sekarang dibungkus wrapper `max-w-3xl mx-auto` supaya
+              kartu ini benar-benar CENTERED secara visual di tengah layar
+              (bukan melebar penuh ke tepi kolom), menjadikannya pusat
+              perhatian yang jelas -- sesuai permintaan "fokus centered pada
+              live tracking GPS". */}
           {activeOrder && (
+            <div className="w-full max-w-3xl mx-auto flex flex-col gap-4">
             <div className="bg-[#0D2E1F] border-2 border-[#00E575] p-6 rounded-3xl flex flex-col gap-4">
               <div className="flex justify-between items-center flex-wrap gap-2">
                 <span className="text-xs font-black text-[#00E575] uppercase tracking-wider flex items-center gap-1.5 animate-pulse">
-                  {activeOrder.serviceType === 'MART' ? '🏪 Pesanan Belanja Sedang Diproses' : '🏍️ Perjalanan Aktif Sedang Berlangsung'}
+                  {isExternalPaymentPending(activeOrder)
+                    ? '💳 Perjalanan Tiba Tujuan — Pembayaran Belum Disetujui'
+                    : activeOrder.serviceType === 'MART'
+                      ? '🏪 Pesanan Belanja Sedang Diproses'
+                      : '🏍️ Perjalanan Aktif Sedang Berlangsung'}
+                </span>
+                <span className="text-[11px] bg-[#06170E] border border-[#FFD700]/40 text-[#FFD700] px-2.5 py-1 rounded-lg font-black">
+                  {activeOrder.orderNumber || `DHN-${String(activeOrder.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`}
                 </span>
                 <span className="text-[10px] bg-[#00E575]/20 text-[#00E575] px-2.5 py-0.5 rounded font-bold uppercase">
-                  Status: {activeOrder.status}
+                  Status: {isExternalPaymentPending(activeOrder) ? 'MENUNGGU PEMBAYARAN' : activeOrder.status}
                 </span>
               </div>
 
@@ -511,6 +853,17 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {activeOrder.serviceType === 'MART' && martPickupNotice && (
+                <div className={`p-4 rounded-2xl border ${martPickupNotice.kind === 'arrived' || martPickupNotice.kind === 'arrivedCustomer' ? 'border-[#00E575] bg-[#00E575]/10' : 'border-cyan-400/60 bg-cyan-400/10'}`}>
+                  <div className="flex items-center gap-2 text-xs font-black uppercase tracking-wide">
+                    <span>{martPickupNotice.kind === 'arrived' || martPickupNotice.kind === 'arrivedCustomer' ? '📍' : '🏍️'}</span>
+                    <span>{martPickupNotice.kind === 'arrived' ? 'Driver Tiba di Merchant' : martPickupNotice.kind === 'headingCustomer' ? 'Driver Menuju Customer' : martPickupNotice.kind === 'arrivedCustomer' ? 'Driver Tiba di Customer' : 'Driver Menuju Merchant'}</span>
+                    {martPickupNotice.orderNumber && <span className="ml-auto text-[#FFD700]">{martPickupNotice.orderNumber}</span>}
+                  </div>
+                  <p className="text-[11px] text-[#D6F5E6] mt-2">{martPickupNotice.message}</p>
                 </div>
               )}
 
@@ -644,6 +997,48 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 </div>
               </div>
 
+              {isExternalPaymentPending(activeOrder) && (
+                <div className="bg-[#FFD700]/10 border-2 border-[#FFD700] p-4 rounded-2xl flex flex-col gap-3">
+                  <div>
+                    <div className="text-sm font-black text-[#FFD700]">💳 Pembayaran masih menggantung</div>
+                    <p className="text-[11px] text-[#D6F5E6] mt-1">
+                      Driver sudah tiba di tujuan, tetapi order belum ditutup. Upload bukti bayar {activeOrder.paymentMethod} dan tunggu persetujuan Admin. Dashboard Customer dan Driver tetap terkunci sampai pembayaran disetujui.
+                    </p>
+                  </div>
+                  {activeOrder.paymentProof?.status === 'PENDING_REVIEW' ? (
+                    <div className="bg-[#06170E] border border-[#23583E] rounded-xl p-3 text-[11px] font-bold text-[#A5C9B8]">
+                      ⏳ Bukti bayar sudah diupload dan sedang ditinjau Admin.
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-2">
+                      {activeOrder.paymentProof?.status === 'REJECTED' && (
+                        <div className="text-[10px] text-red-400 font-bold">
+                          ⚠️ Bukti sebelumnya ditolak{activeOrder.paymentProof.reviewNote ? `: ${activeOrder.paymentProof.reviewNote}` : ''}. Silakan upload ulang.
+                        </div>
+                      )}
+                      <input
+                        type="text"
+                        placeholder="Catatan pembayaran (opsional)"
+                        value={proofNote}
+                        onChange={(e) => setProofNote(e.target.value)}
+                        className="bg-[#06170E] border border-[#23583E] rounded-xl px-3 py-2 text-[11px] text-white placeholder:text-gray-500 focus:outline-none"
+                      />
+                      <input
+                        type="file"
+                        accept="image/*"
+                        disabled={submitProofMutation.isPending}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) submitProofMutation.mutate({ orderId: activeOrder.id, method: activeOrder.paymentMethod, file });
+                        }}
+                        className="text-[10px] text-[#A5C9B8] file:mr-2 file:py-2 file:px-3 file:rounded-xl file:border-0 file:bg-[#FFD700] file:text-[#06170E] file:text-[10px] file:font-black"
+                      />
+                      <span className="text-[9px] text-[#A5C9B8]">Upload screenshot/foto bukti pembayaran yang jelas. Setelah Admin approve, dashboard otomatis terbuka kembali.</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <Suspense fallback={<MapLoadingFallback />}>
                 <LiveTripMap
                   orderId={activeOrder.id}
@@ -666,23 +1061,35 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 />
               )}
             </div>
+
+            {/* 🆕 FIX: sebelumnya kartu "Pesan Baru Terkunci Sementara" ini
+                besar & berat (ikon 8x8 + heading + paragraf), menambah
+                tinggi halaman & menggeser fokus visual menjauh dari live
+                tracking map di atasnya. Sekarang dipadatkan jadi satu baris
+                ringkas, tetap di dalam wrapper `max-w-3xl mx-auto` yang sama
+                supaya tracking map tetap jadi pusat perhatian yang centered. */}
+            <div className="bg-[#0D2E1F]/60 border border-[#FFD700]/30 px-4 py-2.5 rounded-2xl flex items-center gap-2.5 text-left">
+              <Lock className="w-4 h-4 text-[#FFD700] shrink-0" />
+              <p className="text-[11px] text-[#A5C9B8] leading-snug">
+                <span className="font-bold text-[#FFD700]">Pesanan baru terkunci</span>{' '}
+                {isExternalPaymentPending(activeOrder)
+                  ? <>sampai bukti pembayaran <span className="font-bold text-white">{activeOrder.paymentMethod}</span> diupload dan disetujui Admin.</>
+                  : <>selama status <span className="font-bold text-white">{activeOrder.status}</span> masih berjalan. Selesaikan/batalkan perjalanan ini dulu di atas.</>}
+              </p>
+            </div>
+            </div>
           )}
 
           {/* Ride Booking Form — DIKUNCI selama masih ada order aktif yang belum
               selesai. Sebelumnya form ini SELALU tampil & bisa disubmit walau
               activeOrder ada di atasnya — customer bisa pesan order kedua
               sebelum yang pertama kelar (backend sudah menolak di endpoint,
-              tapi UI-nya tidak pernah mencegah/memberi tahu SEBELUM submit). */}
-          {activeOrder ? (
-            <div className="bg-[#0D2E1F] border-2 border-[#FFD700] p-6 rounded-3xl flex flex-col gap-3 items-center text-center">
-              <Lock className="w-8 h-8 text-[#FFD700]" />
-              <h3 className="font-black text-base text-white">Pesan Baru Terkunci Sementara</h3>
-              <p className="text-xs text-[#A5C9B8]">
-                Anda masih punya perjalanan aktif (status <span className="font-bold text-[#FFD700]">{activeOrder.status}</span>).
-                Selesaikan atau batalkan perjalanan itu dulu di panel "Perjalanan Aktif" di atas sebelum memesan perjalanan baru.
-              </p>
-            </div>
-          ) : (
+              tapi UI-nya tidak pernah mencegah/memberi tahu SEBELUM submit).
+              🆕 FIX: pesan lock lama (kartu besar) sudah dipindah ke dalam
+              wrapper centered di atas (dekat live tracking map), jadi di
+              sini cukup render form pemesanan normal saat TIDAK ada
+              activeOrder saja. */}
+          {!activeOrder && (
           <>
           {/* 🆕 (Link Merchant <-> Order): pintu masuk belanja dari toko —
               sebelumnya dashboard customer tidak punya jalan sama sekali
@@ -732,6 +1139,29 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 ))}
               </div>
 
+              {service === 'SEND' && (
+                <div className="bg-[#06170E] border-2 border-[#FFD700]/50 p-4 rounded-2xl flex flex-col gap-3">
+                  <div>
+                    <div className="text-xs font-black text-[#FFD700]">📦 Detail Barang Kiriman</div>
+                    <div className="text-[9px] text-[#A5C9B8]">Informasi ini dilihat driver sebelum menerima order.</div>
+                  </div>
+                  <input value={sendItemDescription} onChange={(e) => setSendItemDescription(e.target.value)} maxLength={300} required placeholder="Jenis/deskripsi barang, contoh: dokumen dalam amplop" className="bg-[#0D2E1F] border border-[#23583E] rounded-xl px-3 py-2.5 text-xs text-white" />
+                  <div className="grid grid-cols-2 gap-2">
+                    <select value={sendPackageSize} onChange={(e) => setSendPackageSize(e.target.value as any)} className="bg-[#0D2E1F] border border-[#23583E] rounded-xl px-3 py-2.5 text-xs text-white">
+                      <option value="SMALL">Kecil</option><option value="MEDIUM">Sedang</option><option value="LARGE">Besar</option>
+                    </select>
+                    <input type="number" min="0.1" max="1000" step="0.1" value={sendWeightKg} onChange={(e) => setSendWeightKg(e.target.value)} required placeholder="Berat (kg)" className="bg-[#0D2E1F] border border-[#23583E] rounded-xl px-3 py-2.5 text-xs text-white" />
+                  </div>
+                  <select value={sendVehicleRequirement} onChange={(e) => setSendVehicleRequirement(e.target.value as any)} className="bg-[#0D2E1F] border border-[#23583E] rounded-xl px-3 py-2.5 text-xs text-white">
+                    <option value="AUTO">Armada otomatis (motor/mobil yang eligible)</option>
+                    <option value="BIKE">Khusus motor</option>
+                    <option value="CAR">Khusus mobil</option>
+                  </select>
+                  <textarea value={sendHandlingNotes} onChange={(e) => setSendHandlingNotes(e.target.value)} maxLength={500} rows={2} placeholder="Catatan penanganan (opsional), contoh: jangan dilipat" className="bg-[#0D2E1F] border border-[#23583E] rounded-xl px-3 py-2.5 text-xs text-white resize-none" />
+                  {(sendPackageSize === 'LARGE' || Number(sendWeightKg || 0) > 20) && <div className="text-[9px] font-bold text-[#FFD700]">Muatan ini otomatis dialokasikan hanya untuk driver mobil.</div>}
+                </div>
+              )}
+
               {/* Pickup and Dropoff Address Inputs & Route Control Actions */}
               <div className="flex flex-col gap-2">
                 <div className="flex justify-between items-center text-[10px] text-[#A5C9B8]">
@@ -761,30 +1191,61 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                   asli yang tersimpan (customer ketik alamat baru, tapi koordinat lama
                   yang terkirim) — dihapus supaya tidak ada dua sumber kebenaran. */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <Suspense fallback={<MapLoadingFallback />}>
-                  <LocationPicker
-                    key={`pickup-${routeResetKey}`}
-                    label="Titik Penjemputan"
-                    initialCenter={{ lat: -7.8718, lng: 112.5326 }}
-                    value={pickupCoords}
-                    onChange={setPickupCoords}
-                    address={pickup}
-                    onAddressChange={setPickup}
-                    markerColor="green"
-                  />
-                </Suspense>
-                <Suspense fallback={<MapLoadingFallback />}>
-                  <LocationPicker
-                    key={`dropoff-${routeResetKey}`}
-                    label="Titik Tujuan"
-                    initialCenter={{ lat: -7.9666, lng: 112.6326 }}
-                    value={dropoffCoords}
-                    onChange={setDropoffCoords}
-                    address={dropoff}
-                    onAddressChange={setDropoff}
-                    markerColor="red"
-                  />
-                </Suspense>
+                <div className="bg-[#06170E] border border-[#23583E] rounded-2xl overflow-hidden">
+                  <button type="button" onClick={() => setShowPickupMap((v) => !v)} className="w-full flex items-center justify-between gap-3 p-3 text-left">
+                    <span className="flex items-center gap-2 min-w-0"><MapPin className="w-4 h-4 text-[#00E575] shrink-0" /><span className="min-w-0"><span className="block text-[10px] font-black text-white">Titik Penjemputan</span><span className="block text-[9px] text-[#A5C9B8] truncate">{pickup || 'Klik untuk memilih lokasi'}</span></span></span>
+                    <ChevronDown className={`w-4 h-4 text-[#A5C9B8] transition-transform ${showPickupMap ? 'rotate-180' : ''}`} />
+                  </button>
+                  {showPickupMap && <div className="p-3 pt-0"><Suspense fallback={<MapLoadingFallback />}><LocationPicker key={`pickup-${routeResetKey}`} label="Titik Penjemputan" initialCenter={{ lat: -7.8718, lng: 112.5326 }} value={pickupCoords} onChange={setPickupCoords} address={pickup} onAddressChange={setPickup} markerColor="green" /></Suspense></div>}
+                </div>
+                <div className="bg-[#06170E] border border-[#23583E] rounded-2xl overflow-hidden">
+                  <button type="button" onClick={() => setShowDropoffMap((v) => !v)} className="w-full flex items-center justify-between gap-3 p-3 text-left">
+                    <span className="flex items-center gap-2 min-w-0"><MapPin className="w-4 h-4 text-red-400 shrink-0" /><span className="min-w-0"><span className="block text-[10px] font-black text-white">Titik Tujuan</span><span className="block text-[9px] text-[#A5C9B8] truncate">{dropoff || 'Klik untuk memilih lokasi'}</span></span></span>
+                    <ChevronDown className={`w-4 h-4 text-[#A5C9B8] transition-transform ${showDropoffMap ? 'rotate-180' : ''}`} />
+                  </button>
+                  {showDropoffMap && <div className="p-3 pt-0"><Suspense fallback={<MapLoadingFallback />}><LocationPicker key={`dropoff-${routeResetKey}`} label="Titik Tujuan" initialCenter={{ lat: -7.9666, lng: 112.6326 }} value={dropoffCoords} onChange={setDropoffCoords} address={dropoff} onAddressChange={setDropoff} markerColor="red" /></Suspense></div>}
+                </div>
+              </div>
+
+              {pickupCoords && (
+                <div className="flex items-center justify-between gap-3 bg-[#06170E] border border-[#23583E] px-3 py-2 rounded-xl text-[10px]">
+                  <span className="flex items-center gap-2 text-[#A5C9B8]"><span className={`w-2 h-2 rounded-full ${Number(nearbyDriversData?.data?.availableCount || 0) > 0 ? 'bg-[#00E575] animate-pulse' : 'bg-[#FFD700]'}`} />Driver eligible sekitar titik jemput</span>
+                  <span className="font-black text-white">{isCheckingNearbyDrivers ? 'Memeriksa...' : `${Number(nearbyDriversData?.data?.availableCount || 0)} tersedia${nearbyDriversData?.data?.nearestDistanceKm != null ? ` • terdekat ±${nearbyDriversData.data.nearestDistanceKm} km` : ''}`}</span>
+                </div>
+              )}
+
+              <div className="flex flex-col gap-3 bg-[#06170E] border border-[#23583E] p-3 rounded-2xl">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-xs font-black text-white">Multi-Destinasi</div>
+                      <div className="text-[9px] text-[#A5C9B8]">Tambahkan hingga 4 tujuan lanjutan. Urutan kunjungan mengikuti urutan di bawah.</div>
+                    </div>
+                    <button type="button" onClick={addExtraStop} disabled={extraStops.length >= 4} className="bg-[#00E575] text-[#06170E] px-3 py-2 rounded-xl text-[10px] font-black disabled:opacity-40">
+                      <PlusCircle className="w-3 h-3 inline mr-1" /> Tambah Tujuan
+                    </button>
+                  </div>
+                  {extraStops.map((stop, index) => (
+                    <div key={stop.key} className="border border-[#23583E] rounded-xl p-3 flex flex-col gap-2">
+                      <div className="flex justify-between items-center text-[10px] font-bold text-[#FFD700]">
+                        <span>Tujuan {index + 2}</span>
+                        <button type="button" onClick={() => removeExtraStop(index)} className="text-red-400">Hapus</button>
+                      </div>
+                      <Suspense fallback={<MapLoadingFallback />}>
+                        <LocationPicker
+                          key={`extra-${routeResetKey}-${stop.key}`}
+                          label={`Titik Tujuan ${index + 2}`}
+                          initialCenter={stop.coords || dropoffCoords || { lat: -7.9666, lng: 112.6326 }}
+                          value={stop.coords}
+                          onChange={(coords) => updateExtraStop(index, { coords })}
+                          address={stop.address}
+                          onAddressChange={(address) => updateExtraStop(index, { address })}
+                          markerColor="red"
+                        />
+                      </Suspense>
+                      <input value={stop.note} onChange={(e) => updateExtraStop(index, { note: e.target.value })} placeholder="Catatan tujuan (opsional)" className="bg-[#0D2E1F] border border-[#23583E] rounded-lg px-3 py-2 text-[10px] text-white" />
+                    </div>
+                  ))}
+                  {extraStops.length > 0 && <div className="text-[9px] text-[#A5C9B8]">Total tujuan: {extraStops.length + 1}. Estimasi jarak menghitung seluruh etape.</div>}
               </div>
 
               {/* Price Calculation Board */}
@@ -884,28 +1345,32 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
           )}
         </div>
 
-        {/* Right Column: Order History & Local OS detection info */}
+        {/* Right Column: Order History & Local OS detection info
+            🆕 Auto-hide seluruh kolom ini (termasuk Riwayat Order Perjalanan
+            & Saldo Dompet) selama ada perjalanan aktif — bagian dari Mode
+            Fokus Perjalanan (lihat placeholder di bawah untuk kondisi
+            activeOrder). */}
+        {!activeOrder && (
         <div className="flex flex-col gap-6">
-          {/* OS Integration Audit */}
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-5 rounded-3xl flex flex-col gap-3">
-            <span className="text-xs font-bold text-[#00E575] uppercase tracking-wider flex items-center gap-1.5">
-              <Smartphone className="w-4 h-4" /> Integrasi Genggam OS
-            </span>
-            <div className="bg-[#06170E] p-3 rounded-xl border border-[#23583E] flex items-center gap-3">
-              <span className="text-2xl">🟢</span>
-              <div className="text-xs">
-                <span className="font-bold text-white block">Aplikasi Latar Belakang Aktif</span>
-                Sistem mendeteksi Android OS tersambung secara steril.
-              </div>
-            </div>
-          </div>
-
-          {/* Ride logs/history */}
+          {/* Ride logs/history
+              🆕 AUTO-HIDE (perbaikan): daftar riwayat sekarang collapsed
+              secara default — hanya header yang selalu terlihat, isi
+              lengkap baru muncul kalau customer mengetuk header ini. */}
           <div className="bg-[#0D2E1F] border border-[#23583E] p-5 rounded-3xl flex-1 flex flex-col gap-4">
-            <span className="text-xs font-bold text-[#FFD700] uppercase tracking-wider flex items-center gap-1.5">
-              <History className="w-4 h-4" /> Riwayat Order Perjalanan
-            </span>
+            <button
+              type="button"
+              onClick={() => setShowRideHistory((v) => !v)}
+              aria-expanded={showRideHistory}
+              className="text-xs font-bold text-[#FFD700] uppercase tracking-wider flex items-center justify-between gap-1.5 w-full text-left cursor-pointer"
+            >
+              <span className="flex items-center gap-1.5">
+                <History className="w-4 h-4" /> Riwayat Order Perjalanan
+              </span>
+              <ChevronDown className={`w-4 h-4 text-[#A5C9B8] transition-transform ${showRideHistory ? 'rotate-180' : ''}`} />
+            </button>
 
+            {showRideHistory && (
+            <>
             {isOrdersLoading ? (
               <SkeletonList count={3} />
             ) : isOrdersError ? (
@@ -919,7 +1384,7 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 {ordersData.orders.map((o: any) => (
                   <div key={o.id} className="bg-[#06170E] border border-[#23583E] p-3.5 rounded-xl flex flex-col gap-2">
                     <div className="flex justify-between items-center text-[10px]">
-                      <span className="font-bold text-[#FFD700]">{o.serviceType} / ID: {o.id.substring(0, 8)}</span>
+                      <span className="font-bold text-[#FFD700]">{o.serviceType} / {o.orderNumber || `DHN-${String(o.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`}</span>
                       <span className={`px-2 py-0.5 rounded font-black ${
                         o.status === 'COMPLETED' ? 'bg-[#00E575]/20 text-[#00E575]' :
                         o.status === 'PENDING' ? 'bg-amber-500/20 text-amber-500 animate-pulse' :
@@ -1034,6 +1499,29 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                         <div className="w-full text-center bg-[#00E575]/10 text-[#00E575] text-[10px] font-bold py-2 rounded-xl">
                           ✓ Sudah Dibayar Lunas
                         </div>
+                        {Number(o.tipAmount || 0) > 0 ? (
+                          <div className="w-full text-center bg-[#FFD700]/10 text-[#FFD700] text-[10px] font-bold py-2 rounded-xl border border-[#FFD700]/30">
+                            🎁 Tips {formatRupiah(Number(o.tipAmount))} sudah dikirim 100% kepada driver
+                          </div>
+                        ) : o.driver ? (
+                          <div className="bg-[#0D2E1F] border border-[#23583E] rounded-xl p-3 flex flex-col gap-2">
+                            <div className="text-[10px] font-black text-[#FFD700]">🎁 Berikan Tips kepada Driver</div>
+                            <div className="text-[9px] text-[#A5C9B8]">Tips dipotong dari saldo dompet dan masuk 100% ke penghasilan driver tanpa komisi platform.</div>
+                            <div className="grid grid-cols-3 gap-1.5">
+                              {[5000, 10000, 20000].map((amount) => (
+                                <button key={amount} type="button" onClick={() => setTipAmounts((current) => ({ ...current, [o.id]: String(amount) }))} className="bg-[#06170E] border border-[#23583E] text-white rounded-lg py-1.5 text-[9px] font-bold hover:border-[#FFD700]">
+                                  {formatRupiah(amount)}
+                                </button>
+                              ))}
+                            </div>
+                            <div className="flex gap-2">
+                              <input type="number" min="1000" max="500000" step="1000" value={tipAmounts[o.id] || ''} onChange={(e) => setTipAmounts((current) => ({ ...current, [o.id]: e.target.value }))} placeholder="Nominal tips" className="min-w-0 flex-1 bg-[#06170E] border border-[#23583E] rounded-lg px-2 py-2 text-[10px] text-white" />
+                              <button type="button" disabled={tipMutation.isPending || Number(tipAmounts[o.id] || 0) < 1000} onClick={() => tipMutation.mutate({ orderId: o.id, amount: Number(tipAmounts[o.id]) })} className="bg-[#FFD700] text-[#06170E] rounded-lg px-3 py-2 text-[10px] font-black disabled:opacity-40">
+                                {tipMutation.isPending ? 'Mengirim...' : 'Kirim Tips'}
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
                         <button
                           onClick={() => printReceipt(o)}
                           className="w-full bg-[#06170E] border border-[#23583E] hover:border-[#00E575] text-[#A5C9B8] hover:text-[#00E575] text-[10px] font-bold py-2 rounded-xl transition-all"
@@ -1053,9 +1541,12 @@ function CustomerApp({ onBack, triggerToast }: PortalProps) {
                 ))}
               </div>
             )}
+            </>
+            )}
           </div>
 
         </div>
+        )}
       </div>
 
       <TopupModal

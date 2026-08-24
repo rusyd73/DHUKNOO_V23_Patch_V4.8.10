@@ -10,8 +10,10 @@ import { TopupModal } from '../components/modals/SharedModals';
 import AuthFlow from '../components/auth/AuthFlow';
 import { SkeletonList } from '../components/common/Skeleton';
 import { QueryErrorState } from '../components/common/QueryErrorState';
+import { WithdrawalPanel } from '../components/wallet/WithdrawalPanel';
 import {
   AlertTriangle,
+  ChevronDown,
   ClipboardList,
   DollarSign,
   History,
@@ -41,6 +43,17 @@ function MapLoadingFallback() {
 const LiveTripMap = React.lazy(() => import('../components/map/LiveTripMap'));
 const DriverDashboardMap = React.lazy(() => import('../components/map/DriverDashboardMap'));
 
+const EXTERNAL_PROOF_METHODS = ['QRIS', 'TRANSFER', 'EWALLET'];
+const isExternalPaymentPending = (order: any) =>
+  order?.status === 'COMPLETED' && !order?.isPaid && EXTERNAL_PROOF_METHODS.includes(order?.paymentMethod);
+
+const serviceLabel = (serviceType: unknown) => ({
+  BIKE: 'Ojek Motor',
+  CAR: 'Mobil',
+  SEND: 'Kirim Barang',
+  MART: 'Belanja Merchant',
+}[String(serviceType || '').toUpperCase()] || String(serviceType || '-'));
+
 interface PortalProps {
   onBack: () => void;
   triggerToast: (m: string) => void;
@@ -49,6 +62,10 @@ interface PortalProps {
 function DriverApp({ onBack, triggerToast }: PortalProps) {
   const { login, logout, user } = useAuthStore();
   const queryClient = useQueryClient();
+  const [activeTrip, setActiveTrip] = useState<any | null>(null);
+  const [offeredJob, setOfferedJob] = useState<any | null>(null);
+  const activeJobFocusRef = React.useRef<HTMLDivElement | null>(null);
+  const focusedOrderIdRef = React.useRef<string | null>(null);
 
   // Fetch real driver profile
   const { data: profileData, isLoading: isProfileLoading, refetch: refetchProfile } = useQuery({
@@ -58,10 +75,30 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
   });
 
   // Fetch active available jobs
+  // 🆕 FIX: sebelumnya `enabled: !!user` -- artinya query ini langsung
+  // dieksekusi begitu driver login, PADAHAL status default driver baru
+  // login adalah OFFLINE (driver harus menyalakan toggle "Online" dulu).
+  // Backend memang sengaja menolak permintaan ini dengan 403 DRIVER_OFFLINE
+  // selama driver belum online (lihat job.service.ts) -- itu bukan bug,
+  // tapi frontend seharusnya tidak memanggil endpoint ini sampai driver
+  // benar-benar online, supaya tidak membanjiri log server dengan error
+  // yang sebenarnya "wajar". Query baru aktif kalau driver online, ATAU
+  // kalau ada activeJob yang sudah pernah ter-cache sebelumnya (supaya
+  // perjalanan yang sedang berjalan tetap bisa di-recover meski status
+  // online sempat tidak sinkron). Dibaca lewat queryClient.getQueryData
+  // (bukan langsung dari `jobsData` di bawah) supaya tidak self-reference
+  // ke variabel yang belum selesai diinisialisasi (TDZ).
+  const cachedJobsData = queryClient.getQueryData<any>(['driverJobs']);
   const { data: jobsData, isLoading: isJobsLoading, isError: isJobsError, refetch: refetchJobs } = useQuery({
     queryKey: ['driverJobs'],
     queryFn: DriverAPI.getJobs,
-    enabled: !!user,
+    enabled: !!user && (profileData?.profile?.isOnline === true || Boolean(cachedJobsData?.activeJob)),
+    // P0 recovery: GET /jobs is the lifecycle source-of-truth after reconnect
+    // or a Socket.IO race. Poll only while the driver is online so a PENDING
+    // order cannot remain invisible merely because the offer event happened
+    // before the dashboard listener was ready.
+    refetchInterval: profileData?.profile?.isOnline ? 5000 : false,
+    refetchIntervalInBackground: true,
   });
 
   // Mutations
@@ -80,7 +117,14 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
           autoAccept: isAutoAcceptOn,
         });
       }
-      refetchJobs();
+      // 🆕 FIX: refetch manual (beda dgn refetchInterval) TIDAK menghormati
+      // flag `enabled` di atas -- kalau tetap dipanggil tanpa syarat di sini,
+      // saat driver mematikan toggle "Online" (online === false), baris ini
+      // akan langsung memicu GET /jobs yang PASTI gagal 403 DRIVER_OFFLINE.
+      // Sekarang hanya refetch kalau driver baru saja ONLINE.
+      if (online) {
+        refetchJobs();
+      }
     },
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal mengubah status harian!');
@@ -116,15 +160,24 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     // PERBARUAN: hentikan ring SEKETIKA saat driver tap "Terima Order" --
     // jangan tunggu response server dulu, supaya bel langsung berhenti persis
     // di momen mereka klik terima, sesuai permintaan.
-    onMutate: () => {
+    onMutate: (orderId) => {
       stopRingLoop();
+      setOfferedJob((current) => current?.id === orderId ? null : current);
     },
     onSuccess: (res) => {
       triggerToast(res.message);
+      if (res?.order && ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(res.order.status)) {
+        setActiveTrip(res.order);
+      }
       queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      refetchJobs();
     },
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal menerima orderan!');
+      stopRingLoop();
+      setOfferedJob(null);
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      refetchJobs();
     },
   });
 
@@ -147,13 +200,31 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     updateLocationMutation.mutate(coords);
   };
 
+  const updateStopStatusMutation = useMutation({
+    mutationFn: ({ orderId, stopId, status }: { orderId: string; stopId: string; status: 'ARRIVED' | 'COMPLETED' }) => DriverAPI.updateStopStatus(orderId, stopId, status),
+    onSuccess: (res: any) => {
+      triggerToast(res.message);
+      if (res?.order) setActiveTrip((current: any) => ({ ...(current || {}), ...res.order }));
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      refetchJobs();
+    },
+    onError: (err: any) => triggerToast(err.response?.data?.error || 'Gagal memperbarui tujuan perjalanan!'),
+  });
+
   const updateJobStatusMutation = useMutation({
     mutationFn: ({ orderId, status }: { orderId: string; status: string }) => 
       DriverAPI.updateJobStatus(orderId, status),
     onSuccess: (res) => {
       triggerToast(res.message);
+      const nextOrder = res?.order;
+      if (nextOrder && (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(nextOrder.status) || isExternalPaymentPending(nextOrder))) {
+        setActiveTrip(nextOrder);
+      } else if (nextOrder && ['COMPLETED', 'CANCELLED'].includes(nextOrder.status)) {
+        setActiveTrip(null);
+      }
       queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
       queryClient.invalidateQueries({ queryKey: ['driverProfile'] });
+      refetchJobs();
     },
     onError: (err: any) => {
       triggerToast(err.response?.data?.error || 'Gagal memperbarui status orderan!');
@@ -183,17 +254,92 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
   const [driverTopupAmount, setDriverTopupAmount] = useState('');
   const [isDriverTopupModalOpen, setIsDriverTopupModalOpen] = useState(false);
   const [driverCoords, setDriverCoords] = useState<{ lat: number; lng: number } | null>(null);
+  // 🆕 AUTO-HIDE (perbaikan): sebelumnya panel Verifikasi Dokumen & Jurnal
+  // Transaksi hanya disembunyikan KETIKA ada activeJob — jadi di kondisi
+  // normal (tidak sedang narik) keduanya tetap tampil penuh seperti semula.
+  // Sekarang keduanya collapsed/tersembunyi SECARA DEFAULT (sama seperti
+  // panel "Pengaturan Tampilan & Aksesibilitas"), dan baru terbuka kalau
+  // driver mengetuk headernya. Saat ada activeJob, keduanya tetap otomatis
+  // disembunyikan total tanpa bisa dibuka manual (Mode Fokus Perjalanan).
+  const [showDocVerification, setShowDocVerification] = useState(false);
+  const [showTransactionJournal, setShowTransactionJournal] = useState(false);
 
   const isAutoAcceptOn = Boolean(profileData?.profile?.autoAcceptEnabled ?? profileData?.profile?.autoAccept);
 
   const currentDriverId = profileData?.profile?.id || user?.id;
   // Find if this driver is currently busy with an accepted order
-  const activeJob = jobsData?.jobs?.find((j: any) => j.driverId === currentDriverId && j.status !== 'COMPLETED' && j.status !== 'CANCELLED');
+  // P0: restore active trip from explicit activeJobs, with API compatibility fallback.
+  const normalizedJobs = Array.isArray(jobsData?.jobs)
+    ? jobsData.jobs
+    : Array.isArray(jobsData?.data)
+      ? jobsData.data
+      : [];
 
-  // 🔥 WARMUP AUDIOCONTEXT - Dipanggil saat komponen mount (user gesture dari klik menu)
+  // V4: GET /jobs sekarang scoped ke driver yang login. Jangan membuat
+  // lifecycle bergantung pada kecocokan ID User vs DriverProfile secara
+  // diam-diam. Jika backend mengirim activeJob/activeJobs, gunakan itu;
+  // fallback ke daftar jobs yang juga sudah scoped.
+  const serverActiveJob =
+    (jobsData?.activeJob && (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(jobsData.activeJob.status) || isExternalPaymentPending(jobsData.activeJob)))
+      ? jobsData.activeJob
+      : (Array.isArray(jobsData?.activeJobs) ? jobsData.activeJobs : normalizedJobs)
+          .find((j: any) =>
+            (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'].includes(j.status) || isExternalPaymentPending(j)) &&
+            (!j.driverId || j.driverId === currentDriverId)
+          );
+
+  const activeJob = activeTrip || serverActiveJob;
+  const pendingJobs = normalizedJobs.filter((job: any) => job.status === 'PENDING');
+  const activeStops = activeJob && activeJob.serviceType !== 'MART' && Array.isArray(activeJob.stops)
+    ? [...activeJob.stops].sort((a: any, b: any) => a.sequence - b.sequence)
+    : [];
+  const currentStop = activeStops.find((stop: any) => stop.status !== 'COMPLETED') || activeStops[activeStops.length - 1];
+
   useEffect(() => {
-    warmupAudioContext();
-    console.log('🔊 AudioContext warmed up for DriverApp');
+    if (!activeJob?.id || focusedOrderIdRef.current === activeJob.id) return;
+    focusedOrderIdRef.current = activeJob.id;
+    window.setTimeout(() => activeJobFocusRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 150);
+  }, [activeJob?.id]);
+
+  useEffect(() => {
+    if (serverActiveJob) {
+      setActiveTrip(serverActiveJob);
+    } else if (!updateJobStatusMutation.isPending) {
+      setActiveTrip(null);
+    }
+  }, [serverActiveJob?.id, serverActiveJob?.status, updateJobStatusMutation.isPending]);
+
+  // Driver yang baru online harus dapat mengklaim publikasi yang sudah ada.
+  // Auto-accept saat createOrder tidak mungkin menjangkau driver yang saat itu
+  // masih offline; setelah /jobs menemukan order lama yang eligible, klaim
+  // order pertama lewat endpoint atomik yang sama dengan tombol manual.
+  useEffect(() => {
+    if (!profileData?.profile?.isOnline || !isAutoAcceptOn || activeJob || offeredJob || acceptJobMutation.isPending) return;
+    const firstPending = pendingJobs[0];
+    if (firstPending?.id) acceptJobMutation.mutate(firstPending.id);
+  }, [profileData?.profile?.isOnline, isAutoAcceptOn, activeJob?.id, offeredJob?.id, pendingJobs[0]?.id, acceptJobMutation.isPending]);
+
+  // Audio notification warm-up must happen from a genuine user gesture.
+  // Modern browsers keep AudioContext suspended when resume() is called only
+  // from a mount effect, which can make incoming-order ring notifications silent.
+  useEffect(() => {
+    const handleFirstInteraction = () => {
+      warmupAudioContext();
+      console.log('🔊 AudioContext warmed up for DriverApp (user gesture)');
+      document.removeEventListener('click', handleFirstInteraction);
+      document.removeEventListener('touchstart', handleFirstInteraction);
+      document.removeEventListener('keydown', handleFirstInteraction);
+    };
+
+    document.addEventListener('click', handleFirstInteraction);
+    document.addEventListener('touchstart', handleFirstInteraction, { passive: true });
+    document.addEventListener('keydown', handleFirstInteraction);
+
+    return () => {
+      document.removeEventListener('click', handleFirstInteraction);
+      document.removeEventListener('touchstart', handleFirstInteraction);
+      document.removeEventListener('keydown', handleFirstInteraction);
+    };
   }, []);
 
   // PERBAIKAN: driver sebelumnya TIDAK PERNAH join room "drivers_pool" --
@@ -274,23 +420,25 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     // TIDAK PERNAH terpanggil sama sekali -- makanya bel/ring tidak pernah bunyi.
     const handleNewOrderOffered = (data: any) => {
       console.log('🛎️ ORDER BARU DITAWARKAN KE DRIVER:', data);
-      
-      // ✅ 1. MULAI RING LOOP
+
+      // P0: event ini adalah offer TARGETED dari DispatchService, bukan
+      // broadcast pool. Simpan sebagai local offer supaya driver memiliki
+      // tombol TERIMA yang langsung bekerja tanpa menunggu GET /jobs.
+      setOfferedJob({
+        ...data,
+        id: data.orderId,
+        status: 'PENDING',
+      });
+
       try {
         startRingLoop();
-        console.log('🔊 Ring loop started - order baru ditawarkan ke driver');
       } catch (error) {
         console.error('❌ Gagal memulai ring loop:', error);
       }
-      
-      // 2. Tampilkan toast notifikasi
-      // PERBAIKAN: payload dari backend tidak punya field customerName/total,
-      // yang ada 'price' (lihat dispatch.service.ts offerNextDriver).
-      const total = data.price || data.total || 0;
+
+      const total = Number(data.price || data.total || 0);
       const formattedTotal = total.toLocaleString('id-ID');
       triggerToast(`📦 Order baru! ${data.pickupAddress ? `Dari ${data.pickupAddress}. ` : ''}Total: Rp ${formattedTotal}`);
-      
-      // 3. Refresh daftar order
       refetchJobs();
     };
 
@@ -299,6 +447,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderTakenByOther = (data: any) => {
       console.log('🔄 Order diambil driver lain:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
       triggerToast(`⏳ Order #${data.orderId || 'unknown'} sudah diambil driver lain`);
       refetchJobs();
     };
@@ -309,6 +458,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOrderExpired = (data: any) => {
       console.log('⏰ Order expired:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
       triggerToast(`⏰ Order #${data.orderId || 'unknown'} telah kadaluwarsa`);
       refetchJobs();
     };
@@ -319,14 +469,77 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
     const handleOfferTimeout = (data: any) => {
       console.log('⏱️ Offer order timeout untuk driver ini:', data);
       stopRingLoop();
+      setOfferedJob((current) => current?.id === data.orderId ? null : current);
     };
 
     // Daftarkan semua listener — nama event HARUS sama persis dengan yang
     // di-emit backend (lihat grep "SocketService.emitTo" di seluruh backend/src).
+    const handleAssignedOrStatusChanged = (data: any) => {
+      console.log('🔄 Driver active order sync:', data);
+      if (data?.orderId && data?.status) {
+        stopRingLoop();
+        setOfferedJob((current) => current?.id === data.orderId ? null : current);
+        if (data.status === 'CANCELLED') {
+          setActiveTrip((current: any) => current?.id === data.orderId ? null : current);
+        } else if (data.status === 'COMPLETED') {
+          setActiveTrip((current: any) => {
+            if (current?.id !== data.orderId) return current;
+            const merged = data.order ? { ...current, ...data.order } : { ...current, status: 'COMPLETED' };
+            return isExternalPaymentPending(merged) ? merged : null;
+          });
+        } else if (data.order) {
+          setActiveTrip(data.order);
+        } else {
+          setActiveTrip((current: any) => {
+            if (!current || current.id === data.orderId) {
+              return current ? { ...current, status: data.status } : current;
+            }
+            return current;
+          });
+        }
+      }
+      refetchJobs();
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+    };
+
+    const handlePaymentPending = (data: any) => {
+      refetchJobs();
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      triggerToast(`💳 ${data?.message || 'Perjalanan tiba tujuan. Menunggu bukti pembayaran customer dan approval Admin.'}`);
+    };
+    const handlePaymentProofSubmitted = (data: any) => {
+      refetchJobs();
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      triggerToast(`⏳ ${data?.message || 'Customer sudah upload bukti bayar. Menunggu approval Admin.'}`);
+    };
+    const handlePaymentSettled = () => {
+      setActiveTrip(null);
+      refetchJobs();
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      queryClient.invalidateQueries({ queryKey: ['driverProfile'] });
+      triggerToast('✅ Pembayaran disetujui. Order ditutup dan dashboard Driver dibuka kembali.');
+    };
+    const handleTipReceived = (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['driverProfile'] });
+      queryClient.invalidateQueries({ queryKey: ['driverJobs'] });
+      playBellRingSound();
+      triggerToast(`🎁 ${data?.message || `Tips ${formatRupiah(Number(data?.amount || 0))} diterima dari customer.`}`);
+    };
+
     socket.on('new_order_available', handleNewOrderOffered);
     socket.on('order_taken', handleOrderTakenByOther);
     socket.on('order_expired', handleOrderExpired);
     socket.on('order_timeout', handleOfferTimeout);
+    socket.on('order_accepted', handleAssignedOrStatusChanged);
+    socket.on('order_status_changed', handleAssignedOrStatusChanged);
+    socket.on('order_updated', handleAssignedOrStatusChanged);
+    socket.on('payment_pending', handlePaymentPending);
+    socket.on('payment_proof_submitted', handlePaymentProofSubmitted);
+    socket.on('payment_proof_rejected', handlePaymentPending);
+    socket.on('payment_received', handlePaymentSettled);
+    socket.on('order_paid', handlePaymentSettled);
+    socket.on('tip_received', handleTipReceived);
+    socket.on('jobs_refresh_required', refetchJobs);
 
     // Cleanup
     return () => {
@@ -335,6 +548,16 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
       socket.off('order_taken', handleOrderTakenByOther);
       socket.off('order_expired', handleOrderExpired);
       socket.off('order_timeout', handleOfferTimeout);
+      socket.off('order_accepted', handleAssignedOrStatusChanged);
+      socket.off('order_status_changed', handleAssignedOrStatusChanged);
+      socket.off('order_updated', handleAssignedOrStatusChanged);
+      socket.off('payment_pending', handlePaymentPending);
+      socket.off('payment_proof_submitted', handlePaymentProofSubmitted);
+      socket.off('payment_proof_rejected', handlePaymentPending);
+      socket.off('payment_received', handlePaymentSettled);
+      socket.off('order_paid', handlePaymentSettled);
+      socket.off('tip_received', handleTipReceived);
+      socket.off('jobs_refresh_required', refetchJobs);
       
       // ✅ STOP ring loop saat komponen unmount
       stopRingLoop();
@@ -392,31 +615,68 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
   return (
     <div className="w-full max-w-7xl mx-auto px-4 py-8 flex flex-col gap-6 flex-1">
       {/* Title Panel */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-[#0D2E1F] p-6 rounded-3xl border border-[#23583E]">
-        <div>
-          <h2 className="text-3xl font-black text-[#00E575]">Mitra Portal - Dhuknoo Driver</h2>
-          <p className="text-xs text-[#A5C9B8]">Konektivitas langsung ke API Endpoint Driver: `/api/driver/*`</p>
+      <div className="sticky top-[70px] z-30 flex items-center justify-between gap-2 bg-[#0D2E1F] px-3 sm:px-4 py-2.5 rounded-2xl border border-[#23583E] shadow-lg shadow-[#06170E]/30">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-9 h-9 rounded-xl bg-[#00E575]/15 flex items-center justify-center text-lg shrink-0">🏍️</span>
+          <div className="min-w-0">
+            <h2 className="text-sm sm:text-base font-black text-[#00E575] truncate">Mitra Driver</h2>
+            <p className="text-[9px] text-white font-bold truncate">{profileData?.fullName || user?.fullName || user?.email || 'Memuat akun...'}</p>
+            <p className="hidden sm:block text-[8px] text-[#A5C9B8] truncate">Portal operasional DHUKNOO</p>
+          </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2 shrink-0">
+          <Suspense fallback={<span className="w-8 h-8 rounded-xl bg-[#06170E] border border-[#23583E] animate-pulse" />}>
+            <DriverDashboardMap
+              compact
+              isOnline={Boolean(profileData?.profile?.isOnline)}
+              initialCoords={
+                profileData?.profile?.latitude && profileData?.profile?.longitude
+                  ? { lat: Number(profileData.profile.latitude), lng: Number(profileData.profile.longitude) }
+                  : null
+              }
+              onLocationUpdate={handleDriverLocationUpdate}
+            />
+          </Suspense>
           <button 
             onClick={() => {
               refetchProfile();
               refetchJobs();
               triggerToast('Sinkronisasi orderan aktif sukses!');
             }}
-            className="flex items-center gap-2 bg-[#23583E] hover:bg-[#23583E]/80 text-[#00E575] text-xs font-bold px-4 py-2.5 rounded-xl transition-all"
+            className="flex items-center gap-1.5 bg-[#23583E] hover:bg-[#23583E]/80 text-[#00E575] text-[10px] font-bold px-3 py-2 rounded-xl transition-all"
           >
             <RefreshCw className="w-4 h-4" />
-            <span>Segarkan</span>
+            <span className="hidden sm:inline">Segarkan</span>
           </button>
         </div>
       </div>
 
+      {/* 🎯 MODE FOKUS PERJALANAN AKTIF — 🆕 ditaruh paling atas & sticky
+          supaya langsung terlihat tanpa perlu scroll (konsisten dengan
+          dashboard Customer). Menggantikan placeholder yang sebelumnya
+          berada di kolom kanan paling bawah. */}
+      {activeJob && (
+        <div ref={activeJobFocusRef} className="bg-[#0D2E1F] border-2 border-[#00E575] shadow-[0_0_25px_-5px_rgba(0,229,117,0.4)] p-4 rounded-3xl flex flex-col items-center gap-1 text-center scroll-mt-24">
+          <span className="text-2xl leading-none">🎯</span>
+          <span className="text-sm font-black text-[#00E575]">Mode Fokus Perjalanan Aktif</span>
+          <p className="text-[11px] text-[#A5C9B8]/80 max-w-md">
+            {isExternalPaymentPending(activeJob)
+              ? 'Perjalanan sudah tiba di tujuan, tetapi pembayaran belum disetujui. Dashboard tetap terkunci sampai customer upload bukti bayar dan Admin menyetujuinya.'
+              : 'Verifikasi Dokumen, Jurnal Transaksi & daftar lowongan disembunyikan sementara supaya Anda fokus menyelesaikan perjalanan yang sedang berjalan di bawah ini. Panel akan muncul kembali setelah perjalanan selesai.'}
+          </p>
+        </div>
+      )}
+
       {/* Main Layout Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
-        {/* Left Column: Driver Shift & Active Orders */}
-        <div className="flex flex-col gap-6 lg:col-span-2">
+        {/* Left Column: Driver Shift & Active Orders
+            🆕 FIX: saat activeJob, kolom ini melebar penuh (lg:col-span-3)
+            dan kolom kanan (Satelit GPS Pendamping, dst) disembunyikan
+            total -- sebelumnya panel GPS Pendamping tetap tampil di kolom
+            kanan walau activeJob ada, membuat halaman jadi panjang ke
+            bawah & kartu "Tugas Perjalanan Aktif" tidak jadi fokus utama. */}
+        <div className={`flex flex-col gap-6 ${activeJob ? 'lg:col-span-3' : 'lg:col-span-2'}`}>
 
           {/* BARU: Notifikasi upload dokumen untuk driver baru — sebelumnya
               tidak ada pemberitahuan sama sekali; driver baru hanya tahu perlu
@@ -537,15 +797,16 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
             <div className="bg-[#06170E] p-6 rounded-2xl border border-[#23583E] flex flex-col justify-between gap-4">
               <div className="flex items-center gap-2 text-[#FFD700]">
                 <TrendingUp className="w-5 h-5" />
-                <span className="text-xs font-bold uppercase tracking-wider">Deposit Penghasilan</span>
+                <span className="text-xs font-bold uppercase tracking-wider">Penghasilan Driver</span>
               </div>
               <div>
-                <span className="text-[10px] text-[#A5C9B8] block">Bisa dicairkan kapan saja</span>
+                  <span className="text-[10px] text-[#A5C9B8] block">Akumulasi penghasilan dalam wallet</span>
                 <span className="text-3xl font-black text-[#00E575]">
-                  {formatRupiah(Number(profileData?.wallet?.balance || 0))}
+                  {formatRupiah(Number(profileData?.wallet?.earningsBalance || 0))}
                 </span>
+                <span className="text-[10px] text-[#A5C9B8] block mt-1">Saldo operasional: {formatRupiah(Number(profileData?.wallet?.balance || 0))}</span>
               </div>
-              <p className="text-[10px] text-[#A5C9B8]/60">Penghasilan Anda akan langsung bertambah setiap kali perjalanan diselesaikan dengan sukses!</p>
+              <p className="text-[10px] text-[#A5C9B8]/60">Pembayaran non-tunai masuk ke wallet. Pendapatan CASH diterima langsung dari customer dan dicatat di jurnal, bukan dikreditkan ulang ke wallet.</p>
 
               {/* Top-up Deposit Driver — wajib punya saldo minimum supaya bisa menerima order */}
               <form
@@ -553,7 +814,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                   e.preventDefault();
                   setIsDriverTopupModalOpen(true);
                 }}
-                className="flex gap-2 pt-1 border-t border-[#23583E]/50 mt-1"
+                className="flex flex-col sm:flex-row gap-2 pt-1 border-t border-[#23583E]/50 mt-1 w-full"
               >
                 <input
                   type="number"
@@ -561,34 +822,18 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                   placeholder="Nominal top up deposit..."
                   value={driverTopupAmount}
                   onChange={(e) => setDriverTopupAmount(e.target.value)}
-                  className="flex-1 bg-[#0D2E1F] border border-[#23583E] rounded-lg px-3 py-2 text-xs text-white placeholder:text-gray-500 focus:outline-none focus:border-[#00E575]"
+                  className="w-full min-w-0 sm:flex-1 bg-[#0D2E1F] border border-[#23583E] rounded-lg px-3 py-2 text-xs text-white placeholder:text-gray-500 focus:outline-none focus:border-[#00E575]"
                 />
                 <button
                   type="submit"
-                  className="bg-[#00E575] hover:bg-[#00E575]/80 text-[#06170E] text-xs font-black px-4 rounded-lg whitespace-nowrap"
+                  className="bg-[#00E575] hover:bg-[#00E575]/80 text-[#06170E] text-xs font-black px-4 py-2 rounded-lg whitespace-nowrap w-full sm:w-auto min-h-10"
                 >
                   Pilih Bayar
                 </button>
               </form>
+              <WithdrawalPanel compact />
             </div>
           </div>
-
-          {/* PANDUAN LOKASI DRIVER: peta yang tampil di dashboard utama
-              (bukan cuma saat trip aktif) sekaligus mesin auto-update lokasi
-              GPS ke backend -- terutama saat driver baru transisi dari
-              OFFLINE ke ONLINE, supaya koordinat langsung ter-update dan
-              driver bisa lolos filter dispatch/auto-accept. */}
-          <Suspense fallback={<MapLoadingFallback />}>
-            <DriverDashboardMap
-              isOnline={Boolean(profileData?.profile?.isOnline)}
-              initialCoords={
-                profileData?.profile?.latitude && profileData?.profile?.longitude
-                  ? { lat: Number(profileData.profile.latitude), lng: Number(profileData.profile.longitude) }
-                  : null
-              }
-              onLocationUpdate={handleDriverLocationUpdate}
-            />
-          </Suspense>
 
           {/* Active Work Progress Bar */}
           {activeJob && (
@@ -602,6 +847,10 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 </span>
               </div>
 
+              <div className="text-xs font-black text-[#FFD700]">
+                {activeJob.serviceType === 'MART' ? '🏪' : activeJob.serviceType === 'SEND' ? '📦' : activeJob.serviceType === 'CAR' ? '🚗' : '🏍️'} Layanan {serviceLabel(activeJob.serviceType)}
+              </div>
+
               <div className="bg-[#06170E] p-4 rounded-xl border border-[#23583E] flex flex-col gap-2 text-xs">
                 <div>
                   <span className="text-gray-400 block text-[9px]">PELANGGAN:</span>
@@ -613,8 +862,8 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                     <span className="text-white truncate block">{activeJob.pickupAddress}</span>
                   </div>
                   <div>
-                    <span className="text-gray-400 block text-[9px]">LOKASI TUJUAN:</span>
-                    <span className="text-white truncate block">{activeJob.dropoffAddress}</span>
+                    <span className="text-gray-400 block text-[9px]">{activeStops.length > 0 ? 'TUJUAN AKTIF:' : 'LOKASI TUJUAN:'}</span>
+                    <span className="text-white truncate block">{currentStop?.address || activeJob.dropoffAddress}</span>
                   </div>
                 </div>
                 <div className="flex justify-between items-center border-t border-[#23583E]/50 pt-2 mt-2">
@@ -623,11 +872,46 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 </div>
               </div>
 
+              {activeJob.serviceType === 'SEND' && (
+                <div className="bg-[#06170E] border-2 border-[#FFD700]/50 rounded-2xl p-4 text-xs flex flex-col gap-1">
+                  <div className="font-black text-[#FFD700]">📦 Detail Barang yang Diantarkan</div>
+                  <div><span className="text-[#A5C9B8]">Deskripsi:</span> <strong className="text-white">{activeJob.itemDescription || 'Tidak ada deskripsi'}</strong></div>
+                  <div><span className="text-[#A5C9B8]">Ukuran/volume:</span> <strong className="text-white">{activeJob.packageSize || '-'}</strong> · <span className="text-[#A5C9B8]">Berat:</span> <strong className="text-white">{activeJob.estimatedWeightKg ? `${Number(activeJob.estimatedWeightKg)} kg` : '-'}</strong></div>
+                  <div><span className="text-[#A5C9B8]">Rekomendasi armada:</span> <strong className="text-white">{activeJob.vehicleRequirement || 'AUTO'}</strong></div>
+                  {activeJob.handlingNotes && <div><span className="text-[#A5C9B8]">Penanganan:</span> <strong className="text-white">{activeJob.handlingNotes}</strong></div>}
+                </div>
+              )}
+
+              {activeStops.length > 0 && (
+                <div className="bg-[#06170E] border border-[#23583E] rounded-2xl p-4 flex flex-col gap-2">
+                  <div className="text-xs font-black text-[#FFD700]">📍 Rute Multi-Destinasi</div>
+                  <div className="text-[10px] text-[#A5C9B8]">Kunjungi tujuan secara berurutan. Order hanya dapat diselesaikan setelah tujuan terakhir selesai.</div>
+                  {activeStops.map((stop: any) => {
+                    const previousDone = activeStops.filter((s: any) => s.sequence < stop.sequence).every((s: any) => s.status === 'COMPLETED');
+                    const isCurrent = currentStop?.id === stop.id;
+                    const hasNext = activeStops.some((s: any) => s.sequence > stop.sequence);
+                    return (
+                      <div key={stop.id} className={`flex flex-col md:flex-row md:items-center justify-between gap-2 border rounded-xl p-3 ${isCurrent ? 'border-[#FFD700] bg-[#FFD700]/5' : 'border-[#23583E]/60'}`}>
+                        <div className="min-w-0">
+                          <div className="text-[10px] font-black text-white">Tujuan {stop.sequence}: {stop.address}</div>
+                          {stop.note && <div className="text-[9px] text-[#A5C9B8]">Catatan: {stop.note}</div>}
+                          <div className="text-[9px] text-[#00E575]">Status: {stop.status}</div>
+                        </div>
+                        <div className="flex gap-2">
+                          <button type="button" disabled={!isCurrent || !previousDone || stop.status !== 'PENDING' || !['PICKED_UP', 'ARRIVED_CUSTOMER'].includes(activeJob.status)} onClick={() => updateStopStatusMutation.mutate({ orderId: activeJob.id, stopId: stop.id, status: 'ARRIVED' })} className="bg-cyan-500 text-white px-3 py-2 rounded-lg text-[9px] font-black disabled:opacity-30">Tiba di Tujuan {stop.sequence}</button>
+                          <button type="button" disabled={!isCurrent || stop.status !== 'ARRIVED'} onClick={() => updateStopStatusMutation.mutate({ orderId: activeJob.id, stopId: stop.id, status: 'COMPLETED' })} className="bg-[#00E575] text-[#06170E] px-3 py-2 rounded-lg text-[9px] font-black disabled:opacity-30">{hasNext ? `Lanjut ke Tujuan ${stop.sequence + 1}` : 'Selesai Tujuan Terakhir'}</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
               <Suspense fallback={<MapLoadingFallback />}>
                 <LiveTripMap
                   orderId={activeJob.id}
                   pickupCoords={{ lat: Number(activeJob.pickupLat), lng: Number(activeJob.pickupLng) }}
-                  dropoffCoords={{ lat: Number(activeJob.dropoffLat), lng: Number(activeJob.dropoffLng) }}
+                  dropoffCoords={{ lat: Number(currentStop?.lat ?? activeJob.dropoffLat), lng: Number(currentStop?.lng ?? activeJob.dropoffLng) }}
                   driverCoords={driverCoords}
                   isDriverSide={true}
                   onDriverCoordsChange={handleDriverCoordsChange}
@@ -641,45 +925,114 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 currentUserId={user?.id || ''}
                 currentUserRole="DRIVER"
                 otherPartyName={activeJob.customer?.user?.fullName}
-                otherPartyPhone={activeJob.customer?.phoneNumber}
+                otherPartyPhone={activeJob.customer?.phoneNumber || activeJob.customer?.user?.phoneNumber}
               />
 
-              {/* Progress Stepper Buttons */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {/* Progress Stepper Buttons — MART memiliki dua titik ARRIVED. */}
+              {isExternalPaymentPending(activeJob) ? (
+                <div className="bg-[#FFD700]/10 border-2 border-[#FFD700] p-4 rounded-2xl text-left">
+                  <div className="text-sm font-black text-[#FFD700]">💳 Menunggu penyelesaian pembayaran</div>
+                  <p className="text-[11px] text-[#D6F5E6] mt-1">
+                    Anda sudah tiba di tujuan. Customer harus upload bukti bayar {activeJob.paymentMethod}, lalu Admin melakukan approval. Jangan ambil order baru sampai pembayaran berstatus lunas.
+                  </p>
+                  <div className="mt-2 text-[10px] font-bold text-[#A5C9B8]">
+                    Status bukti: {activeJob.paymentProof?.status === 'PENDING_REVIEW' ? '⏳ Sedang ditinjau Admin' : activeJob.paymentProof?.status === 'REJECTED' ? '⚠️ Ditolak — menunggu upload ulang customer' : '📤 Menunggu customer upload bukti bayar'}
+                  </div>
+                </div>
+              ) : (
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ON_THE_WAY' })}
                   disabled={activeJob.status !== 'ACCEPTED'}
                   className="bg-amber-500 hover:bg-amber-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Menuju Jemput
+                  {activeJob.serviceType === 'MART' ? 'Menuju Merchant' : activeJob.serviceType === 'SEND' ? 'Menuju Lokasi Pengambilan Barang' : 'Menuju Lokasi Jemput Customer'}
                 </button>
-                <button
+                {activeStops.length > 0 && currentStop?.status === 'PENDING' && (
+                  <button
+                    onClick={() => updateStopStatusMutation.mutate({ orderId: activeJob.id, stopId: currentStop.id, status: 'ARRIVED' })}
+                    disabled={!['PICKED_UP', 'ARRIVED_CUSTOMER'].includes(activeJob.status) || updateStopStatusMutation.isPending}
+                    className="bg-cyan-500 hover:bg-cyan-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  >
+                    Tiba di Lokasi {currentStop.sequence}
+                  </button>
+                )}
+                {activeStops.length > 0 && currentStop?.status === 'ARRIVED' && (
+                  <button
+                    onClick={() => updateStopStatusMutation.mutate({ orderId: activeJob.id, stopId: currentStop.id, status: 'COMPLETED' })}
+                    disabled={updateStopStatusMutation.isPending}
+                    className="bg-[#00E575] hover:bg-[#00ff80] text-[#071F14] py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  >
+                    {activeStops.some((stop: any) => stop.sequence > currentStop.sequence)
+                      ? `Lanjut ke Lokasi ${currentStop.sequence + 1}`
+                      : `Selesaikan Lokasi ${currentStop.sequence}`}
+                  </button>
+                )}
+                {activeJob.serviceType !== 'MART' && <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED' })}
                   disabled={activeJob.status !== 'ON_THE_WAY'}
                   className="bg-cyan-500 hover:bg-cyan-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Tiba di Lokasi
-                </button>
+                  {activeJob.serviceType === 'SEND' ? 'Tiba di Lokasi Pengambilan Barang' : 'Tiba di Lokasi Jemput Customer'}
+                </button>}
+                {activeJob.serviceType !== 'MART' && <button
+                  onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'PICKED_UP' })}
+                  disabled={activeJob.status !== 'ARRIVED'}
+                  className="bg-violet-500 hover:bg-violet-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                >
+                  {activeJob.serviceType === 'SEND' ? 'Barang Diambil & Menuju Tujuan' : 'Customer Dijemput & Menuju Tujuan'}
+                </button>}
+                {activeJob.serviceType !== 'MART' && activeStops.length === 0 && <button
+                  onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED_CUSTOMER' })}
+                  disabled={activeJob.status !== 'PICKED_UP'}
+                  className="bg-sky-500 hover:bg-sky-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                >
+                  {activeJob.serviceType === 'SEND' ? 'Tiba di Lokasi Penerima Barang' : 'Tiba di Lokasi Tujuan Customer'}
+                </button>}
+                {activeJob.serviceType === 'MART' && activeStops.length === 0 && <button
+                  onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED' })}
+                  disabled={activeJob.status !== 'ON_THE_WAY'}
+                  className="bg-cyan-500 hover:bg-cyan-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                >
+                  Tiba di Merchant
+                </button>}
+                {activeJob.serviceType === 'MART' && <button
+                  onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'PICKED_UP' })}
+                  disabled={activeJob.status !== 'ARRIVED'}
+                  className="bg-violet-500 hover:bg-violet-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                >
+                  Ambil & Menuju Customer
+                </button>}
+                {activeJob.serviceType === 'MART' && (
+                  <button
+                    onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'ARRIVED_CUSTOMER' })}
+                    disabled={activeJob.status !== 'PICKED_UP'}
+                    className="bg-sky-500 hover:bg-sky-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  >
+                    Tiba di Customer
+                  </button>
+                )}
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'COMPLETED' })}
-                  disabled={activeJob.status !== 'ARRIVED'}
+                  disabled={activeJob.status !== 'ARRIVED_CUSTOMER' || activeStops.some((s: any) => s.status !== 'COMPLETED')}
                   className="bg-[#00E575] hover:bg-[#00ff80] text-[#071F14] py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
                 >
-                  Selesaikan Trip
+                  Selesaikan Order
                 </button>
                 <button
                   onClick={() => updateJobStatusMutation.mutate({ orderId: activeJob.id, status: 'CANCELLED' })}
-                  disabled={activeJob.status === 'COMPLETED'}
-                  className="bg-red-500 hover:bg-red-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30"
+                  disabled={activeJob.status === 'COMPLETED' || activeJob.status === 'CANCELLED'}
+                  className="bg-red-500 hover:bg-red-400 text-white py-2 rounded-xl text-[10px] font-black transition-all disabled:opacity-30 col-span-2 md:col-span-5"
                 >
                   Batalkan Order
                 </button>
               </div>
+              )}
             </div>
           )}
 
           {/* Order Selesai — Menunggu Konfirmasi Cash */}
-          {jobsData?.jobs?.some((j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id) && (
+          {normalizedJobs.some((j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id) && (
             <div className="bg-[#0D2E1F] border border-[#FFD700]/40 p-6 rounded-3xl flex flex-col gap-3">
               <h3 className="font-black text-sm text-[#FFD700] flex items-center gap-1.5">
                 <DollarSign className="w-4 h-4" /> Order Selesai — Menunggu Konfirmasi Cash
@@ -708,14 +1061,37 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
             </div>
           )}
 
-          {/* Job Pool (Available orders) */}
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-6 rounded-3xl flex flex-col gap-4">
-            <h3 className="font-black text-lg text-[#00E575] flex items-center gap-1.5">
-              <ClipboardList className="w-5 h-5" /> Lowongan Pesanan Di Sekitar Batu
+          {/* 🎯 MODE FOKUS PERJALANAN AKTIF — saat driver punya activeJob,
+              seluruh daftar lowongan/offer di bawah ini disembunyikan
+              otomatis (auto-hide) supaya tampilan fokus penuh ke perjalanan
+              yang sedang berjalan (lihat kartu "Tugas Perjalanan Aktif" di
+              atas). Panel Verifikasi Dokumen & Jurnal Transaksi di kolom
+              kanan juga auto-hide dengan alasan yang sama — lihat di bawah. */}
+
+          {/* Job Pool (Available orders) — auto-hide selama activeJob berjalan
+              supaya driver fokus penuh menyelesaikan perjalanan yang aktif
+              (driver juga memang tidak bisa menerima order baru selama
+              activeJob masih ada — tombol Terima Order sudah disabled). */}
+          {!activeJob && (
+          <div className="order-first bg-[#0D2E1F] border-2 border-[#00E575]/60 p-3 sm:p-4 rounded-2xl flex flex-col gap-3 shadow-[0_0_20px_-10px_rgba(0,229,117,0.9)]">
+            <h3 className="font-black text-sm sm:text-base text-[#00E575] flex items-center justify-between gap-2">
+              <span className={`flex items-center gap-1.5 ${offeredJob ? 'text-[#FFD700] animate-pulse' : ''}`}>
+              <ClipboardList className="w-5 h-5" /> {offeredJob ? 'Pesanan Masuk — Menunggu Anda' : 'Lowongan Pesanan Di Sekitar Batu'}
+              </span>
+              <span className="shrink-0 rounded-full bg-[#FFD700] px-2 py-0.5 text-[9px] text-[#071F14]">
+                {new Set([
+                  ...(offeredJob?.id ? [offeredJob.id] : []),
+                  ...normalizedJobs.filter((job: any) => job.status === 'PENDING').map((job: any) => job.id),
+                ]).size} tersedia
+              </span>
             </h3>
             
             {(() => {
-              const hasUnconfirmedCash = jobsData?.jobs?.some(
+              const pendingJobs = normalizedJobs.filter((job: any) => job.status === 'PENDING');
+              const visibleJobs = offeredJob
+                ? [offeredJob, ...pendingJobs.filter((job: any) => job.id !== offeredJob.id)]
+                : pendingJobs;
+              const hasUnconfirmedCash = normalizedJobs.some(
                 (j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id
               );
 
@@ -746,22 +1122,34 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
               <SkeletonList count={3} />
             ) : isJobsError ? (
               <QueryErrorState message="Gagal memuat daftar order. Periksa koneksi internet Anda." onRetry={() => refetchJobs()} />
-            ) : !jobsData?.jobs || jobsData.jobs.filter((j: any) => j.status === 'PENDING').length === 0 ? (
+            ) : visibleJobs.length === 0 ? (
               <div className="p-8 bg-[#06170E] border border-dashed border-[#23583E] rounded-2xl text-center text-xs text-[#A5C9B8]/70">
                 Belum ada pesanan masuk saat ini di wilayah Malang Raya. Menunggu orderan baru...
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {jobsData.jobs.filter((j: any) => j.status === 'PENDING').map((job: any) => (
-                  <div key={job.id} className="bg-[#06170E] border border-[#23583E] p-4 rounded-2xl flex flex-col justify-between gap-3">
+                {visibleJobs.map((job: any) => (
+                  <div key={job.id} className={`bg-[#06170E] border p-3 rounded-xl flex flex-col justify-between gap-2 ${offeredJob?.id === job.id ? 'border-[#FFD700] shadow-[0_0_16px_-8px_rgba(255,215,0,0.8)]' : 'border-[#23583E]'}`}>
                     <div>
                       <div className="flex justify-between items-center">
-                        <span className="text-[10px] font-bold text-[#FFD700]">Tipe: {job.serviceType}</span>
-                        <span className="text-[10px] text-gray-400">Baru</span>
+                        <span className="text-[10px] font-bold text-[#FFD700]">Layanan: {serviceLabel(job.serviceType)} ({job.serviceType})</span>
+                        <span className={`text-[10px] ${offeredJob?.id === job.id ? 'font-black text-[#FFD700]' : 'text-gray-400'}`}>{offeredJob?.id === job.id ? 'DITAWARKAN' : 'PUBLIKASI'}</span>
                       </div>
                       <div className="text-xs text-[#A5C9B8] mt-2 flex flex-col gap-1">
                         <span className="truncate"><strong className="text-white">Jemput:</strong> {job.pickupAddress}</span>
-                        <span className="truncate"><strong className="text-white">Tujuan:</strong> {job.dropoffAddress}</span>
+                        {Array.isArray(job.stops) && job.stops.length > 0 ? (
+                          <div className="flex flex-col gap-1 mt-1">
+                            <strong className="text-[#FFD700]">Multi-lokasi: {job.stops.length} tujuan</strong>
+                            {job.stops.map((stop: any) => <span key={stop.id || stop.sequence} className="truncate"><strong className="text-white">Tujuan {stop.sequence}:</strong> {stop.address}</span>)}
+                          </div>
+                        ) : <span className="truncate"><strong className="text-white">Tujuan:</strong> {job.dropoffAddress}</span>}
+                        {job.serviceType === 'SEND' && (
+                          <div className="mt-2 rounded-lg border border-[#FFD700]/40 bg-[#FFD700]/5 p-2 text-[10px]">
+                            <div className="font-black text-[#FFD700]">📦 {job.itemDescription || 'Barang kiriman'}</div>
+                            <div>Ukuran: <strong className="text-white">{job.packageSize || '-'}</strong> • Berat: <strong className="text-white">{job.estimatedWeightKg ? `${Number(job.estimatedWeightKg)} kg` : '-'}</strong></div>
+                            <div>Armada: <strong className="text-white">{job.vehicleRequirement || 'AUTO'}</strong>{job.handlingNotes ? ` • ${job.handlingNotes}` : ''}</div>
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -781,38 +1169,38 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
               );
             })()}
           </div>
+          )}
         </div>
 
-        {/* Right Column: Companion GPS Verification */}
+        {/* Right Column: Companion GPS Verification
+            🆕 FIX: seluruh kolom kanan (termasuk Satelit GPS Pendamping)
+            sekarang auto-hide total selama activeJob berjalan -- supaya
+            kartu "Tugas Perjalanan Aktif" di kolom kiri benar-benar jadi
+            satu-satunya fokus, tidak ada apa pun lagi di sisi kanan yang
+            menambah panjang halaman / mengalihkan perhatian. */}
+        {!activeJob && (
         <div className="flex flex-col gap-6">
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-5 rounded-3xl flex flex-col gap-4">
-            <span className="text-xs font-bold text-[#00E575] uppercase tracking-wider flex items-center gap-1.5">
-              <Navigation className="w-4 h-4" /> Satelit GPS Pendamping
-            </span>
-            <div className="bg-[#06170E] p-4 rounded-xl border border-[#23583E] text-xs">
-              <div className="flex justify-between items-center">
-                <span>Instalasi Driver Companion:</span>
-                <span className="text-[#00E575] font-bold">TERPASANG</span>
-              </div>
-              <div className="flex justify-between items-center mt-2">
-                <span>Status Akun:</span>
-                <span className={`font-bold ${profileData?.profile?.isVerified ? 'text-[#00E575]' : 'text-red-400'}`}>
-                  {profileData?.profile?.isVerified ? 'VERIFIED (AKTIF)' : 'BELUM DIVERIFIKASI'}
-                </span>
-              </div>
-              {!profileData?.profile?.isVerified && (
-                <p className="text-[10px] text-red-300 mt-2">
-                  Akun Anda belum bisa digunakan untuk menerima pesanan (Narik). Silakan minta verifikasi akun Anda pada **Dashboard Admin**.
-                </p>
-              )}
-            </div>
-          </div>
+          {/* Verifikasi Dokumen: KTP+Selfie, STNK & SIM (*Wajib)
+              🆕 Auto-hide selama activeJob berjalan — panel ini cukup dilihat
+              sebelum/di luar perjalanan supaya tampilan driver saat menarik
+              order tetap fokus & tidak penuh sesak (lihat catatan "Mode
+              Fokus" di dekat Job Pool di atas). */}
+          {!activeJob && (
+          <div className="bg-[#0D2E1F] border border-[#23583E] rounded-3xl">
+            <button
+              type="button"
+              onClick={() => setShowDocVerification((v) => !v)}
+              aria-expanded={showDocVerification}
+              className="w-full flex items-center justify-between gap-2 p-5 text-left cursor-pointer"
+            >
+              <span className="text-xs font-bold text-[#00E575] uppercase tracking-wider flex items-center gap-1.5">
+                <UserCheck className="w-4 h-4" /> Verifikasi Dokumen Driver
+              </span>
+              <ChevronDown className={`w-4 h-4 text-[#A5C9B8] shrink-0 transition-transform ${showDocVerification ? 'rotate-180' : ''}`} />
+            </button>
 
-          {/* Verifikasi Dokumen: KTP+Selfie, STNK & SIM (*Wajib) */}
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-5 rounded-3xl flex flex-col gap-3">
-            <span className="text-xs font-bold text-[#00E575] uppercase tracking-wider flex items-center gap-1.5">
-              <UserCheck className="w-4 h-4" /> Verifikasi Dokumen Driver
-            </span>
+            {showDocVerification && (
+            <div className="flex flex-col gap-3 px-5 pb-5">
             <p className="text-[10px] text-[#A5C9B8]/70 -mt-1">
               Upload foto KTP + Selfie, STNK Kendaraan, dan foto SIM (*Wajib). Admin akan meninjau sebelum akun benar-benar aktif.
             </p>
@@ -865,13 +1253,30 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 </div>
               );
             })}
+            </div>
+            )}
           </div>
+          )}
 
-          <div className="bg-[#0D2E1F] border border-[#23583E] p-5 rounded-3xl flex-1 flex flex-col gap-3">
-            <span className="text-xs font-bold text-[#FFD700] uppercase tracking-wider flex items-center gap-1.5">
-              <History className="w-4 h-4" /> Jurnal Transaksi Driver
-            </span>
+          {/* Jurnal Transaksi Driver — 🆕 Auto-hide selama activeJob berjalan,
+              dengan alasan fokus yang sama seperti panel Verifikasi Dokumen
+              di atas. */}
+          {!activeJob && (
+          <div className="bg-[#0D2E1F] border border-[#23583E] rounded-3xl flex-1 flex flex-col">
+            <button
+              type="button"
+              onClick={() => setShowTransactionJournal((v) => !v)}
+              aria-expanded={showTransactionJournal}
+              className="w-full flex items-center justify-between gap-2 p-5 text-left cursor-pointer"
+            >
+              <span className="text-xs font-bold text-[#FFD700] uppercase tracking-wider flex items-center gap-1.5">
+                <History className="w-4 h-4" /> Jurnal Transaksi Driver
+              </span>
+              <ChevronDown className={`w-4 h-4 text-[#A5C9B8] shrink-0 transition-transform ${showTransactionJournal ? 'rotate-180' : ''}`} />
+            </button>
 
+            {showTransactionJournal && (
+            <div className="px-5 pb-5">
             {!profileData?.wallet?.transactions || profileData.wallet.transactions.length === 0 ? (
               <div className="text-xs text-[#A5C9B8]/60 text-center py-8 border border-dashed border-[#23583E] rounded-xl bg-[#06170E]">
                 Belum ada transaksi pendapatan masuk harian.
@@ -891,8 +1296,12 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 ))}
               </div>
             )}
+            </div>
+            )}
           </div>
+          )}
         </div>
+        )}
       </div>
 
       <TopupModal

@@ -29,13 +29,38 @@ export class RedisService {
         },
       });
 
-      this.client.on('connect', () => {
+      // 🆕 FIX P0/P1 "Redis readiness" (audit): SEBELUMNYA hanya event
+      // 'connect' & 'error' yang didengarkan. 'connect' di ioredis fire
+      // begitu koneksi TCP terbentuk, SEBELUM handshake Redis (AUTH/SELECT
+      // dll) selesai -- bukan sinyal paling akurat bahwa client benar-benar
+      // siap menerima command. Dan kalau koneksi terputus BERSIH (server
+      // Redis restart, network partition tanpa error eksplisit), ioredis
+      // memancarkan 'close'/'reconnecting', BUKAN SELALU 'error' -- tanpa
+      // listener untuk itu, `isConnected` tetap TERKUNCI true selamanya
+      // walau koneksi sudah lama putus, dan getRedisOrThrow() di
+      // dispatch.redis.ts akan terus mengira Redis sehat.
+      //
+      // Sekarang pakai event 'ready' (fire setelah handshake SUNGGUHAN
+      // selesai, sinyal paling akurat "siap pakai") untuk set true, dan
+      // tambahkan listener 'close'/'reconnecting' untuk set false segera
+      // begitu koneksi terputus dengan cara APA PUN -- readiness flag ini
+      // sekarang benar-benar mencerminkan status koneksi real-time.
+      this.client.on('ready', () => {
         this.isConnected = true;
         logger.info('Redis connection established successfully.');
       });
 
       this.client.on('error', (err) => {
         logger.error('Redis Client Error: %s', err.message);
+        this.isConnected = false;
+      });
+
+      this.client.on('close', () => {
+        logger.warn('Redis connection closed.');
+        this.isConnected = false;
+      });
+
+      this.client.on('reconnecting', () => {
         this.isConnected = false;
       });
     } catch (err) {

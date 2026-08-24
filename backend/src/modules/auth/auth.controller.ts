@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import jwt from 'jsonwebtoken';
 import { AuthenticatedRequest } from '../../core/middleware/auth.middleware';
 import { AuthService } from './auth.service';
 import { AppError } from '../../core/errors/AppError';
@@ -14,7 +15,35 @@ export class AuthController {
   // ============================================================
   register = async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const result = await this.authService.registerUser(req.body);
+      // 🆕 FIX BUG NYATA (ditemukan dari log production): sebelumnya
+      // req.body diteruskan MENTAH ke registerUser(), padahal
+      // registerSchema (validasi Zod di route) memvalidasi field
+      // `password`, sementara registerUser() mengharapkan field
+      // bernama `passwordPlain` -- MISMATCH NAMA, bukan typo di satu
+      // tempat saja. Akibatnya `data.passwordPlain` SELALU undefined,
+      // dan `bcrypt.hash(undefined, salt)` throw
+      // "Illegal arguments: undefined, string" -- SEMUA percobaan
+      // registrasi gagal 400 sejak awal (dikonfirmasi dari log:
+      // "Register error: Illegal arguments: undefined, string").
+      // Diperbaiki dengan mapping eksplisit, bukan forward mentah --
+      // sekalian mencegah field tak terduga lain ikut terbawa diam-diam.
+      const { email, password, fullName, phone, role, vehiclePlate, vehicleModel, driverServiceType, merchantName, merchantCategory, merchantAddress, merchantLatitude, merchantLongitude } = req.body;
+
+      const result = await this.authService.registerUser({
+        email,
+        passwordPlain: password,
+        fullName,
+        phone,
+        role,
+        vehiclePlate,
+        vehicleModel,
+        driverServiceType,
+        merchantName,
+        merchantCategory,
+        merchantAddress,
+        merchantLatitude,
+        merchantLongitude,
+      });
       return res.status(201).json({
         success: true,
         message: 'Registrasi berhasil! Silakan login.',
@@ -152,15 +181,51 @@ export class AuthController {
   // 🔒 LOGOUT - HAPUS COOKIE
   // ============================================================
   logout = async (req: AuthenticatedRequest, res: Response) => {
+    // 🆕 FIX P1 "Logout pernah 401 tanpa auth; pastikan logout
+    // idempotent/ditangani saat token sudah invalid" (audit driver-jobs).
+    // SEBELUMNYA route ini dipasangi authenticateToken (lihat
+    // auth.routes.ts) yang MENOLAK KERAS (401) begitu access token
+    // kedaluwarsa/tidak ada -- padahal itu skenario PALING LUMRAH untuk
+    // logout (user idle lama, access token 15 menit sudah lewat, baru
+    // klik logout). Client jadi tidak pernah bisa "berhasil logout"
+    // lewat server dalam kondisi itu, walau niatnya (keluar dari sesi)
+    // seharusnya SELALU bisa dipenuhi tanpa perlu access token yang
+    // masih hidup -- yang benar-benar perlu dicabut adalah REFRESH
+    // token (di cookie httpOnly), bukan access token.
+    //
+    // Sekarang authenticateToken DILEPAS dari route ini (lihat
+    // auth.routes.ts) dan logic identifikasi user dibuat TOLERAN
+    // bertingkat:
+    //   1. Access token masih valid (req.user ada, lewat middleware
+    //      opsional) -> pakai userId dari situ, jalur normal.
+    //   2. Access token tidak ada/kedaluwarsa -> coba baca & verifikasi
+    //      cookie refreshToken (JWT terpisah, umur 7 hari, secret
+    //      berbeda) untuk dapat userId, lalu cabut sesi itu juga.
+    //   3. Keduanya tidak bisa diverifikasi -> tidak ada sesi
+    //      server-side yang bisa/perlu dicabut (sudah invalid dengan
+    //      sendirinya) -- logout tetap dianggap BERHASIL (200) dan
+    //      cookie tetap dihapus, karena dari sudut pandang client,
+    //      "tidak lagi terautentikasi" sudah tercapai.
     try {
-      const userId = req.user?.id;
+      let userId = req.user?.id;
+
       if (!userId) {
-        return res.status(401).json({ success: false, error: 'Unauthorized' });
+        const refreshTokenFromCookie = (req as any).cookies?.refreshToken;
+        if (refreshTokenFromCookie) {
+          try {
+            const decoded = jwt.verify(refreshTokenFromCookie, ENV.JWT_REFRESH_SECRET) as any;
+            userId = decoded?.id;
+          } catch {
+            // Refresh token juga sudah tidak valid/kedaluwarsa -- tidak
+            // apa-apa, lanjut ke langkah 3 di atas (idempotent success).
+          }
+        }
       }
 
-      await this.authService.logout(userId);
+      if (userId) {
+        await this.authService.logout(userId);
+      }
 
-      // ✅ HAPUS COOKIE
       res.clearCookie('refreshToken', {
         httpOnly: true,
         secure: ENV.NODE_ENV === 'production',

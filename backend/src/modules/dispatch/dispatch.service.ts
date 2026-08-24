@@ -9,13 +9,16 @@ import { DISPATCH_CONSTANTS } from "./dispatch.constants";
 import { prisma } from "../../config/prisma";
 import { logger } from "../../config/logger";
 import { TariffEngineService } from "../tariff/tariff.service";
+import { getOrderNumber } from "../../core/utils/order-number";
 import {
   DispatchCandidate,
   DispatchRequest,
   DispatchResult,
 } from "./dispatch.types";
+import { DriverPickupCompensationService } from "../driver/services/driver-pickup-compensation.service";
 
 export class DispatchService {
+  private pickupCompensationService = new DriverPickupCompensationService();
   private repository = new DispatchRepository();
   private locationService = new LocationService();
   private tariffEngine = new TariffEngineService();
@@ -74,6 +77,7 @@ export class DispatchService {
             serviceType: request.order.serviceType,
             pickupLat: request.order.pickupLat,
             pickupLng: request.order.pickupLng,
+            vehicleRequirement: request.order.vehicleRequirement,
           },
           options: {
             minimumDeposit: await this.tariffEngine.getMinimumDriverDeposit(),
@@ -99,30 +103,65 @@ export class DispatchService {
         eligibleDrivers.map((d: any) => [d.id, d])
       );
 
-      const candidates: DispatchCandidate[] = nearestDrivers
+      const haversineMeters = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+        const R = 6371000;
+        const toRad = (v: number) => (v * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLng = toRad(lng2 - lng1);
+        const a = Math.sin(dLat / 2) ** 2
+          + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      };
+
+      const buildCandidate = (profile: any, distanceMeters: number): DispatchCandidate => ({
+        driverId: profile.id,
+        userId: profile.userId,
+        latitude: Number(profile.latitude),
+        longitude: Number(profile.longitude),
+        distanceMeters,
+        etaMinutes: Math.ceil(
+          distanceMeters / (MAP_CONSTANTS.BIKE_SPEED_KMH * 1000 / 60)
+        ),
+        autoAcceptEnabled: Boolean(profile.autoAcceptEnabled),
+      });
+
+      let candidates: DispatchCandidate[] = nearestDrivers
         .filter((driver: any) => eligibleMap.has(driver.driverId))
         .filter((driver: any) => {
-          if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") {
-            return true;
-          }
+          if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") return true;
           const profile = eligibleMap.get(driver.driverId);
           return profile && (profile as any).serviceType === request.order.serviceType;
         })
-        .map((driver: any) => {
-          const profile = eligibleMap.get(driver.driverId)!;
-          return {
-            driverId: profile.id,
-            userId: profile.userId,
-            latitude: Number(profile.latitude),
-            longitude: Number(profile.longitude),
-            distanceMeters: driver.distanceMeters,
-            etaMinutes: Math.ceil(
-              driver.distanceMeters /
-              (MAP_CONSTANTS.BIKE_SPEED_KMH * 1000 / 60)
-            ),
-            autoAcceptEnabled: Boolean((profile as any).autoAcceptEnabled),
-          };
-        });
+        .map((driver: any) => buildCandidate(eligibleMap.get(driver.driverId)!, Number(driver.distanceMeters)));
+
+      // P0 RECOVERY: Redis GEO adalah acceleration layer, bukan source of truth.
+      // Jika GEO kosong/stale atau driver baru saja online sehingga koordinat DB
+      // belum masuk GEO, jangan biarkan order PENDING menggantung. Gunakan
+      // availableDrivers + koordinat DB sebagai fallback, tetap dibatasi radius 5 km
+      // dan eligibility yang sama.
+      if (candidates.length === 0 && eligibleDrivers.length > 0) {
+        const orderLat = Number(request.order.pickupLat);
+        const orderLng = Number(request.order.pickupLng);
+        candidates = eligibleDrivers
+          .filter((profile: any) => {
+            if (request.order.serviceType === "SEND" || request.order.serviceType === "MART") return true;
+            return profile.serviceType === request.order.serviceType;
+          })
+          .map((profile: any) => {
+            const distanceMeters = haversineMeters(
+              orderLat, orderLng, Number(profile.latitude), Number(profile.longitude)
+            );
+            return { profile, distanceMeters };
+          })
+          .filter(({ distanceMeters }) => distanceMeters <= 5000)
+          .sort((a, b) => a.distanceMeters - b.distanceMeters)
+          .slice(0, DISPATCH_CONSTANTS.MAX_CANDIDATES)
+          .map(({ profile, distanceMeters }) => buildCandidate(profile, distanceMeters));
+
+        if (candidates.length > 0) {
+          logger.warn(`[DISPATCH] order ${orderId}: Redis GEO tidak menghasilkan kandidat usable; memakai DB-location fallback (${candidates.length} kandidat).`);
+        }
+      }
 
       logger.info(`[DISPATCH] order ${orderId}: ${candidates.length} kandidat FINAL`);
 
@@ -199,11 +238,21 @@ export class DispatchService {
       }
     }
 
+    const pickupRate = await this.pickupCompensationService.resolveRatePerKm(request.order.serviceType);
+    const pickupDistanceKm = Math.max(0, Number(driver.distanceMeters || 0) / 1000);
+    const pickupCompensationPreview = Math.max(0, Math.round(pickupDistanceKm * pickupRate.rate));
+    const stops = await prisma.orderStop.findMany({
+      where: { orderId },
+      orderBy: { sequence: 'asc' },
+      select: { id: true, sequence: true, address: true, lat: true, lng: true, note: true, status: true },
+    });
+
     SocketService.emitToUser(
       driver.userId,
       DISPATCH_CONSTANTS.NEW_ORDER_EVENT,
       {
         orderId,
+        orderNumber: getOrderNumber(orderId),
         serviceType: request.order.serviceType,
         pickupAddress: request.order.pickupAddress,
         dropoffAddress: request.order.dropoffAddress,
@@ -213,8 +262,17 @@ export class DispatchService {
         dropoffLng: request.order.dropoffLng,
         distanceKm: request.order.distanceKm,
         price: request.order.price,
+        stops,
         etaMinutes: driver.etaMinutes,
         distanceMeters: driver.distanceMeters,
+        driverPickupDistanceKm: Math.round(pickupDistanceKm * 1000) / 1000,
+        driverPickupRatePerKm: pickupRate.rate,
+        driverPickupCompensation: pickupCompensationPreview,
+        itemDescription: request.order.itemDescription,
+        packageSize: request.order.packageSize,
+        estimatedWeightKg: request.order.estimatedWeightKg,
+        handlingNotes: request.order.handlingNotes,
+        vehicleRequirement: request.order.vehicleRequirement,
       }
     );
 
@@ -222,7 +280,7 @@ export class DispatchService {
       orderId,
       DISPATCH_CONSTANTS.OFFER_TIMEOUT_SECONDS,
       async () => {
-        SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId });
+        SocketService.emitToUser(driver.userId, DISPATCH_CONSTANTS.ORDER_TIMEOUT_EVENT, { orderId, orderNumber: getOrderNumber(orderId) });
 
         const hasAccepted = await DispatchState.hasAccepted(orderId);
         if (hasAccepted) {
@@ -259,18 +317,56 @@ export class DispatchService {
       await DispatchState.accept(orderId, driverId);
       await DispatchScheduler.cancel(orderId);
 
-      const order = await this.repository.assignDriver(orderId, driverId);
+      // FIX7: snapshot DRIVER -> PICKUP dihitung SEBELUM claim lalu ditulis
+      // atomik oleh DispatchRepository.assignDriver(). Tarif customer tetap
+      // memakai pickup -> destination dan sama sekali tidak berubah.
+      const [driverForComp, orderForComp] = await Promise.all([
+        this.repository.getDriver(driverId),
+        prisma.order.findUnique({
+          where: { id: orderId },
+          select: { serviceType: true, pickupLat: true, pickupLng: true, distanceKm: true, price: true, discount: true },
+        }),
+      ]);
+      if (!driverForComp || !orderForComp) throw new Error('Data driver/order tidak tersedia untuk snapshot pickup compensation');
+
+      const pickupCompensation = await this.pickupCompensationService.calculate({
+        serviceType: orderForComp.serviceType,
+        driverLat: driverForComp.latitude,
+        driverLng: driverForComp.longitude,
+        pickupLat: orderForComp.pickupLat,
+        pickupLng: orderForComp.pickupLng,
+        customerBillableDistanceKm: Number(orderForComp.distanceKm),
+        customerFareAtAcceptance: Number(orderForComp.price) - Number(orderForComp.discount),
+      });
+
+      const order = await this.repository.assignDriver(orderId, driverId, pickupCompensation);
+      logger.info(`[PICKUP_COMP] Dispatch order ${orderId}: ${pickupCompensation.driverPickupDistanceKm}km x Rp${pickupCompensation.driverPickupRatePerKm}/km = Rp${pickupCompensation.driverPickupCompensation}`);
+
       await DispatchState.clear(orderId);
 
       try {
         const driverProfile = await this.repository.getDriver(driverId);
         SocketService.emitToOrder(orderId, "order_status_changed", {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           status: (order as any).status,
           driverId,
         });
+        // 🆕 FIX P0 (sama seperti job.routes.ts manual accept): jalur
+        // auto-dispatch ini juga tidak pernah memberi tahu merchant.ownerId
+        // sebelumnya, jadi bel ring di dashboard Merchant tetap looping
+        // walau order MART sudah di-auto-accept oleh sistem dispatch.
+        if ((order as any).merchant?.ownerId) {
+          SocketService.emitToUser((order as any).merchant.ownerId, "order_status_changed", {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            status: (order as any).status,
+            driverId,
+          });
+        }
         SocketService.emitToUser((order as any).customer.userId, "order_accepted", {
           orderId,
+          orderNumber: getOrderNumber(orderId),
           driverId,
           driver: {
             fullName: (driverProfile as any)?.user?.fullName,
@@ -278,8 +374,42 @@ export class DispatchService {
             vehiclePlate: (driverProfile as any)?.vehiclePlate,
           },
         });
+        if ((order as any).serviceType === 'MART') {
+          SocketService.emitToUser((order as any).customer.userId, 'mart_driver_heading_to_merchant', {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            status: (order as any).status,
+            serviceType: (order as any).serviceType,
+            message: 'Driver sedang menuju lokasi merchant untuk mengambil pesanan Anda.',
+          });
+        }
         if (driverProfile?.userId) {
-          SocketService.emitToUser(driverProfile.userId, DISPATCH_CONSTANTS.ORDER_ACCEPTED_EVENT, { orderId });
+          SocketService.emitToUser(driverProfile.userId, DISPATCH_CONSTANTS.ORDER_ACCEPTED_EVENT, {
+            orderId,
+            orderNumber: getOrderNumber(orderId),
+            driverId,
+            status: (order as any).status,
+            autoAccepted: true,
+            order: {
+              id: (order as any).id,
+              orderNumber: getOrderNumber(orderId),
+              status: (order as any).status,
+              serviceType: (order as any).serviceType,
+              pickupAddress: (order as any).pickupAddress,
+              pickupLat: (order as any).pickupLat,
+              pickupLng: (order as any).pickupLng,
+              dropoffAddress: (order as any).dropoffAddress,
+              dropoffLat: (order as any).dropoffLat,
+              dropoffLng: (order as any).dropoffLng,
+              price: (order as any).price,
+              discount: (order as any).discount,
+              itemDescription: (order as any).itemDescription,
+              packageSize: (order as any).packageSize,
+              estimatedWeightKg: (order as any).estimatedWeightKg,
+              handlingNotes: (order as any).handlingNotes,
+              vehicleRequirement: (order as any).vehicleRequirement,
+            },
+          });
         }
         SocketService.emitToDriversPool("order_taken", { orderId });
         SocketService.emitToAdmins("order_accepted", { orderId });

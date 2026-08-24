@@ -62,8 +62,16 @@ let refreshInFlight: Promise<{ accessToken: string; refreshToken: string }> | nu
 // auth.controller.ts: `req.cookies?.refreshToken || req.body?.refreshToken`).
 async function performTokenRefresh(rToken?: string | null): Promise<{ accessToken: string; refreshToken: string }> {
   const res = await api.post(API_ENDPOINTS.auth.refresh, rToken ? { refreshToken: rToken } : {});
-  const newAccessToken = res.data?.accessToken;
-  const newRefreshToken = res.data?.refreshToken || rToken;
+  // 🆕 FIX P0 KONTRAK AUTH: `res` di sini adalah response axios MENTAH,
+  // jadi `res.data` = body JSON `{ success, data: { accessToken,
+  // refreshToken } }` (lihat auth.controller.ts refreshToken()) --
+  // BUKAN payload-nya langsung. Sebelumnya kode membaca res.data.accessToken
+  // yang selalu undefined, membuat SETIAP auto-refresh gagal dengan
+  // "Refresh token response tidak mengandung accessToken." walau request
+  // ke server sebenarnya sukses -- efeknya user ter-logout terus-menerus
+  // begitu access token 15 menit kedaluwarsa.
+  const newAccessToken = res.data?.data?.accessToken;
+  const newRefreshToken = res.data?.data?.refreshToken || rToken;
 
   if (!newAccessToken) {
     throw new Error("Refresh token response tidak mengandung accessToken.");
@@ -141,3 +149,44 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+// ============================================
+// 🆕 PROACTIVE TOKEN REFRESH (bukan cuma reaktif nunggu 401)
+// ============================================
+// FIX ("driver/merchant online >15 menit tanpa order masuk, harus login
+// ulang"): sebelumnya refresh HANYA terjadi reaktif -- dipicu request HTTP
+// yang gagal 401. Kalau user CUMA menunggu (tidak ada request HTTP apa pun
+// yang natural terjadi, cuma menunggu event Socket.IO), access token di
+// storage tetap diam di sana, makin basi, sampai 15 menit lewat. Socket.IO
+// reconnect (lihat services/socket.ts) lalu gagal pakai token basi itu.
+// Sekarang selama user login, token di-refresh proaktif setiap 10 menit
+// (5 menit sebelum access token 15 menit-nya benar-benar habis) -- jadi
+// token di storage nyaris TIDAK PERNAH benar-benar kadaluarsa.
+const PROACTIVE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+let proactiveRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+export function startProactiveTokenRefresh() {
+  if (proactiveRefreshTimer) return; // sudah jalan, jangan dobel
+  proactiveRefreshTimer = setInterval(() => {
+    const token = useAuthStore.getState().token;
+    if (!token) return; // sudah logout, tidak perlu refresh
+    const rToken = useAuthStore.getState().refreshToken;
+    if (!refreshInFlight) {
+      refreshInFlight = performTokenRefresh(rToken).finally(() => {
+        refreshInFlight = null;
+      });
+    }
+    refreshInFlight.catch(() => {
+      // Diam-diam gagal di sini tidak apa-apa -- interceptor 401 di atas
+      // tetap jadi jaring pengaman terakhir kalau refresh proaktif ini
+      // ternyata gagal (mis. refresh token betulan sudah invalid).
+    });
+  }, PROACTIVE_REFRESH_INTERVAL_MS);
+}
+
+export function stopProactiveTokenRefresh() {
+  if (proactiveRefreshTimer) {
+    clearInterval(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+}

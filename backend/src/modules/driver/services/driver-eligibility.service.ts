@@ -23,6 +23,7 @@ export interface DriverEligibilityInput {
     pickupLng: number;
     dropoffLat?: number;
     dropoffLng?: number;
+    vehicleRequirement?: string | null;
   };
   options?: {
     minimumDeposit?: number;
@@ -88,11 +89,18 @@ export class DriverEligibilityService {
       score -= 30;
     }
 
-    // STEP 5: Dokumen valid
+    // STEP 5: Verifikasi dokumen
+    // P0 lifecycle rule: `isVerified=true` adalah hasil persetujuan Admin dan
+    // menjadi source-of-truth untuk kelayakan operasional. Sebelumnya driver
+    // yang sudah VERIFIED masih ditolak hanya karena seed/dev account belum
+    // memiliki baris DriverDocument APPROVED. Akibatnya dispatch ride, manual
+    // accept, dan GET /jobs semuanya bisa kosong walaupun akun sudah verified,
+    // online, saldo cukup, dan tipe layanan cocok. Dokumen tetap dibaca untuk
+    // audit/metadata, tetapi TIDAK menjadi hard-block kedua setelah isVerified.
     const hasValidDocs = driver.documents?.some(
       doc => doc.status === 'APPROVED'
     );
-    if (!hasValidDocs) {
+    if (!driver.isVerified && !hasValidDocs) {
       reasons.push('Tidak ada dokumen yang disetujui');
       score -= 30;
     }
@@ -119,12 +127,16 @@ export class DriverEligibilityService {
       );
       score -= 50;
     }
+    // SEND adalah satu layanan lintas-armada. vehicleRequirement adalah
+    // rekomendasi customer yang WAJIB terlihat pada offer, bukan hard-block
+    // dispatch. Driver BIKE/CAR menilai sendiri deskripsi, ukuran dan berat
+    // barang sebelum menerima atau menolak pekerjaan.
 
     // STEP 8: AKTIF ORDER
     const activeOrder = await prisma.order.findFirst({
       where: {
         driverId,
-        status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED'] },
+        status: { in: ['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER'] },
       },
     });
     if (activeOrder) {
@@ -158,9 +170,13 @@ export class DriverEligibilityService {
         acceptedAt: { gte: today },
       },
     });
+    // Jumlah order harian adalah metadata operasional, BUKAN hard-block.
+    // Batas tetap 20 sebelumnya membuat driver mendadak tidak menerima
+    // seluruh layanan setelah pengujian intensif, tanpa penjelasan di UI.
+    // Pembatasan jam kerja/kelelahan kelak harus menjadi kebijakan tersendiri
+    // yang eksplisit dan dapat dikonfigurasi, bukan alasan eligibility diam-diam.
     if (todayOrdersCount >= maxDailyOrders) {
-      reasons.push(`Batas order harian tercapai (${maxDailyOrders} order)`);
-      score -= 10;
+      logger.info(`[ELIGIBILITY] Driver ${driverId} sudah mencapai ${todayOrdersCount} order hari ini; tetap eligible (audit-only).`);
     }
     metadata.todayOrders = todayOrdersCount;
 

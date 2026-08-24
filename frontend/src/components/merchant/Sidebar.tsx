@@ -30,12 +30,30 @@ export function MerchantSidebar({ onBack, setActiveTab, activeTab, orderCount = 
     onBack();
   };
 
+  // 🆕 RESPONSIVE FIX: sebelumnya panel ini SELALU vertikal & fixed w-64,
+  // sehingga di layar HP (viewport sempit) memakan hampir separuh layar dan
+  // mengunci fungsi utama "Kelola" merchant supaya sulit dijangkau.
+  // Sekarang, di bawah breakpoint `lg` panel berubah jadi bar horizontal
+  // ("landscape") ringkas yang menempel di atas konten, dan baru berubah
+  // jadi sidebar vertikal penuh w-64 di layar besar (>= lg).
   return (
-    <aside className="w-64 bg-[#0D2E1F] border-r border-[#23583E] h-screen flex flex-col sticky top-0">
+    <aside className="w-full lg:w-64 bg-[#0D2E1F] border-b lg:border-b-0 lg:border-r border-[#23583E] flex flex-row lg:flex-col items-center lg:items-stretch gap-2 lg:gap-0 px-2 lg:px-0 py-2 lg:py-0 lg:h-[calc(100vh-70px)] sticky top-[70px] z-30 shadow-lg shadow-[#06170E]/30">
       {/* ==========================================
-          HEADER
+          HEADER (mode landscape/mobile — ringkas, ikon toko + badge saja)
           ========================================== */}
-      <div className="p-4 border-b border-[#23583E]">
+      <div className="flex lg:hidden items-center gap-1.5 shrink-0 pl-1">
+        <span className="text-xl leading-none">🏪</span>
+        {orderCount > 0 && (
+          <span className="bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full animate-pulse">
+            {orderCount}
+          </span>
+        )}
+      </div>
+
+      {/* ==========================================
+          HEADER (mode sidebar/desktop — lengkap seperti semula)
+          ========================================== */}
+      <div className="hidden lg:block p-4 border-b border-[#23583E]">
         <h2 className="text-lg font-bold text-[#FF6B6B] flex items-center gap-2">
           🏪 Merchant
           {orderCount > 0 && (
@@ -57,8 +75,10 @@ export function MerchantSidebar({ onBack, setActiveTab, activeTab, orderCount = 
 
       {/* ==========================================
           NAVIGATION MENU
+          — mobile: baris horizontal, bisa discroll ke samping (landscape bar)
+          — desktop (lg+): kolom vertikal seperti sidebar semula
           ========================================== */}
-      <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+      <nav className="flex-1 flex flex-row lg:flex-col gap-1 overflow-x-auto overflow-y-hidden lg:overflow-x-hidden lg:overflow-y-auto lg:p-4 dhuknoo-scrollbar min-w-0">
         {menuItems.map((item) => (
           <button
             key={item.key}
@@ -70,18 +90,18 @@ export function MerchantSidebar({ onBack, setActiveTab, activeTab, orderCount = 
               }
               setActiveTab(item.key);
             }}
-            className={`flex items-center gap-3 w-full px-4 py-2.5 rounded-xl text-sm transition-all text-left relative ${
+            className={`flex flex-col lg:flex-row items-center justify-center lg:justify-start gap-0.5 lg:gap-3 shrink-0 lg:w-full px-3 lg:px-4 py-1.5 lg:py-2.5 rounded-xl text-[10px] lg:text-sm transition-all text-center lg:text-left relative whitespace-nowrap ${
               activeTab === item.key
                 ? 'bg-[#FF6B6B]/20 text-[#FF6B6B] border border-[#FF6B6B]/30'
                 : 'text-[#A5C9B8] hover:bg-[#23583E]/30 hover:text-white'
             }`}
           >
             <span className="flex-shrink-0">{item.icon}</span>
-            <span className="flex-1">{item.label}</span>
+            <span className="lg:flex-1">{item.label}</span>
             
             {/* Badge notifikasi */}
             {item.badge && item.badge > 0 && (
-              <span className="bg-red-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full min-w-[20px] text-center animate-pulse shadow-lg shadow-red-500/30">
+              <span className="absolute -top-1 -right-1 lg:static bg-red-500 text-white text-[9px] lg:text-[10px] font-bold px-1.5 lg:px-2 py-0.5 rounded-full min-w-[16px] lg:min-w-[20px] text-center animate-pulse shadow-lg shadow-red-500/30">
                 {item.badge}
               </span>
             )}
@@ -91,14 +111,17 @@ export function MerchantSidebar({ onBack, setActiveTab, activeTab, orderCount = 
 
       {/* ==========================================
           FOOTER - LOGOUT
+          — mobile: ikon saja di ujung bar landscape
+          — desktop: tombol penuh dengan label seperti semula
           ========================================== */}
-      <div className="p-4 border-t border-[#23583E]">
+      <div className="shrink-0 lg:p-4 lg:border-t lg:border-[#23583E]">
         <button
           onClick={handleLogout}
-          className="flex items-center gap-3 w-full px-4 py-2.5 rounded-xl text-sm text-red-400 hover:bg-red-500/10 transition-all hover:text-red-300"
+          title="Logout"
+          className="flex items-center gap-2 lg:w-full px-2.5 lg:px-4 py-1.5 lg:py-2.5 rounded-xl text-xs lg:text-sm text-red-400 hover:bg-red-500/10 transition-all hover:text-red-300"
         >
-          <LogOut className="w-5 h-5" />
-          <span>Logout</span>
+          <LogOut className="w-4 h-4 lg:w-5 lg:h-5" />
+          <span className="hidden lg:inline">Logout</span>
         </button>
       </div>
     </aside>

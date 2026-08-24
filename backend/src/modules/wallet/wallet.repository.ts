@@ -7,7 +7,7 @@ export class WalletRepository {
   }
 
   createForUser(userId: string) {
-    return prisma.wallet.create({ data: { userId, balance: 0 } });
+    return prisma.wallet.create({ data: { userId, balance: 0, earningsBalance: 0 } });
   }
 
   async findOrCreateByUserId(userId: string) {
@@ -59,12 +59,30 @@ export class WalletRepository {
     const deltaDecimal = new Prisma.Decimal(delta);
     const minRequiredBalance = deltaDecimal.isNegative() ? deltaDecimal.abs() : new Prisma.Decimal(0);
 
-    const { count } = await tx.wallet.updateMany({
-      where: { id: walletId, balance: { gte: minRequiredBalance } },
-      data: { balance: { increment: deltaDecimal } },
-    });
+    const isEarningCredit = deltaDecimal.isPositive() && (type === 'EARNING' || type === 'MERCHANT_EARNING');
+    const isEarningRefund = deltaDecimal.isPositive() && type === 'WITHDRAWAL_REFUND';
+    // earningsBalance adalah akumulasi penghasilan yang dapat dicairkan,
+    // bukan cermin semua debit saldo operasional. Komisi CASH/top-up expense
+    // tetap mengurangi balance, tetapi tidak menghapus catatan penghasilan.
+    // Penghasilan hanya berkurang ketika benar-benar di-HOLD untuk withdrawal
+    // (alur tersebut mengubah kedua kolom secara eksplisit di WalletService).
+    const earningsDelta = isEarningCredit || isEarningRefund ? deltaDecimal : new Prisma.Decimal(0);
 
-    if (count === 0) {
+    // Satu statement atomic. TOPUP/ADMIN_CREDIT dan debit operasional tidak
+    // mengubah earningsBalance; available withdrawal tetap dibatasi oleh
+    // min(earningsBalance, balance - minimumRetained).
+    const updatedRows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      UPDATE "Wallet"
+      SET
+        "balance" = "balance" + ${deltaDecimal},
+        "earningsBalance" = GREATEST(0, "earningsBalance" + ${earningsDelta}),
+        "updatedAt" = NOW()
+      WHERE "id" = ${walletId}
+        AND "balance" >= ${minRequiredBalance}
+      RETURNING "id"
+    `);
+
+    if (updatedRows.length === 0) {
       const exists = await tx.wallet.findUnique({ where: { id: walletId }, select: { id: true } });
       if (!exists) {
         throw new Error('Wallet tidak ditemukan.');

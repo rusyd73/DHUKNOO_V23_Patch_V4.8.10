@@ -6,6 +6,8 @@ export enum LedgerEntryType {
   PLATFORM_FEE = 'PLATFORM_FEE',
   MERCHANT_FEE = 'MERCHANT_FEE',
   DRIVER_COMMISSION = 'DRIVER_COMMISSION',
+  DRIVER_PICKUP_COMPENSATION = 'DRIVER_PICKUP_COMPENSATION',
+  PLATFORM_PICKUP_SUBSIDY = 'PLATFORM_PICKUP_SUBSIDY',
   REFUND = 'REFUND',
 }
 
@@ -29,6 +31,7 @@ export interface OrderFeeBreakdown {
   platformFee: number;
   merchantFee: number;
   driverCommission: number;
+  driverPickupCompensation?: number;
   breakdown: {
     itemsSubtotal?: number;
     deliveryFee?: number;

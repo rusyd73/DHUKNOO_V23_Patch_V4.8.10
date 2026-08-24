@@ -5,12 +5,29 @@ export const AdminAPI = {
   getDashboard: async () =>
     (await api.get(API_ENDPOINTS.admin.dashboard)).data,
 
+  createAdmin: async (data: { email: string; password: string; fullName: string }) =>
+    (await api.post('/api/admin/create-admin', data)).data,
+
+  getAdmins: async () =>
+    (await api.get('/api/admin/admins')).data,
+
+  deactivateAdmin: async (adminId: string, reason?: string) =>
+    (await api.patch(`/api/admin/admins/${adminId}/deactivate`, { reason })).data,
+
   getPendingDriverDocuments: async () =>
     (
       await api.get(
         API_ENDPOINTS.admin.pendingDriverDocuments
       )
     ).data,
+
+  getDriverDocumentFile: async (documentId: string) =>
+    (
+      await api.get(
+        `/api/admin/driver-documents/${documentId}/file`,
+        { responseType: 'blob' }
+      )
+    ).data as Blob,
 
   reviewDriverDocument: async (
     documentId: string,
@@ -28,6 +45,12 @@ export const AdminAPI = {
 
   reviewTopupRequest: async (id: string, status: 'APPROVED' | 'REJECTED', reviewNote?: string) =>
     (await api.post(`/api/admin/topup-requests/${id}/review`, { status, reviewNote })).data,
+
+  getWithdrawalRequests: async () =>
+    (await api.get('/api/wallet/admin/withdrawals')).data,
+
+  reviewWithdrawal: async (id: string, action: 'APPROVE' | 'PROCESS' | 'COMPLETE' | 'REJECT' | 'FAIL' | 'COMPLETE_MANUAL' | 'REFUND_MANUAL', reviewNote?: string) =>
+    (await api.post(`/api/wallet/admin/withdrawals/${id}/action`, { action, reviewNote })).data,
 
   verifyDriver: async (driverId: string) =>
     (

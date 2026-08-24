@@ -14,4 +14,10 @@ export const LocationAPI = {
         ...(isOnline !== undefined ? { isOnline } : {}),
       })
     ).data,
+  getNearbyAvailability: async (latitude: number, longitude: number, serviceType: string, radiusKm = 5, vehicleRequirement = 'AUTO') =>
+    (
+      await api.get('/api/location/drivers/nearby-availability', {
+        params: { latitude, longitude, serviceType, radiusKm, vehicleRequirement },
+      })
+    ).data,
 };

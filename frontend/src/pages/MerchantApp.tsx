@@ -54,7 +54,7 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
       const total = data.price || data.total || 0;
       const formattedTotal = total.toLocaleString('id-ID');
       
-      triggerToast(`📦 Pesanan baru! Total: Rp ${formattedTotal} ⏰ Menunggu driver...`);
+      triggerToast(`📦 Pesanan ${data.orderNumber || ''} baru! Total: Rp ${formattedTotal} ⏰ Menunggu driver...`);
       
       // 3. Update counter order masuk
       setOrderCount(prev => prev + 1);
@@ -72,7 +72,7 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
       
       // ✅ STOP RING LOOP jika order sudah di-accept atau selesai
       const status = data.status || '';
-      if (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'COMPLETED', 'CANCELLED'].includes(status)) {
+      if (['ACCEPTED', 'ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER', 'COMPLETED', 'CANCELLED'].includes(status)) {
         stopRingLoop();
         console.log('🔇 Ring loop stopped - order status changed to:', status);
       }
@@ -155,7 +155,14 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
   };
 
   return (
-    <div className="flex min-h-screen bg-[#06170E]">
+    // 🆕 RESPONSIVE FIX: sebelumnya "flex" (default flex-row) memaksa
+    // sidebar (Panel Toko) & konten selalu berdampingan secara horizontal,
+    // termasuk di layar HP sempit — sidebar w-64 menghabiskan sebagian
+    // besar layar dan mengunci akses ke fungsi kelola utama. Sekarang di
+    // bawah breakpoint `lg` layout ditumpuk vertikal (bar navigasi
+    // landscape di atas, konten penuh di bawah); di layar besar (lg+)
+    // kembali berdampingan seperti semula.
+    <div className="flex flex-col lg:flex-row min-h-screen bg-[#06170E]">
       {/* Sidebar dengan badge notifikasi */}
       <MerchantSidebar 
         onBack={onBack} 
@@ -163,7 +170,7 @@ function MerchantApp({ onBack, triggerToast }: MerchantAppProps) {
         activeTab={activeTab}
         orderCount={orderCount}
       />
-      <div className="flex-1 p-6 overflow-y-auto">
+      <div className="flex-1 p-4 lg:p-6 overflow-y-auto overflow-x-hidden min-w-0">
         {renderContent()}
       </div>
     </div>

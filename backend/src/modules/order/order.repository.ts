@@ -1,5 +1,6 @@
 import { Prisma, OrderStatus } from '@prisma/client';
 import { prisma } from '../../config/prisma';
+import { getOrderNumber } from '../../core/utils/order-number';
 
 
 export class OrderRepository {
@@ -108,7 +109,8 @@ export class OrderRepository {
         },
 
 
-        pricingHistory: true
+        pricingHistory: true,
+        stops: { orderBy: { sequence: 'asc' } },
 
       }
 
@@ -193,7 +195,14 @@ export class OrderRepository {
 
           }
 
-        }
+        },
+        merchant: true,
+        orderItems: true,
+        // RC2 FIX2: diperlukan agar customer dapat membedakan belum upload,
+        // sedang ditinjau, ditolak, dan approved setelah reload halaman.
+        paymentProof: true,
+        ledgers: { where: { type: 'DRIVER_TIP' }, select: { amount: true } },
+        stops: { orderBy: { sequence: 'asc' } },
 
       },
 
@@ -204,7 +213,11 @@ export class OrderRepository {
 
       }
 
-    });
+    }).then(orders => orders.map(order => ({
+      ...order,
+      orderNumber: getOrderNumber(order.id),
+      tipAmount: order.ledgers.reduce((sum, entry) => sum + Number(entry.amount), 0),
+    })));
 
   }
 
@@ -299,7 +312,8 @@ export class OrderRepository {
 
           }
 
-        }
+        },
+        stops: { orderBy: { sequence: 'asc' } }
 
       },
 
@@ -479,7 +493,7 @@ export class OrderRepository {
 
       where: {
         driverId: driverProfileId,
-        status: { in: [OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED] },
+        status: { in: [OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.ARRIVED, OrderStatus.PICKED_UP, OrderStatus.ARRIVED_CUSTOMER] },
       },
 
       select: { id: true },

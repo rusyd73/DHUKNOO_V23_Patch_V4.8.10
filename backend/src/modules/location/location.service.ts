@@ -73,11 +73,22 @@ export class LocationService {
       // Best-effort
     }
 
-    // STEP 4: SNAPSHOT KE DATABASE (PERIODIK, SETIAP 60 DETIK)
+    // STEP 4: SNAPSHOT KE DATABASE.
+    // Saat driver baru ONLINE, koordinat WAJIB disimpan sinkron sebelum
+    // request /jobs/eligibility berikutnya. Sebelumnya hanya setImmediate,
+    // sehingga Redis sudah benar tetapi PostgreSQL masih null/basi dan
+    // publikasi lama tidak pernah terlihat oleh driver yang terlambat online.
     const last = LocationService.lastSnapshot.get(userId) || 0;
     const now = Date.now();
 
-    if (now - last > SNAPSHOT_INTERVAL * 1000) {
+    if (isOnline === true) {
+      await this.locationRepo.updateDriverLocation(userId, latitude, longitude, true);
+      LocationService.lastSnapshot.set(userId, now);
+      logger.debug(`[LOCATION] Online driver ${userId} location synchronously saved to DB`);
+      SocketService.emitToUser(userId, 'jobs_refresh_required', {
+        reason: 'ONLINE_LOCATION_READY',
+      });
+    } else if (now - last > SNAPSHOT_INTERVAL * 1000) {
       setImmediate(async () => {
         try {
           await this.locationRepo.updateDriverLocation(

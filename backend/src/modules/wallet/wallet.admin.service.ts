@@ -3,11 +3,81 @@ import { AppError } from '../../core/errors/AppError';
 import { logger } from '../../config/logger';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { SocketService } from '../../websocket/socket';
-import crypto from 'crypto';
 import { WalletRepository } from './wallet.repository';
 
 export class WalletAdminService {
   private walletRepo = new WalletRepository();
+
+  async listWithdrawals() {
+    return prisma.withdrawalRequest.findMany({
+      where: { status: { in: ['PENDING_REVIEW', 'PENDING_TRANSFER', 'APPROVED', 'PROCESSING'] } },
+      include: { user: { select: { id: true, fullName: true, email: true, role: true } } },
+      orderBy: { createdAt: 'asc' }, take: 100,
+    });
+  }
+
+  async reviewWithdrawal(adminId: string, requestId: string, action: string, reviewNote?: string) {
+    const request = await prisma.withdrawalRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new AppError('Permintaan pencairan tidak ditemukan.', 404);
+    if (request.payoutProvider && request.payoutProvider !== 'MANUAL') {
+      throw new AppError('Pencairan otomatis hanya boleh diselesaikan oleh status resmi provider/webhook.', 409);
+    }
+    const now = new Date();
+    const transitions: Record<string, { from: string[]; to: string }> = {
+      APPROVE: { from: ['PENDING_REVIEW'], to: 'APPROVED' },
+      PROCESS: { from: ['APPROVED'], to: 'PROCESSING' },
+      COMPLETE: { from: ['APPROVED', 'PROCESSING'], to: 'COMPLETED' },
+      REJECT: { from: ['PENDING_REVIEW'], to: 'REJECTED' },
+      FAIL: { from: ['APPROVED', 'PROCESSING'], to: 'FAILED' },
+      COMPLETE_MANUAL: { from: ['PENDING_TRANSFER'], to: 'COMPLETED' },
+      REFUND_MANUAL: { from: ['PENDING_TRANSFER'], to: 'FAILED' },
+    };
+    const transition = transitions[action];
+    if (!transition || !transition.from.includes(request.status)) throw new AppError(`Aksi ${action} tidak valid untuk status ${request.status}.`, 409);
+
+    if (action === 'COMPLETE_MANUAL' && (!reviewNote || reviewNote.trim().length < 3)) {
+      throw new AppError('Nomor referensi transfer wajib diisi.', 400);
+    }
+    const updated = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.withdrawalRequest.updateMany({
+        where: { id: requestId, status: { in: transition.from as any } },
+        data: {
+          status: transition.to as any,
+          reviewedBy: adminId,
+          reviewNote: reviewNote?.trim() || null,
+          reviewedAt: ['APPROVE', 'REJECT', 'COMPLETE_MANUAL', 'REFUND_MANUAL'].includes(action) ? now : request.reviewedAt,
+          processedAt: action === 'PROCESS' ? now : request.processedAt,
+          completedAt: ['COMPLETE', 'COMPLETE_MANUAL'].includes(action) ? now : null,
+          manualTransferReference: action === 'COMPLETE_MANUAL' ? reviewNote!.trim() : request.manualTransferReference,
+          manualTransferredAt: action === 'COMPLETE_MANUAL' ? now : request.manualTransferredAt,
+          providerStatus: action === 'COMPLETE_MANUAL' ? 'MANUALLY_TRANSFERRED' : action === 'REFUND_MANUAL' ? 'MANUAL_TRANSFER_CANCELLED' : request.providerStatus,
+        },
+      });
+      if (count !== 1) throw new AppError('Permintaan sudah diproses oleh Admin lain.', 409);
+      if (action === 'REJECT' || action === 'FAIL' || action === 'REFUND_MANUAL') {
+        let wallet = await tx.wallet.findUnique({ where: { userId: request.userId } });
+        if (!wallet) wallet = await tx.wallet.create({ data: { userId: request.userId, balance: 0, earningsBalance: 0 } });
+        await this.walletRepo.applyDelta(tx, wallet.id, Number(request.amount), 'WITHDRAWAL_REFUND', `Pengembalian dana pencairan ${requestId}`, undefined, `withdrawal-refund-${requestId}`);
+      }
+      if (action === 'COMPLETE' || action === 'COMPLETE_MANUAL') {
+        let wallet = await tx.wallet.findUnique({ where: { userId: request.userId } });
+        if (!wallet) wallet = await tx.wallet.create({ data: { userId: request.userId, balance: 0, earningsBalance: 0 } });
+        await tx.transaction.create({
+          data: {
+            walletId: wallet.id,
+            type: 'WITHDRAWAL_COMPLETED',
+            amount: 0,
+            description: `Pencairan selesai ${requestId}${reviewNote?.trim() ? ` · Ref: ${reviewNote.trim()}` : ''}`,
+            idempotencyKey: `withdrawal-completed-${requestId}`,
+          },
+        });
+      }
+      return tx.withdrawalRequest.findUniqueOrThrow({ where: { id: requestId } });
+    });
+    await AuditLogger.log(adminId, `WITHDRAWAL_${action}`, `${requestId} user ${request.userId} Rp${request.amount}`);
+    SocketService.emitToUser(request.userId, 'withdrawal_status_changed', { requestId, status: updated.status, amount: request.amount });
+    return updated;
+  }
 
   // ============================================================
   // 🔒 LIST PENDING REQUESTS
@@ -234,38 +304,37 @@ export class WalletAdminService {
       throw new AppError('User target tidak aktif!', 400);
     }
 
-    // 🆕 FIX IDEMPOTENCY KRITIS: versi sebelumnya generate
-    // `admin-credit-${adminId}-${targetUserId}-${Date.now()}` -- key
-    // BERUBAH tiap milidetik, jadi @unique constraint di Transaction
-    // TIDAK PERNAH kena collision, dan double-klik tombol atau retry
-    // jaringan dari dashboard admin akan MENGKREDIT DUA KALI tanpa
-    // terdeteksi sama sekali.
+    // 🆕 FIX P0 IDEMPOTENCY KRITIS (audit): versi sebelumnya, kalau client
+    // tidak mengirim idempotencyKey, server diam-diam generate key ACAK
+    // (`crypto.randomUUID()`) SEKALI per panggilan sebagai fallback. Key
+    // acak itu TIDAK PERNAH sama antar dua request -- jadi @unique
+    // constraint di Transaction tidak pernah kena collision, dan
+    // double-klik tombol atau retry jaringan dari dashboard admin bisa
+    // MENGKREDIT DUA KALI tanpa terdeteksi sama sekali. Fallback itu
+    // memberi ILUSI aman (kodenya "punya idempotency key") padahal untuk
+    // request yang paling butuh perlindungan (client yang belum kirim
+    // key) perlindungannya nol.
     //
-    // Sekarang: kalau client kirim idempotencyKey (disarankan --
-    // dashboard admin generate 1 UUID per klik tombol dan kirim ulang
-    // key yang SAMA kalau request di-retry), key itu dipakai apa
-    // adanya. Sebelum insert, dicek dulu apakah key ini SUDAH PERNAH
-    // dipakai -- kalau sudah, request dianggap REPLAY dari transaksi
-    // yang sama dan hasil transaksi ASLI dikembalikan (bukan dikredit
-    // ulang, dan bukan error generik yang bikin client retry lagi).
-    //
-    // Kalau client TIDAK kirim idempotencyKey sama sekali, server
-    // generate key acak (crypto.randomUUID) SEKALI per panggilan --
-    // ini tidak melindungi dari double-klik (server tidak tahu 2
-    // request berbeda itu "niat" yang sama atau bukan), makanya
-    // idempotencyKey di schema Zod sangat disarankan diisi client,
-    // bukan cuma opsional secara default di UI.
-    const key = idempotencyKey || `admin-credit-${adminId}-${targetUserId}-${crypto.randomUUID()}`;
+    // Sekarang idempotencyKey WAJIB dari client (ditegakkan di
+    // adminWalletCreditSchema, .optional() sudah dihapus) -- tidak ada
+    // fallback server-side sama sekali. Kalau sampai lolos ke sini tanpa
+    // key (mis. dipanggil langsung dari kode lain, bukan lewat route),
+    // request DITOLAK eksplisit daripada diam-diam "diamankan sendiri".
+    if (!idempotencyKey) {
+      throw new AppError(
+        'idempotencyKey wajib diisi untuk kredit wallet admin -- operasi finansial ini harus bisa diretry dengan aman tanpa risiko double-credit.',
+        400
+      );
+    }
+    const key = idempotencyKey;
 
-    if (idempotencyKey) {
-      const existing = await prisma.transaction.findUnique({
-        where: { idempotencyKey: key },
-        include: { wallet: true },
-      });
-      if (existing) {
-        logger.info(`[WALLET] Idempotent replay terdeteksi untuk key ${key} -- mengembalikan hasil transaksi asli, TIDAK mengkredit ulang.`);
-        return { updatedWallet: existing.wallet, transaction: existing, replayed: true };
-      }
+    const existing = await prisma.transaction.findUnique({
+      where: { idempotencyKey: key },
+      include: { wallet: true },
+    });
+    if (existing) {
+      logger.info(`[WALLET] Idempotent replay terdeteksi untuk key ${key} -- mengembalikan hasil transaksi asli, TIDAK mengkredit ulang.`);
+      return { updatedWallet: existing.wallet, transaction: existing, replayed: true };
     }
 
     let result;

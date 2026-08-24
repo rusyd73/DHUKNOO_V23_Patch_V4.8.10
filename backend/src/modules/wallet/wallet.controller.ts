@@ -5,9 +5,23 @@ import { AppError } from '../../core/errors/AppError';
 import { logger } from '../../config/logger';
 import { AuditLogger } from '../../core/logging/audit.logger';
 import { prisma } from '../../config/prisma';
+import { PayoutService } from './payout.service';
 
 export class WalletController {
   private walletService = new WalletService();
+  private payoutService = new PayoutService();
+
+  xenditPayoutWebhook = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const token = String(req.headers['x-callback-token'] || '');
+      if (!this.payoutService.verifyXenditWebhook(token)) return res.status(401).json({ error: 'Webhook tidak terverifikasi.' });
+      await this.payoutService.handleXenditWebhook(req.body);
+      return res.status(200).json({ received: true });
+    } catch (err: any) {
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Webhook payout gagal diproses.' });
+    }
+  };
 
   // ============================================================
   // 🔒 GET BALANCE
@@ -41,6 +55,19 @@ export class WalletController {
     }
   };
 
+  getMyWithdrawals = async (req: AuthenticatedRequest, res: Response) => {
+    try { return res.json({ success: true, data: await this.walletService.getWithdrawalHistory(req.user!.id) }); }
+    catch (err: any) { return res.status(err instanceof AppError ? err.statusCode : 500).json({ success: false, error: err.message || 'Gagal mengambil riwayat pencairan.' }); }
+  };
+
+  createWithdrawal = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const data = await this.walletService.requestWithdrawal(req.user!.id, { ...req.body, amount: Number(req.body.amount) });
+      await AuditLogger.log(req.user!.id, 'WITHDRAWAL_REQUESTED', `Permintaan pencairan Rp${Number(req.body.amount).toLocaleString('id-ID')}`);
+      return res.status(201).json({ success: true, message: 'Permintaan pencairan diajukan dan dana telah ditahan.', data });
+    } catch (err: any) { return res.status(err instanceof AppError ? err.statusCode : 500).json({ success: false, error: err.message || 'Gagal mengajukan pencairan.' }); }
+  };
+
   // ============================================================
   // 🔒 REQUEST TOPUP (DENGAN VALIDASI)
   // ============================================================
@@ -59,12 +86,14 @@ export class WalletController {
         return res.status(400).json({ error: 'Payment method is required' });
       }
 
-      if (!proofImageUrl) {
+      // 🔒 Normalisasi method lebih dulu agar aturan bukti pembayaran konsisten.
+      const normalizedMethod = method === 'PAYMENT_LINK' ? 'TRANSFER' : method;
+
+      // CASH disetor langsung ke kasir/agen dan diverifikasi secara fisik.
+      // Bukti foto tetap wajib untuk semua metode non-tunai.
+      if (normalizedMethod !== 'CASH' && !proofImageUrl) {
         return res.status(400).json({ error: 'Proof image is required' });
       }
-
-      // 🔒 Normalisasi method
-      const normalizedMethod = method === 'PAYMENT_LINK' ? 'TRANSFER' : method;
 
       // 🔒 Panggil service dengan validasi
       const topupRequest = await this.walletService.requestTopup(

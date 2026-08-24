@@ -1,4 +1,5 @@
 import { prisma } from "../../config/prisma";
+import type { DriverPickupCompensationSnapshot } from "../driver/services/driver-pickup-compensation.service";
 
 
 export class DispatchRepository {
@@ -35,15 +36,14 @@ export class DispatchRepository {
           not:null,
         },
 
-        // BEKUKAN driver dari publikasi order baru selama ada order CASH yang
-        // sudah COMPLETED tapi BELUM dikonfirmasi diterima (isPaid masih false).
-        // Tanpa ini driver bisa terus menumpuk order baru padahal belum
-        // menyetorkan/mengkonfirmasi uang tunai dari order sebelumnya.
+        // BEKUKAN driver dari publikasi order baru selama settlement order
+        // sebelumnya masih menggantung. CASH menunggu konfirmasi driver;
+        // QRIS/TRANSFER/EWALLET menunggu upload + approval bukti bayar customer.
         orders: {
           none: {
             status: 'COMPLETED',
-            paymentMethod: 'CASH',
             isPaid: false,
+            paymentMethod: { in: ['CASH', 'QRIS', 'TRANSFER', 'EWALLET'] },
           },
         },
 
@@ -249,57 +249,70 @@ async assignDriver(
 
   orderId:string,
 
-  driverId:string
+  driverId:string,
+
+  pickupCompensationSnapshot?: DriverPickupCompensationSnapshot
 
 ){
 
+  // FIX7: claim order + snapshot kompensasi driver->pickup berada dalam
+  // SATU transaksi. Jika snapshot pricing gagal, claim ikut rollback.
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`
+      WITH driver_lock AS MATERIALIZED (
+        SELECT pg_advisory_xact_lock(hashtext(${driverId}))
+      )
+      SELECT 1::INTEGER AS locked FROM driver_lock
+    `;
+    const activeOrder = await tx.order.findFirst({
+      where: {
+        driverId,
+        status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED", "PICKED_UP", "ARRIVED_CUSTOMER"] },
+      },
+      select: { id: true },
+    });
+    if (activeOrder) {
+      throw new Error("Driver sudah memiliki order aktif.");
+    }
 
-  // PERBAIKAN: sebelumnya ini `prisma.order.update` TANPA PENJAGA SAMA
-  // SEKALI (`where: { id: orderId }` saja) -- order APAPUN statusnya akan
-  // ditimpa jadi ACCEPTED milik driver ini, bahkan kalau order itu SUDAH
-  // diambil driver lain lebih dulu (race condition) atau sudah dibatalkan.
-  // Sekarang pakai `updateMany` dengan penjaga status:PENDING & driverId:null
-  // (pola yang sama seperti OrderRepository.claimOrder), supaya kalau count
-  // hasilnya 0 berarti order sudah "diambil" pihak lain -- pemanggil
-  // (DispatchService.acceptOffer) akan menangkap ini sebagai race dan
-  // lanjut ke kandidat berikutnya, BUKAN diam-diam menimpa data driver lain.
-  const result = await prisma.order.updateMany({
+    const result = await tx.order.updateMany({
+      where: {
+        id: orderId,
+        status: "PENDING",
+        driverId: null,
+        createdAt: { gt: new Date(Date.now() - 30 * 60 * 1000) },
+      },
+      data:{
+        driverId,
+        status: "ACCEPTED",
+        acceptedAt: new Date(),
+      },
+    });
 
-    where: {
-      id: orderId,
-      status: "PENDING",
-      driverId: null,
-    },
+    if (result.count === 0) {
+      throw new Error("Order sudah diambil pihak lain sebelum assignDriver sempat jalan (race condition).");
+    }
 
-    data:{
+    if (pickupCompensationSnapshot) {
+      const pricing = await tx.pricingHistory.findUnique({ where: { orderId } });
+      const currentBreakdown = pricing?.breakdown && typeof pricing.breakdown === 'object'
+        ? (pricing.breakdown as Record<string, unknown>)
+        : {};
 
+      await tx.pricingHistory.upsert({
+        where: { orderId },
+        create: { orderId, tariffVersionId: null, breakdown: pickupCompensationSnapshot as any },
+        update: { breakdown: { ...currentBreakdown, ...pickupCompensationSnapshot } as any },
+      });
+    }
 
-      driverId,
-
-
-      status:
-        "ACCEPTED",
-
-      acceptedAt:
-        new Date()
-
-
-    },
-
-  });
-
-  if (result.count === 0) {
-    throw new Error("Order sudah diambil pihak lain sebelum assignDriver sempat jalan (race condition).");
-  }
-
-  // PENTING: relasi customer disertakan supaya pemanggil (DispatchService.acceptOffer)
-  // bisa mengambil customer.userId yang BENAR untuk notifikasi realtime — order.customerId
-  // saja adalah ID CustomerProfile, BUKAN ID User yang dipakai room socket `user_<id>`.
-  return prisma.order.findUniqueOrThrow({
-    where: { id: orderId },
-    include: {
-      customer: true,
-    },
+    return tx.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: {
+        customer: true,
+        merchant: { select: { ownerId: true } },
+      },
+    });
   });
 
 }

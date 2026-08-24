@@ -5,6 +5,8 @@ import { WalletRepository } from '../wallet/wallet.repository';
 import { TariffEngineService } from '../tariff/tariff.service';
 import { AppError, NotFoundError, ForbiddenError } from '../../core/errors/AppError';
 import { SocketService } from '../../websocket/socket';
+import { LedgerService } from '../ledger/ledger.service';
+import { AuditLogger } from '../../core/logging/audit.logger';
 
 /**
  * Menghitung pembagian pembayaran satu order: berapa yang ditagih ke customer
@@ -30,36 +32,34 @@ export function calculatePaymentSplit(
  * order (harga barang + ongkir) sebagai "pendapatan driver", dan MERCHANT
  * TIDAK PERNAH menerima apa pun untuk barang yang terjual. Fungsi ini
  * memisahkan order MART menjadi tiga bagian:
- *   - merchantEarning : nilai barang (itemsSubtotal) dikurangi platform fee
- *                        merchant -> masuk ke wallet pemilik toko.
+ *   - merchantEarning : 100% nilai barang (itemsSubtotal) -> masuk ke wallet
+ *                        pemilik toko. Nilai pokok produk bukan objek komisi.
  *   - driverEarning    : ongkir (deliveryFee) dikurangi komisi platform
  *                        (tarif tiered TariffEngine yang sama dengan order
  *                        lain, tapi dihitung dari ongkir saja, bukan dari
  *                        total order).
- *   - Sisanya (merchantFee + driverCommission) adalah pendapatan platform,
- *     sama seperti platformFee pada order biasa (tidak dikreditkan ke
- *     wallet mana pun secara eksplisit -- konsisten dengan pola yang sudah
- *     ada untuk platformFee non-MART).
+ *   - Pendapatan platform HANYA driverCommission dari ongkos pengantaran.
  */
 export function calculateMartPaymentSplit(
   price: Prisma.Decimal.Value,
   discount: Prisma.Decimal.Value,
   itemsSubtotal: Prisma.Decimal.Value,
   driverCommissionRate: number,
-  merchantFeeRate: number
+  _legacyMerchantFeeRate: number = 0
 ) {
   const amountToCharge = new Prisma.Decimal(price).minus(discount);
   const itemsSubtotalDecimal = new Prisma.Decimal(itemsSubtotal);
   // Ongkir = total ditagih - nilai barang (diskon, kalau ada, dianggap memotong ongkir dulu).
   const deliveryFee = amountToCharge.minus(itemsSubtotalDecimal);
 
-  const merchantFee = itemsSubtotalDecimal.times(merchantFeeRate);
-  const merchantEarning = itemsSubtotalDecimal.minus(merchantFee);
+  const merchantFeeRate = 0;
+  const merchantFee = new Prisma.Decimal(0);
+  const merchantEarning = itemsSubtotalDecimal;
 
   const driverCommission = deliveryFee.times(driverCommissionRate);
   const driverEarning = deliveryFee.minus(driverCommission);
 
-  const platformFee = merchantFee.plus(driverCommission);
+  const platformFee = driverCommission;
 
   return {
     amountToCharge,
@@ -79,6 +79,7 @@ export class PaymentService {
   private paymentRepo = new PaymentRepository();
   private walletRepo = new WalletRepository();
   private tariffEngine = new TariffEngineService();
+  private ledgerService = new LedgerService();
 
   private async resolveCommissionRateForOrder(order: { id: string; price: any; discount: any }) {
     const pricingHistory = await this.paymentRepo.findPricingHistoryByOrderId(order.id);
@@ -86,6 +87,23 @@ export class PaymentService {
     return pricingHistory?.breakdown && typeof (pricingHistory.breakdown as any).commissionRate === 'number'
       ? (pricingHistory.breakdown as any).commissionRate
       : (await this.tariffEngine.resolveCommissionRate(amountToChargeRaw)).rate;
+  }
+
+  // FIX7: kompensasi DRIVER -> PICKUP sudah di-snapshot saat accept di
+  // PricingHistory.breakdown. Settlement hanya MEMBACA snapshot ini; tidak
+  // menghitung ulang dari lokasi driver terkini. Customer tidak pernah ditagih
+  // komponen ini dan komisi driver tidak diterapkan atas kompensasi ini.
+  private async resolveDriverPickupCompensation(orderId: string): Promise<{ amount: number; distanceKm: number; ratePerKm: number }> {
+    const pricingHistory = await this.paymentRepo.findPricingHistoryByOrderId(orderId);
+    const breakdown = pricingHistory?.breakdown as any;
+    const amount = Number(breakdown?.driverPickupCompensation ?? 0);
+    const distanceKm = Number(breakdown?.driverPickupDistanceKm ?? breakdown?.driverAcceptanceDistanceKm ?? 0);
+    const ratePerKm = Number(breakdown?.driverPickupRatePerKm ?? 0);
+    return {
+      amount: Number.isFinite(amount) && amount > 0 ? amount : 0,
+      distanceKm: Number.isFinite(distanceKm) && distanceKm > 0 ? distanceKm : 0,
+      ratePerKm: Number.isFinite(ratePerKm) && ratePerKm > 0 ? ratePerKm : 0,
+    };
   }
 
   /**
@@ -118,12 +136,7 @@ export class PaymentService {
         ? breakdown.commissionRate
         : (await this.tariffEngine.resolveCommissionRate(deliveryFeeRaw)).rate;
 
-    const merchantFeeRate =
-      breakdown && typeof breakdown.merchantFeeRate === 'number'
-        ? breakdown.merchantFeeRate
-        : await this.tariffEngine.getMerchantPlatformFeeRate();
-
-    return calculateMartPaymentSplit(order.price, order.discount, itemsSubtotal, driverCommissionRate, merchantFeeRate);
+    return calculateMartPaymentSplit(order.price, order.discount, itemsSubtotal, driverCommissionRate);
   }
 
   async chargeOrder(customerUserId: string, orderId: string, idempotencyKey: string) {
@@ -146,6 +159,9 @@ export class PaymentService {
     if (order.isPaid) {
       throw new AppError('Order ini sudah dibayar sebelumnya!', 409);
     }
+    if (order.paymentMethod !== 'WALLET') {
+      throw new AppError(`chargeOrder hanya berlaku untuk order dengan paymentMethod WALLET (saat ini: ${order.paymentMethod}).`, 400);
+    }
     if (order.status !== 'COMPLETED') {
       throw new AppError('Order hanya bisa dibayar setelah perjalanan berstatus COMPLETED!', 400);
     }
@@ -156,7 +172,7 @@ export class PaymentService {
     const isMartOrder = !!order.merchantId;
 
     // 🆕 Order MART (checkout dari Merchant) dipecah 3-arah: merchant dapat
-    // nilai barang (dikurangi platform fee merchant), driver dapat komisi dari
+    // 100% nilai barang, driver mendapat bagian bersih dari
     // ongkir saja -- SEBELUMNYA driver menerima hampir seluruh nilai order
     // (barang + ongkir) dan merchant tidak pernah dibayar sama sekali.
     const martSplit = isMartOrder ? await this.resolveMartSplit(order) : null;
@@ -172,13 +188,14 @@ export class PaymentService {
     const { amountToCharge, platformFee, driverEarning } = isMartOrder
       ? martSplit!
       : calculatePaymentSplit(order.price, order.discount, commissionRate);
+    const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
     const customerWallet = await this.walletRepo.findOrCreateByUserId(customerUserId);
     const driverWallet = await this.walletRepo.findOrCreateByUserId(order.driver.userId);
     // Merchant hanya bisa dikreditkan kalau punya akun login (ownerId) —
     // sama seperti syarat notifikasi 'merchant_new_order' saat order dibuat.
-    // Kalau tidak ada, bagian merchant TIDAK hilang -- tetap tercatat sebagai
-    // bagian dari platformFee (lihat komentar di calculateMartPaymentSplit).
+    // Kalau tidak ada owner, settlement ditolak oleh validasi bisnis terkait;
+    // nilai produk tidak boleh dialihkan menjadi revenue platform.
     const merchantOwnerId = isMartOrder ? (order as any).merchant?.ownerId : null;
     const merchantWallet = merchantOwnerId ? await this.walletRepo.findOrCreateByUserId(merchantOwnerId) : null;
 
@@ -209,8 +226,22 @@ export class PaymentService {
           `${idempotencyKey}:credit`
         );
 
-        // 🆕 Kreditkan pendapatan ke MERCHANT (nilai barang dikurangi platform
-        // fee merchant) -- ini yang sebelumnya sama sekali tidak ada.
+        // FIX7: subsidy platform untuk jarak driver -> pickup. Dibukukan
+        // TERPISAH agar tidak menaikkan tagihan customer dan tidak ikut komisi.
+        const pickupCredit = pickupCompensation.amount > 0
+          ? await this.walletRepo.applyDelta(
+              tx,
+              driverWallet.id,
+              pickupCompensation.amount,
+              'EARNING',
+              `Kompensasi menuju pickup order #${order.id}: ${pickupCompensation.distanceKm.toFixed(3)} km x Rp${pickupCompensation.ratePerKm.toLocaleString('id-ID')}/km`,
+              order.id,
+              `${idempotencyKey}:pickup-compensation`
+            )
+          : null;
+
+        // Kreditkan 100% nilai pokok produk ke merchant. Merchant tidak ikut
+        // skema komisi driver/platform.
         let merchantCredit: Awaited<ReturnType<WalletRepository['applyDelta']>> | null = null;
         if (isMartOrder && martSplit && merchantWallet) {
           merchantCredit = await this.walletRepo.applyDelta(
@@ -218,18 +249,23 @@ export class PaymentService {
             merchantWallet.id,
             martSplit.merchantEarning,
             'MERCHANT_EARNING',
-            `Penjualan order #${order.id} (setelah platform fee merchant ${(martSplit.merchantFeeRate * 100).toFixed(1)}%)`,
+            `Penjualan order #${order.id} (100% nilai pokok produk)`,
             order.id,
             `${idempotencyKey}:merchant-credit`
           );
         }
 
+        // 🆕 FIX P0 "Financial State Machine" (audit a1.4): settlementStatus
+        // di-set SETTLED dalam TRANSAKSI ATOMIK YANG SAMA dengan debit/kredit
+        // di atas -- konsisten dengan prinsip "settlement harus atomic
+        // sebagai satu unit bisnis" (bukan langkah terpisah yang bisa gagal
+        // sendiri setelah uang sudah berpindah).
         const updatedOrder = await tx.order.update({
           where: { id: order.id },
-          data: { isPaid: true },
+          data: { isPaid: true, settlementStatus: 'SETTLED' },
         });
 
-        return { debit, credit, merchantCredit, updatedOrder };
+        return { debit, credit, pickupCredit, merchantCredit, updatedOrder };
       });
 
       // Realtime: dashboard driver, merchant & customer langsung update tanpa refresh.
@@ -237,7 +273,8 @@ export class PaymentService {
         SocketService.emitToOrder(order.id, 'order_paid', { orderId: order.id });
         SocketService.emitToUser(order.driver.userId, 'payment_received', {
           orderId: order.id,
-          amount: driverEarning,
+          amount: new Prisma.Decimal(driverEarning).plus(pickupCompensation.amount),
+          pickupCompensation: pickupCompensation.amount,
         });
         if (merchantOwnerId) {
           SocketService.emitToUser(merchantOwnerId, 'payment_received', {
@@ -255,6 +292,7 @@ export class PaymentService {
         order: result.updatedOrder,
         customerTransaction: result.debit.transaction,
         driverTransaction: result.credit.transaction,
+        pickupCompensationTransaction: result.pickupCredit?.transaction ?? null,
         merchantTransaction: result.merchantCredit?.transaction ?? null,
         platformFee,
         alreadyProcessed: false,
@@ -303,9 +341,11 @@ export class PaymentService {
     const isMartOrder = !!order.merchantId;
     const martSplit = isMartOrder ? await this.resolveMartSplit(order) : null;
     const commissionRate = isMartOrder ? martSplit!.driverCommissionRate : await this.resolveCommissionRateForOrder(order);
-    const { platformFee } = isMartOrder
+    const paymentSplit = isMartOrder
       ? martSplit!
       : calculatePaymentSplit(order.price, order.discount, commissionRate);
+    const { platformFee } = paymentSplit;
+    const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
     // 🆕 Untuk order MART cash: customer membayar TUNAI ke driver untuk
     // SELURUH nilai order (barang + ongkir) -- driver memegang uang milik
@@ -343,6 +383,20 @@ export class PaymentService {
           idempotencyKey
         );
 
+        // FIX7: meski pembayaran utama cash di tangan driver, kompensasi
+        // driver->pickup berasal dari platform sehingga tetap dikreditkan ke wallet.
+        const pickupCredit = pickupCompensation.amount > 0
+          ? await this.walletRepo.applyDelta(
+              tx,
+              driverWallet.id,
+              pickupCompensation.amount,
+              'EARNING',
+              `Kompensasi menuju pickup order #${order.id}: ${pickupCompensation.distanceKm.toFixed(3)} km x Rp${pickupCompensation.ratePerKm.toLocaleString('id-ID')}/km`,
+              order.id,
+              `${idempotencyKey}:pickup-compensation`
+            )
+          : null;
+
         // 🆕 Setorkan bagian merchant yang baru dipotong dari deposit driver ke wallet merchant.
         let merchantCredit: Awaited<ReturnType<WalletRepository['applyDelta']>> | null = null;
         if (isMartOrder && martSplit && merchantWallet) {
@@ -351,15 +405,53 @@ export class PaymentService {
             merchantWallet.id,
             martSplit.merchantEarning,
             'MERCHANT_EARNING',
-            `Penjualan order #${order.id} (dibayar tunai/cash, disetor dari deposit driver, setelah platform fee merchant ${(martSplit.merchantFeeRate * 100).toFixed(1)}%)`,
+            `Penjualan order #${order.id} (dibayar tunai/cash, 100% nilai pokok produk)`,
             order.id,
             `${idempotencyKey}:merchant-credit`
           );
         }
 
-        const updatedOrder = await tx.order.update({ where: { id: order.id }, data: { isPaid: true } });
-        return { feeDeduction, merchantCredit, updatedOrder };
+        // 🆕 FIX P0 "Financial State Machine": lihat komentar di chargeOrder().
+        const updatedOrder = await tx.order.update({ where: { id: order.id }, data: { isPaid: true, settlementStatus: 'SETTLED' } });
+        return { feeDeduction, pickupCredit, merchantCredit, updatedOrder };
       });
+
+      // CASH diterima fisik oleh driver, sehingga driverEarning TIDAK boleh
+      // dikreditkan lagi ke wallet. Namun seluruh split tetap WAJIB dicatat
+      // di Ledger (recordOnly) agar laporan driver/platform/merchant lengkap.
+      // Sebelumnya hanya pickup compensation yang dicatat: dashboard admin
+      // menampilkan komisi Rp0 dan perolehan driver hanya sebesar kompensasi.
+      try {
+        await this.ledgerService.recordOrderLedger({
+          orderId: order.id,
+          customerPayment: Number(paymentSplit.amountToCharge),
+          driverEarning: isMartOrder && martSplit
+            ? Number(martSplit.deliveryFee)
+            : Number(paymentSplit.amountToCharge),
+          merchantEarning: isMartOrder && martSplit ? Number(martSplit.itemsSubtotal) : 0,
+          platformFee: Number(platformFee),
+          merchantFee: isMartOrder && martSplit ? Number(martSplit.merchantFee) : 0,
+          driverCommission: isMartOrder && martSplit
+            ? Number(martSplit.driverCommission)
+            : Number(platformFee),
+          driverPickupCompensation: pickupCompensation.amount,
+          breakdown: {
+            itemsSubtotal: isMartOrder && martSplit ? Number(martSplit.itemsSubtotal) : 0,
+            deliveryFee: isMartOrder && martSplit ? Number(martSplit.deliveryFee) : Number(paymentSplit.amountToCharge),
+            shippingFee: isMartOrder && martSplit ? Number(martSplit.deliveryFee) : Number(paymentSplit.amountToCharge),
+            merchantFeeRate: isMartOrder && martSplit ? martSplit.merchantFeeRate : 0,
+            commissionRate,
+            driverPickupDistanceKm: pickupCompensation.distanceKm,
+            driverPickupRatePerKm: pickupCompensation.ratePerKm,
+          },
+        }, { recordOnly: true });
+      } catch (ledgerError: any) {
+        await AuditLogger.log(
+          driverUserId,
+          'LEDGER_RECORD_FAILED',
+          `Order CASH #${order.id} settled tetapi ledger split gagal: ${ledgerError?.message || ledgerError}. Perlu rekonsiliasi.`
+        ).catch(() => undefined);
+      }
 
       // Realtime: dashboard customer, driver & merchant langsung sinkron.
       try {
@@ -382,6 +474,7 @@ export class PaymentService {
       return {
         order: result.updatedOrder,
         transaction: result.feeDeduction.transaction,
+        pickupCompensationTransaction: result.pickupCredit?.transaction ?? null,
         merchantTransaction: result.merchantCredit?.transaction ?? null,
         alreadyProcessed: false,
       };
@@ -417,7 +510,13 @@ export class PaymentService {
       throw new AppError('Order ini sudah lunas!', 409);
     }
     if (order.status !== 'COMPLETED') {
-      throw new AppError('Bukti bayar hanya bisa diupload setelah order berstatus COMPLETED!', 400);
+      throw new AppError('Bukti bayar hanya bisa diupload setelah driver tiba di tujuan!', 400);
+    }
+    if (!['QRIS', 'TRANSFER', 'EWALLET'].includes(order.paymentMethod)) {
+      throw new AppError('Order ini tidak menggunakan metode pembayaran yang memerlukan bukti bayar manual.', 400);
+    }
+    if (order.paymentMethod !== method) {
+      throw new AppError(`Metode bukti bayar harus sesuai dengan metode order (${order.paymentMethod}).`, 400);
     }
 
     const existing = await this.paymentRepo.findPaymentProofByOrderId(orderId);
@@ -425,7 +524,24 @@ export class PaymentService {
       throw new AppError('Bukti bayar untuk order ini sudah pernah diupload dan sedang/sudah ditinjau!', 409);
     }
 
-    return this.paymentRepo.createOrReplacePaymentProof(orderId, method, proofImageUrl, note);
+    const proof = await this.paymentRepo.createOrReplacePaymentProof(orderId, method, proofImageUrl, note);
+
+    try {
+      const payload = {
+        orderId,
+        paymentMethod: method,
+        proofStatus: proof.status,
+        message: 'Bukti bayar sudah diterima dan sedang menunggu persetujuan Admin.',
+      };
+      SocketService.emitToOrder(orderId, 'payment_proof_submitted', payload);
+      SocketService.emitToUser(customerUserId, 'payment_proof_submitted', payload);
+      if ((order as any).driver?.userId) SocketService.emitToUser((order as any).driver.userId, 'payment_proof_submitted', payload);
+      SocketService.emitToAdmins('payment_proof_submitted', payload);
+    } catch {
+      // Realtime best-effort; bukti sudah tersimpan durable di database.
+    }
+
+    return proof;
   }
 
   /** Admin meninjau bukti bayar manual. Kalau APPROVED, kreditkan pendapatan ke driver. */
@@ -438,6 +554,31 @@ export class PaymentService {
 
     if (status === 'REJECTED') {
       const updated = await this.paymentRepo.updatePaymentProofStatus(proofId, 'REJECTED', adminUserId, reviewNote);
+      // 🆕 FIX P0 "Financial State Machine" (audit a1.4): bukti bayar
+      // ditolak berarti percobaan settlement ini GAGAL tapi customer masih
+      // bisa upload ulang (lihat submitPaymentProof -- REJECTED boleh
+      // digantikan bukti baru) -- state paling akurat adalah
+      // RETRY_REQUIRED, bukan dibiarkan diam di PENDING (yang secara
+      // makna berarti "belum pernah dicoba sama sekali", padahal sudah
+      // ada satu percobaan yang eksplisit ditolak).
+      await prisma.order.update({
+        where: { id: proof.order.id },
+        data: { settlementStatus: 'RETRY_REQUIRED' },
+      });
+      try {
+        const payload = {
+          orderId: proof.order.id,
+          paymentMethod: proof.method,
+          proofStatus: 'REJECTED',
+          reviewNote,
+          message: `Bukti bayar ${proof.method} ditolak. Silakan upload ulang bukti pembayaran yang valid.`,
+        };
+        SocketService.emitToOrder(proof.order.id, 'payment_proof_rejected', payload);
+        if ((proof.order as any).customer?.userId) SocketService.emitToUser((proof.order as any).customer.userId, 'payment_proof_rejected', payload);
+        if ((proof.order as any).driver?.userId) SocketService.emitToUser((proof.order as any).driver.userId, 'payment_proof_rejected', payload);
+      } catch {
+        // Durable status tetap sumber kebenaran.
+      }
       return { proof: updated, order: proof.order };
     }
 
@@ -459,6 +600,7 @@ export class PaymentService {
     const martSplit = isMartOrder ? await this.resolveMartSplit(order) : null;
     const commissionRate = isMartOrder ? martSplit!.driverCommissionRate : await this.resolveCommissionRateForOrder(order);
     const driverEarning = isMartOrder ? martSplit!.driverEarning : calculatePaymentSplit(order.price, order.discount, commissionRate).driverEarning;
+    const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
     const driverWallet = await this.walletRepo.findOrCreateByUserId(driverProfile.userId);
     const merchantOwnerId = isMartOrder ? (order as any).merchant?.ownerId : null;
@@ -485,6 +627,18 @@ export class PaymentService {
           idempotencyKey
         );
 
+        const pickupCredit = pickupCompensation.amount > 0
+          ? await this.walletRepo.applyDelta(
+              tx,
+              driverWallet.id,
+              pickupCompensation.amount,
+              'EARNING',
+              `Kompensasi menuju pickup order #${order.id}: ${pickupCompensation.distanceKm.toFixed(3)} km x Rp${pickupCompensation.ratePerKm.toLocaleString('id-ID')}/km`,
+              order.id,
+              `${idempotencyKey}:pickup-compensation`
+            )
+          : null;
+
         // 🆕 Kreditkan bagian merchant juga (sebelumnya tidak pernah ada).
         let merchantCredit: Awaited<ReturnType<WalletRepository['applyDelta']>> | null = null;
         if (isMartOrder && martSplit && merchantWallet) {
@@ -493,18 +647,19 @@ export class PaymentService {
             merchantWallet.id,
             martSplit.merchantEarning,
             'MERCHANT_EARNING',
-            `Penjualan order #${order.id} (dibayar via ${proof.method}, disetujui admin, setelah platform fee merchant ${(martSplit.merchantFeeRate * 100).toFixed(1)}%)`,
+            `Penjualan order #${order.id} (dibayar via ${proof.method}, 100% nilai pokok produk)`,
             order.id,
             `${idempotencyKey}:merchant-credit`
           );
         }
 
-        await tx.order.update({ where: { id: order.id }, data: { isPaid: true } });
+        // 🆕 FIX P0 "Financial State Machine": lihat komentar di chargeOrder().
+        await tx.order.update({ where: { id: order.id }, data: { isPaid: true, settlementStatus: 'SETTLED' } });
         const updatedProof = await tx.paymentProof.update({
           where: { id: proofId },
           data: { status: 'APPROVED', reviewedBy: adminUserId, reviewedAt: new Date(), reviewNote },
         });
-        return { credit, merchantCredit, updatedProof };
+        return { credit, pickupCredit, merchantCredit, updatedProof };
       });
     } catch (err: any) {
       // Race kondisi: dua admin (atau double-click) menyetujui bukti yang sama nyaris bersamaan.
@@ -515,10 +670,71 @@ export class PaymentService {
       throw err;
     }
 
+    // Accounting ledger untuk payment eksternal baru ditulis SETELAH approval.
+    // recordOnly=true penting: wallet sudah dikredit oleh transaction settlement
+    // di atas, sehingga Ledger hanya menjadi immutable accounting record dan
+    // tidak boleh memutasi saldo untuk kedua kalinya.
+    try {
+      const ledgerBreakdown = isMartOrder && martSplit
+        ? {
+            orderId: order.id,
+            customerPayment: Number(martSplit.amountToCharge),
+            driverEarning: Number(martSplit.deliveryFee),
+            merchantEarning: Number(martSplit.itemsSubtotal),
+            platformFee: Number(martSplit.platformFee),
+            merchantFee: Number(martSplit.merchantFee),
+            driverCommission: Number(martSplit.driverCommission),
+            driverPickupCompensation: pickupCompensation.amount,
+            breakdown: {
+              itemsSubtotal: Number(martSplit.itemsSubtotal),
+              deliveryFee: Number(martSplit.deliveryFee),
+              shippingFee: Number(martSplit.deliveryFee),
+              merchantFeeRate: martSplit.merchantFeeRate,
+              commissionRate: martSplit.driverCommissionRate,
+              driverPickupDistanceKm: pickupCompensation.distanceKm,
+              driverPickupRatePerKm: pickupCompensation.ratePerKm,
+            },
+          }
+        : (() => {
+            const split = calculatePaymentSplit(order.price, order.discount, commissionRate);
+            return {
+              orderId: order.id,
+              customerPayment: Number(split.amountToCharge),
+              driverEarning: Number(split.amountToCharge),
+              merchantEarning: 0,
+              platformFee: Number(split.platformFee),
+              merchantFee: 0,
+              driverCommission: Number(split.platformFee),
+              driverPickupCompensation: pickupCompensation.amount,
+              breakdown: {
+                deliveryFee: Number(split.amountToCharge),
+                shippingFee: Number(split.amountToCharge),
+                commissionRate,
+                driverPickupDistanceKm: pickupCompensation.distanceKm,
+                driverPickupRatePerKm: pickupCompensation.ratePerKm,
+              },
+            };
+          })();
+
+      await this.ledgerService.recordOrderLedger(ledgerBreakdown, { recordOnly: true });
+    } catch (ledgerError: any) {
+      // Settlement sudah committed; jangan rollback/ubah wallet di sini.
+      // Catat durable supaya reconciliation dapat menindaklanjuti ledger yang hilang.
+      try {
+        await AuditLogger.log(
+          adminUserId,
+          'LEDGER_RECORD_FAILED',
+          `Payment proof #${proofId} APPROVED tetapi ledger order #${order.id} gagal dicatat: ${ledgerError?.message || ledgerError}`
+        );
+      } catch {
+        // Logging terakhir tetap best-effort.
+      }
+    }
+
     // Realtime: driver, merchant & customer langsung tahu bukti bayar disetujui, tanpa refresh.
     try {
       SocketService.emitToOrder(order.id, 'order_paid', { orderId: order.id });
-      SocketService.emitToUser(driverProfile.userId, 'payment_received', { orderId: order.id });
+      SocketService.emitToUser(driverProfile.userId, 'payment_received', { orderId: order.id, amount: new Prisma.Decimal(driverEarning).plus(pickupCompensation.amount), pickupCompensation: pickupCompensation.amount });
       if (merchantOwnerId) {
         SocketService.emitToUser(merchantOwnerId, 'payment_received', { orderId: order.id, amount: martSplit?.merchantEarning });
       }
@@ -533,6 +749,7 @@ export class PaymentService {
     return {
       proof: result.updatedProof,
       transaction: result.credit.transaction,
+      pickupCompensationTransaction: result.pickupCredit?.transaction ?? null,
       merchantTransaction: result.merchantCredit?.transaction ?? null,
       order,
       alreadyProcessed: false,

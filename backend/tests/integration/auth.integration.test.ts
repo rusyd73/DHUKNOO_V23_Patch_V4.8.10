@@ -3,10 +3,15 @@ import { app } from '../../src/app';
 import { prisma } from '../../src/config/prisma';
 
 // Test ini BUTUH Postgres nyala (lihat DATABASE_URL di tests/setupEnv.ts atau .env).
-// Sudah otomatis disediakan lewat service container di CI — lihat
-// .github/workflows/deploy.yml (job audit-backend) dan deploy-staging.yml
-// (job build-and-test). Untuk jalan di lokal: `docker compose up -d postgres`
-// lalu `npx prisma db push` sebelum `npm test`.
+// 🆕 FIX P2 "README/dokumentasi jangan merujuk struktur yang tidak sesuai"
+// (audit E.5): komentar ini SEBELUMNYA merujuk .github/workflows/deploy.yml
+// (job audit-backend) dan deploy-staging.yml (job build-and-test) -- KEDUA
+// FILE ITU TIDAK PERNAH ADA di repo ini, jadi klaim "sudah otomatis
+// disediakan di CI" itu tidak benar. CI yang benar-benar ada sekarang
+// ada di .github/workflows/ci.yml (job "backend"), yang memang sudah
+// menyediakan Postgres lewat service container persis seperti yang
+// coba dijelaskan komentar lama ini. Untuk jalan di lokal: `docker
+// compose up -d postgres` lalu `npx prisma db push` sebelum `npm test`.
 
 const testEmail = `test-auth-${Date.now()}@obamaride.test`;
 const testPassword = 'password123';
@@ -26,9 +31,14 @@ describe('POST /api/auth/register', () => {
       role: 'CUSTOMER',
     });
 
+    // 🆕 FIX P0 KONTRAK AUTH: backend membungkus payload sukses di
+    // `data` (lihat auth.controller.ts register -> { success, message,
+    // data: result }) -- kontrak final yang sama dipakai modul lain
+    // (merchant, dst). Sebelumnya test ini mengecek field di level
+    // teratas (res.body.user), yang tidak pernah ada di response asli.
     expect(res.status).toBe(201);
-    expect(res.body.user).toMatchObject({ email: testEmail, role: 'CUSTOMER' });
-    expect(res.body.user.id).toEqual(expect.any(String));
+    expect(res.body.data).toMatchObject({ email: testEmail, role: 'CUSTOMER' });
+    expect(res.body.data.id).toEqual(expect.any(String));
   });
 
   it('menolak registrasi dengan email yang sudah terdaftar', async () => {
@@ -75,9 +85,9 @@ describe('POST /api/auth/login', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(res.body.accessToken).toEqual(expect.any(String));
-    expect(res.body.refreshToken).toEqual(expect.any(String));
-    expect(res.body.user).toMatchObject({ email: testEmail, role: 'CUSTOMER' });
+    expect(res.body.data.accessToken).toEqual(expect.any(String));
+    expect(res.body.data.refreshToken).toEqual(expect.any(String));
+    expect(res.body.data.user).toMatchObject({ email: testEmail, role: 'CUSTOMER' });
   });
 
   it('menolak login dengan password salah', async () => {
@@ -114,9 +124,9 @@ describe('GET /api/auth/profile (RBAC)', () => {
 
     const res = await request(app)
       .get('/api/auth/profile')
-      .set('Authorization', `Bearer ${loginRes.body.accessToken}`);
+      .set('Authorization', `Bearer ${loginRes.body.data.accessToken}`);
 
     expect(res.status).toBe(200);
-    expect(res.body.user.email).toBe(testEmail);
+    expect(res.body.data.email).toBe(testEmail);
   });
 });

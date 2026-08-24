@@ -56,4 +56,8 @@
     <!-- WAJIB untuk fitur scan QRIS (getUserMedia kamera) & ambil foto
          dokumen/bukti bayar dari WebView. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- WAJIB untuk In-App VoIP/WebRTC. Tanpa RECORD_AUDIO, getUserMedia({audio:true})
+         di Android WebView tidak bisa mengirim audio mikrofon. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 </manifest>

@@ -6,7 +6,7 @@ export const TariffAPI = {
      Preview Tarif
      ========================================================================== */
   preview: async (payload: {
-    serviceType: "BIKE" | "CAR" | "SEND";
+    serviceType: "BIKE" | "CAR" | "SEND" | "MART";
     distanceKm: number;
     zoneName?: string;
     waitMinutes?: number;

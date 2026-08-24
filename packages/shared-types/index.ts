@@ -2,7 +2,7 @@ export type UserRole = 'CUSTOMER' | 'DRIVER' | 'ADMIN' | 'MERCHANT';
 
 export type OrderStatus = 'PENDING' | 'ACCEPTED' | 'ON_THE_WAY' | 'ARRIVED' | 'COMPLETED' | 'CANCELLED';
 
-export type ServiceType = 'BIKE' | 'CAR' | 'SEND';
+export type ServiceType = 'BIKE' | 'CAR' | 'SEND' | 'MART';
 
 export type TransactionType = 'TOPUP' | 'PAYMENT' | 'EARNING' | 'PLATFORM_FEE' | 'REFUND';
 

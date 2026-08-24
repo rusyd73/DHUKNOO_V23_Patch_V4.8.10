@@ -16,7 +16,6 @@ import {
 } from 'lucide-react';
 import { AuthAPI, UploadAPI, WalletAPI } from '../../api';
 import { formatRupiah } from '@obama/shared-utils';
-import { openWhatsAppMessage } from '../../utils/whatsapp';
 
 // PERBAIKAN PERFORMA: file ini sebelumnya adalah bagian dari app/App.tsx
 // (satu file monolitik ~5100 baris) yang SELALU ikut ter-load di initial
@@ -28,16 +27,12 @@ import { openWhatsAppMessage } from '../../utils/whatsapp';
 
 export function QrisCameraScannerModal({ onClose, triggerToast }: { onClose: () => void; triggerToast: (m: string) => void }) {
   const videoRef = React.useRef<HTMLVideoElement>(null);
+  const streamRef = React.useRef<MediaStream | null>(null);
+  const scanFrameRef = React.useRef<number | null>(null);
   const [streamActive, setStreamActive] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [scanResult, setScanResult] = useState<string | null>(null);
 
-  // PERBAIKAN: onClose & triggerToast disimpan di ref supaya effect di bawah
-  // selalu bisa memanggil VERSI TERBARU keduanya, TANPA perlu memasukkan
-  // keduanya ke dependency array useEffect. Sebelumnya keduanya ada di
-  // dependency array — karena keduanya fungsi baru di setiap render parent,
-  // effect jadi restart terus-menerus tiap parent re-render: kamera
-  // dimatikan-nyalakan ulang (kelihatan "berkedip"), dan timer auto-close
-  // ikut ke-reset ke 0 setiap kali (jadi TIDAK PERNAH sempat mencapai 2.5
-  // detik / tidak pernah auto-close).
   const onCloseRef = React.useRef(onClose);
   const triggerToastRef = React.useRef(triggerToast);
   useEffect(() => {
@@ -45,51 +40,123 @@ export function QrisCameraScannerModal({ onClose, triggerToast }: { onClose: () 
     triggerToastRef.current = triggerToast;
   }, [onClose, triggerToast]);
 
+  // Buka stream sekali. Stream disimpan di ref; pemasangan ke elemen <video>
+  // dilakukan oleh effect terpisah SETELAH React benar-benar merender <video>.
+  // Ini memperbaiki bug layar gelap: versi lama setStreamActive(true) lalu
+  // langsung mencoba videoRef.current, padahal elemen video belum ada pada render itu.
   useEffect(() => {
-    let activeStream: MediaStream | null = null;
     let cancelled = false;
 
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
-        .then((stream) => {
-          if (cancelled) {
-            // Modal sudah keburu ditutup sebelum kamera sempat menyala — jangan
-            // biarkan stream yang telat ini nyangkut aktif di background.
-            stream.getTracks().forEach((track) => track.stop());
-            return;
-          }
-          activeStream = stream;
-          setStreamActive(true);
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            videoRef.current.play().catch(() => {});
-          }
-        })
-        .catch(() => {
-          setStreamActive(false);
-        });
+    const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+    if (!window.isSecureContext && !isLocalhost) {
+      const message = 'Kamera hanya bisa diakses melalui koneksi HTTPS (atau localhost saat development).';
+      setCameraError(message);
+      triggerToastRef.current(message);
+      return;
     }
 
-    // PERBAIKAN: sebelumnya ada timer paksa yang menutup modal 2.5 detik
-    // SETELAH DIBUKA, apa pun yang sedang terjadi — termasuk sebelum izin
-    // kamera browser selesai diproses atau sebelum user sempat mengarahkan
-    // kamera ke barcode. 2.5 detik tidak realistis untuk alur nyata (izin
-    // kamera saja bisa makan waktu lebih dari itu). Sekarang modal HANYA
-    // ditutup lewat aksi user sendiri (tombol "Pindai QRIS & Lanjutkan" atau
-    // "✕ Tutup"), sama seperti scanner sungguhan.
+    if (!navigator.mediaDevices?.getUserMedia) {
+      const message = 'Browser/perangkat ini tidak menyediakan akses kamera. Gunakan Chrome/Edge terbaru dan pastikan izin kamera aktif.';
+      setCameraError(message);
+      triggerToastRef.current(message);
+      return;
+    }
+
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    }).then((stream) => {
+      if (cancelled) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      setCameraError(null);
+      setStreamActive(true);
+    }).catch((err: unknown) => {
+      if (cancelled) return;
+      const name = err instanceof DOMException ? err.name : '';
+      const message =
+        name === 'NotAllowedError' || name === 'PermissionDeniedError'
+          ? 'Izin kamera ditolak. Buka pengaturan browser/HP, izinkan akses kamera untuk DHUKNOO, lalu coba lagi.'
+          : name === 'NotFoundError' || name === 'DevicesNotFoundError'
+            ? 'Kamera tidak ditemukan di perangkat ini.'
+            : name === 'NotReadableError' || name === 'TrackStartError'
+              ? 'Kamera sedang dipakai aplikasi lain. Tutup aplikasi kamera lain lalu coba lagi.'
+              : 'Gagal mengakses kamera. Pastikan aplikasi dibuka melalui HTTPS atau localhost.';
+      setCameraError(message);
+      triggerToastRef.current(message);
+    });
 
     return () => {
       cancelled = true;
-      if (activeStream) {
-        activeStream.getTracks().forEach((track) => track.stop());
-      }
+      if (scanFrameRef.current !== null) cancelAnimationFrame(scanFrameRef.current);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     };
-    // PENTING: dependency array KOSONG — effect ini hanya boleh jalan SEKALI
-    // saat modal dibuka (minta izin kamera sekali), lalu dibersihkan SEKALI
-    // saat modal ditutup/unmount. Ini yang memperbaiki gejala "berkedip"
-    // (lihat catatan di atas soal onCloseRef/triggerToastRef).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Pasang stream setelah elemen video sudah mounted, lalu scan frame QRIS.
+  useEffect(() => {
+    if (!streamActive || !videoRef.current || !streamRef.current) return;
+    const video = videoRef.current;
+    video.srcObject = streamRef.current;
+
+    let stopped = false;
+    const start = async () => {
+      try {
+        await video.play();
+      } catch (err) {
+        setCameraError('Kamera terbuka tetapi video gagal diputar. Coba tutup scanner lalu buka kembali.');
+        return;
+      }
+
+      const Detector = (window as any).BarcodeDetector;
+      if (!Detector) {
+        // Kamera tetap berguna sebagai preview, tetapi browser lama belum punya decoder native.
+        setCameraError('Kamera aktif, tetapi browser ini belum mendukung pembacaan QR otomatis. Gunakan Chrome/Edge Android terbaru atau upload screenshot bukti bayar.');
+        return;
+      }
+
+      let detector: any;
+      try {
+        detector = new Detector({ formats: ['qr_code'] });
+      } catch {
+        setCameraError('Decoder QR tidak tersedia pada browser ini. Gunakan browser terbaru.');
+        return;
+      }
+
+      const scan = async () => {
+        if (stopped || video.readyState < 2) {
+          if (!stopped) scanFrameRef.current = requestAnimationFrame(scan);
+          return;
+        }
+        try {
+          const results = await detector.detect(video);
+          const rawValue = results?.[0]?.rawValue;
+          if (rawValue) {
+            setScanResult(rawValue);
+            triggerToastRef.current('✅ QR Code berhasil terbaca. Silakan lanjutkan pembayaran dan simpan bukti bayar.');
+            return;
+          }
+        } catch {
+          // Frame belum dapat dibaca; lanjut scan berikutnya tanpa spam toast.
+        }
+        if (!stopped) scanFrameRef.current = requestAnimationFrame(scan);
+      };
+      scanFrameRef.current = requestAnimationFrame(scan);
+    };
+
+    start();
+    return () => {
+      stopped = true;
+      if (scanFrameRef.current !== null) cancelAnimationFrame(scanFrameRef.current);
+    };
+  }, [streamActive]);
 
   return (
     <div className="fixed inset-0 z-[80] bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
@@ -98,31 +165,46 @@ export function QrisCameraScannerModal({ onClose, triggerToast }: { onClose: () 
           <span className="text-xs font-black text-[#00E575] uppercase tracking-wider flex items-center gap-1.5">
             <Camera className="w-4 h-4" /> Pemindai QRIS Kamera Live
           </span>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-gray-400 hover:text-white font-bold text-xs bg-[#06170E] px-3 py-1 rounded-xl border border-[#23583E]"
-          >
+          <button type="button" onClick={onClose} className="text-gray-400 hover:text-white font-bold text-xs bg-[#06170E] px-3 py-1 rounded-xl border border-[#23583E]">
             ✕ Tutup
           </button>
         </div>
 
         <div className="relative aspect-square bg-black rounded-2xl overflow-hidden border-2 border-[#00E575]/50 flex items-center justify-center">
           {streamActive ? (
-            <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
+            <video ref={videoRef} className="w-full h-full object-cover" playsInline muted autoPlay />
+          ) : cameraError ? (
+            <div className="flex flex-col items-center p-4 gap-2 text-[#A5C9B8]">
+              <Camera className="w-12 h-12 text-red-400" />
+              <span className="text-xs font-bold text-red-400">Kamera Tidak Bisa Dibuka</span>
+              <p className="text-[10px]">{cameraError}</p>
+            </div>
           ) : (
             <div className="flex flex-col items-center p-4 gap-2 text-[#A5C9B8]">
               <QrCode className="w-16 h-16 text-[#00E575] animate-pulse" />
-              <span className="text-xs font-bold text-white">QRIS DHUKNOO RIDE Official</span>
-              <p className="text-[10px]">Posisikan kamera ke barcode QRIS untuk memindai secara otomatis.</p>
+              <span className="text-xs font-bold text-white">Membuka kamera...</span>
             </div>
           )}
 
-          {/* Scanner Overlay Frame */}
           <div className="absolute inset-0 border-2 border-dashed border-[#00E575] m-8 rounded-2xl pointer-events-none flex items-center justify-center">
             <div className="w-full h-0.5 bg-[#00E575] animate-pulse shadow-[0_0_15px_#00E575]"></div>
           </div>
         </div>
+
+        {cameraError && streamActive && !scanResult && (
+          <div className="bg-amber-500/10 border border-amber-500/40 text-amber-300 text-[10px] p-2.5 rounded-xl text-left">
+            {cameraError}
+          </div>
+        )}
+
+        {scanResult ? (
+          <div className="bg-[#00E575]/10 border border-[#00E575]/40 p-3 rounded-xl text-left">
+            <div className="text-[11px] font-black text-[#00E575]">✅ QR Code terbaca</div>
+            <div className="text-[9px] text-[#A5C9B8] mt-1 break-all max-h-16 overflow-y-auto">{scanResult}</div>
+          </div>
+        ) : (
+          <p className="text-[10px] text-[#A5C9B8]">Arahkan kamera belakang ke QRIS sampai kode terbaca otomatis.</p>
+        )}
 
         <div className="bg-[#06170E] p-3 rounded-2xl border border-[#23583E] text-left text-xs space-y-1">
           <div className="flex justify-between font-bold text-white">
@@ -137,13 +219,14 @@ export function QrisCameraScannerModal({ onClose, triggerToast }: { onClose: () 
 
         <button
           type="button"
+          disabled={!scanResult}
           onClick={() => {
-            triggerToast('Pemindaian QRIS berhasil diselesaikan!');
-            onClose();
+            triggerToast('QR berhasil dibaca. Setelah pembayaran, jangan lupa upload bukti bayar agar order dapat di-approve.');
+            onCloseRef.current();
           }}
-          className="bg-[#00E575] text-[#071F14] hover:bg-[#00ff80] font-black py-3 rounded-xl text-xs transition-all shadow-md"
+          className="bg-[#00E575] text-[#071F14] hover:bg-[#00ff80] disabled:opacity-40 disabled:cursor-not-allowed font-black py-3 rounded-xl text-xs transition-all shadow-md"
         >
-          ✅ Pindai QRIS & Lanjutkan
+          {scanResult ? '✅ QR Terbaca — Lanjutkan Pembayaran' : 'Arahkan Kamera ke QRIS'}
         </button>
       </div>
     </div>
@@ -219,7 +302,7 @@ export function TopupModal({
     topupMutation.mutate({
       amount: numAmt,
       method,
-      proofImageUrl: proofUrl || undefined,
+      proofImageUrl: method === 'CASH' ? undefined : (proofUrl || undefined),
     });
   };
 
@@ -450,27 +533,37 @@ export function TopupModal({
               )}
             </div>
 
-            <div className="flex flex-col gap-1.5 bg-[#06170E] p-3 rounded-xl border border-[#23583E]">
-              <label className="font-bold text-[#A5C9B8] text-[11px]">3. Unggah Foto Bukti Bayar / Transfer (Opsional):</label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) handleFileUpload(f);
-                  }}
-                  className="text-[10px] text-[#A5C9B8] file:mr-2 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-[10px] file:font-bold file:bg-[#23583E] file:text-[#00E575] hover:file:bg-[#23583E]/80"
-                />
-                {isUploading && <span className="text-[10px] text-amber-400 animate-pulse">Mengunggah...</span>}
+            {method === 'CASH' ? (
+              <div className="flex flex-col gap-1.5 bg-[#06170E] p-3 rounded-xl border border-[#23583E]">
+                <label className="font-bold text-[#A5C9B8] text-[11px]">3. Verifikasi Setoran Tunai</label>
+                <p className="text-[10px] text-[#A5C9B8]">
+                  Foto bukti tidak diperlukan. Setoran akan tetap berstatus menunggu verifikasi sampai kasir/agen resmi mengonfirmasi uang tunai telah diterima.
+                </p>
               </div>
-              {proofUrl && (
-                <div className="flex items-center gap-2 mt-1 bg-black/40 p-1.5 rounded-lg border border-[#00E575]/40">
-                  <img src={proofUrl} alt="Bukti" className="w-10 h-10 object-cover rounded-md" />
-                  <span className="text-[9px] text-[#00E575] font-bold">Foto Bukti Terlampir!</span>
+            ) : (
+              <div className="flex flex-col gap-1.5 bg-[#06170E] p-3 rounded-xl border border-[#23583E]">
+                <label className="font-bold text-[#A5C9B8] text-[11px]">3. Unggah Foto Bukti Bayar / Transfer (Wajib):</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    required
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleFileUpload(f);
+                    }}
+                    className="text-[10px] text-[#A5C9B8] file:mr-2 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-[10px] file:font-bold file:bg-[#23583E] file:text-[#00E575] hover:file:bg-[#23583E]/80"
+                  />
+                  {isUploading && <span className="text-[10px] text-amber-400 animate-pulse">Mengunggah...</span>}
                 </div>
-              )}
-            </div>
+                {proofUrl && (
+                  <div className="flex items-center gap-2 mt-1 bg-black/40 p-1.5 rounded-lg border border-[#00E575]/40">
+                    <img src={proofUrl} alt="Bukti" className="w-10 h-10 object-cover rounded-md" />
+                    <span className="text-[9px] text-[#00E575] font-bold">Foto Bukti Terlampir!</span>
+                  </div>
+                )}
+              </div>
+            )}
 
             <button
               type="submit"
@@ -510,7 +603,7 @@ export function PasswordResetModal({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [step, setStep] = useState<'REQUEST' | 'VERIFY'>('REQUEST');
   const [isLoading, setIsLoading] = useState(false);
-  const [resetTokenReceived, setResetTokenReceived] = useState<string | null>(null);
+  const [resetWhatsAppUrl, setResetWhatsAppUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (user?.phone || user?.email) {
@@ -531,10 +624,18 @@ export function PasswordResetModal({
     try {
       const res = await AuthAPI.requestPasswordReset({ phone: phone.trim(), emailOrPhone: phone.trim() });
       triggerToast(res.message || '✅ Kode otentikasi alternatif dikirim ke nomor HP pendaftar!');
-      if (res.token) {
-        setResetTokenReceived(res.token);
-        setOtpCode(res.token);
+
+      // 🔒 Kode OTP TIDAK PERNAH ditampilkan di dashboard/UI.
+      // Kode hanya dikirim lewat pesan WhatsApp yang sudah disiapkan
+      // backend (whatsappUrl). Buka otomatis begitu diterima:
+      // - Dibuka di browser desktop -> redirect ke WhatsApp Web
+      // - Dibuka di HP -> langsung membuka aplikasi WhatsApp
+      if (res.whatsappUrl) {
+        setResetWhatsAppUrl(res.whatsappUrl);
+        window.open(res.whatsappUrl, '_blank', 'noopener,noreferrer');
       }
+
+      setOtpCode('');
       setStep('VERIFY');
     } catch (err: any) {
       triggerToast(err.response?.data?.error || 'Gagal mengirim kode otentikasi ke nomor HP!');
@@ -644,17 +745,17 @@ export function PasswordResetModal({
                 <CheckCircle className="w-3.5 h-3.5" /> Kode Otentikasi Alternatif Terkirim!
               </span>
               <p className="text-[9px] text-[#A5C9B8]">
-                Layanan otentikasi DHUKNOO Ride telah mengirimkan kode verifikasi 6-digit ke No. HP Pendaftar: <strong className="text-white">{phone}</strong>.
+                Layanan otentikasi DHUKNOO Ride telah mengirimkan kode verifikasi 6-digit lewat WhatsApp ke No. HP Pendaftar: <strong className="text-white">{phone}</strong>. Buka WhatsApp Anda untuk melihat kodenya.
               </p>
-              {resetTokenReceived && (
+              {resetWhatsAppUrl && (
                 <div className="mt-1 bg-[#0D2E1F] p-2 rounded-lg border border-[#00E575]/30 flex justify-between items-center text-[10px]">
-                  <span>Kode SMS/WA: <b className="text-[#FFD700] font-mono tracking-widest text-xs">{resetTokenReceived}</b></span>
+                  <span>Tidak menerima pesannya?</span>
                   <button
                     type="button"
-                    onClick={() => openWhatsAppMessage(phone, `Kode Otentikasi Reset Kata Sandi DHUKNOO Ride Anda: ${resetTokenReceived}`)}
+                    onClick={() => window.open(resetWhatsAppUrl, '_blank', 'noopener,noreferrer')}
                     className="text-[#25D366] text-[9px] hover:underline font-bold flex items-center gap-1"
                   >
-                    <MessageCircle className="w-3 h-3" /> WA Code
+                    <MessageCircle className="w-3 h-3" /> Buka WhatsApp Lagi
                   </button>
                 </div>
               )}
@@ -706,7 +807,11 @@ export function PasswordResetModal({
             <div className="flex gap-2 mt-2">
               <button
                 type="button"
-                onClick={() => setStep('REQUEST')}
+                onClick={() => {
+                  setStep('REQUEST');
+                  setResetWhatsAppUrl(null);
+                  setOtpCode('');
+                }}
                 className="flex-1 bg-[#06170E] text-[#A5C9B8] font-bold py-2.5 rounded-xl text-xs hover:bg-[#23583E]"
               >
                 Ganti No HP

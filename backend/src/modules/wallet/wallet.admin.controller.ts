@@ -7,6 +7,18 @@ import { logger } from '../../config/logger';
 export class WalletAdminController {
   private walletAdminService = new WalletAdminService();
 
+  listWithdrawals = async (_req: AuthenticatedRequest, res: Response) => {
+    try { const data = await this.walletAdminService.listWithdrawals(); return res.json({ success: true, data }); }
+    catch (err: any) { return res.status(err instanceof AppError ? err.statusCode : 500).json({ success: false, error: err.message }); }
+  };
+
+  reviewWithdrawal = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const data = await this.walletAdminService.reviewWithdrawal(req.user!.id, req.params.requestId, String(req.body.action || '').toUpperCase(), req.body.reviewNote);
+      return res.json({ success: true, message: `Status pencairan menjadi ${data.status}.`, data });
+    } catch (err: any) { return res.status(err instanceof AppError ? err.statusCode : 500).json({ success: false, error: err.message || 'Gagal memproses pencairan.' }); }
+  };
+
   listPending = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const requests = await this.walletAdminService.listPendingRequests();

@@ -1,6 +1,11 @@
 {
-  "name": "OBAMA",
-  "description": "Ojek Batu-Malang Raya (OBAMA) - Aplikasi ride-hailing/delivery kompetitif berbasis kearifan lokal Malang-Batu.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "name": "DHUKNOO Ride",
+  "description": "Integrated ride-hailing and merchant food delivery platform with multi-role portals for Customer, Driver, Merchant, and Admin.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

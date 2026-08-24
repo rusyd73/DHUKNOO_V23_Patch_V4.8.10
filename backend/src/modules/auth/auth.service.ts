@@ -5,11 +5,30 @@ import { AuthRepository } from './auth.repository';
 import { logger } from '../../config/logger';
 import { ENV } from '../../config/env';
 import { AppError } from '../../core/errors/AppError';
-import { MailerService } from '../../config/mailer';
+import { WhatsAppService } from '../../config/whatsapp';
 import { prisma } from '../../config/prisma';
 
 export class AuthService {
   private authRepository = new AuthRepository();
+
+  // 🆕 FIX "Refresh token backend masih plaintext" (audit lanjutan):
+  // User.refreshToken SEBELUMNYA menyimpan JWT refresh token APA
+  // ADANYA (plaintext) -- kalau database bocor (SQL injection, backup
+  // dicuri, insider access), penyerang langsung dapat daftar refresh
+  // token VALID untuk SEMUA user, siap pakai tanpa perlu membobol
+  // apa pun lagi (beda dari password yang di-hash bcrypt -- refresh
+  // token ini kebalikannya, disimpan mentah). Sekarang di-hash SHA-256
+  // sebelum disimpan/dibandingkan -- SHA-256 (bukan bcrypt) sengaja
+  // dipilih karena refresh token JWT sudah py entropi tinggi dari
+  // signature kriptografisnya sendiri (beda dari password manusia yang
+  // butuh hash lambat/bcrypt untuk tahan brute-force) -- tujuan hash
+  // di sini murni supaya kebocoran DB tidak langsung memberi token
+  // siap pakai, bukan menahan brute-force (SHA-256 cepat & cukup untuk
+  // itu, dan tetap deterministic sehingga bisa dipakai di WHERE clause
+  // Prisma untuk pencarian/rotasi atomik seperti sebelumnya).
+  private hashToken(token: string): string {
+    return crypto.createHash('sha256').update(token).digest('hex');
+  }
 
   // ✅ Helper: Normalize email
   private normalizeEmail(email: string): string {
@@ -119,9 +138,6 @@ export class AuthService {
 
   // ============================================================
   // 🔓 LOGIN
-  // ============================================================
-  // ============================================================
-  // 🔓 LOGIN
   //
   // 🆕 FIX "Phone registration": sebelumnya method ini HANYA menerima
   // `email` dan HANYA memanggil findByEmail() -- padahal loginSchema
@@ -167,62 +183,163 @@ export class AuthService {
     return this.generateTokens(user);
   }
 
-  // ============================================================
-  // 🔒 REQUEST PASSWORD RESET - FAIL CLOSED
-  // ============================================================
-  async requestPasswordReset(identifier: string) {
-    const trimmed = (identifier || '').trim();
-    if (!trimmed) {
-      throw new AppError('Email atau Nomor HP wajib diisi!', 400);
-    }
+// ============================================================
+// 🔒 REQUEST PASSWORD RESET — WHATSAPP V4.8.10
+// ============================================================
+async requestPasswordReset(identifier: string) {
+  const trimmed = (identifier || '').trim();
 
-    const user = await this.authRepository.findByEmailOrPhone(trimmed);
+  if (!trimmed) {
+    throw new AppError(
+      'Email atau Nomor HP wajib diisi!',
+      400
+    );
+  }
 
-    const genericResult = {
-      message: 'Jika akun terdaftar, kode reset kata sandi telah dikirim ke email/nomor HP Anda.',
-    };
+  const user =
+    await this.authRepository.findByEmailOrPhone(trimmed);
 
-    if (!user) {
-      logger.warn(`🔑 Password reset requested for unknown identifier: ${trimmed}`);
-      return genericResult;
-    }
+  /**
+   * Fail-closed:
+   * Jangan membocorkan apakah email/nomor HP terdaftar.
+   */
+  const genericResult = {
+    message:
+      'Jika akun terdaftar, kode reset kata sandi telah dikirim ke email/nomor HP Anda.',
+  };
 
-    const otpCode = this.generateOtpCode();
-    const salt = await bcrypt.genSalt(10);
-    const tokenHash = await bcrypt.hash(otpCode, salt);
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-
-    await this.authRepository.setResetPasswordToken(user.id, tokenHash, expiresAt);
-
-    let emailSent = false;
-    if (user.email) {
-      emailSent = await MailerService.sendPasswordResetEmail(user.email, user.fullName, otpCode);
-    }
-
-    logger.info(`🔑 Password reset OTP generated for user ${user.id} (email sent: ${emailSent})`);
-
-    if (!emailSent) {
-      await this.authRepository.setResetPasswordToken(user.id, null, null);
-
-      logger.error(`[PASSWORD RESET] Failed to send OTP email to ${user.email}`);
-      
-      if (ENV.NODE_ENV === 'production') {
-        throw new AppError(
-          'Gagal mengirim kode reset password. Silakan coba lagi atau hubungi customer service.',
-          503
-        );
-      }
-
-      logger.info(`[DEV] OTP for ${user.email}: ${otpCode}`);
-      
-      return {
-        ...genericResult,
-        message: 'Kode reset dibuat. (Mode development: cek log server untuk kode OTP.)',
-      };
-    }
+  if (!user) {
+    logger.warn(
+      `🔑 Password reset requested for unknown identifier: ${trimmed}`
+    );
 
     return genericResult;
   }
+
+  // ==========================================================
+  // GENERATE OTP
+  // ==========================================================
+
+  const otpCode = this.generateOtpCode();
+
+  const salt = await bcrypt.genSalt(10);
+
+  const tokenHash =
+    await bcrypt.hash(otpCode, salt);
+
+  const expiresAt =
+    new Date(Date.now() + 15 * 60 * 1000);
+
+  // ==========================================================
+  // SIMPAN OTP HASH
+  // ==========================================================
+
+  await this.authRepository.setResetPasswordToken(
+    user.id,
+    tokenHash,
+    expiresAt
+  );
+
+  // ==========================================================
+  // AMBIL NOMOR WHATSAPP PENDAFTAR
+  // ==========================================================
+
+  const userAny = user as any;
+
+  const phoneNumber =
+    userAny.phoneNumber ||
+    userAny.phone ||
+    userAny.customerProfile?.phoneNumber ||
+    userAny.driverProfile?.phoneNumber ||
+    userAny.merchantProfile?.phoneNumber ||
+    (
+      trimmed.startsWith('+') ||
+      /^\d+$/.test(trimmed)
+        ? trimmed
+        : ''
+    );
+
+  // ==========================================================
+  // NOMOR TIDAK DITEMUKAN
+  // ==========================================================
+
+  if (!phoneNumber) {
+    logger.error(
+      `[PASSWORD RESET] Nomor WhatsApp tidak ditemukan untuk user ${user.id} (${user.email}).`
+    );
+
+    // Jangan meninggalkan OTP aktif jika nomor tidak tersedia.
+    // Berlaku di semua environment — OTP TIDAK PERNAH dikirim
+    // ke client lewat response API maupun ditampilkan di dashboard.
+    await this.authRepository.setResetPasswordToken(
+      user.id,
+      null,
+      null
+    );
+
+    throw new AppError(
+      'Nomor WhatsApp akun tidak tersedia. Silakan hubungi customer service DHUKNOO.',
+      503
+    );
+  }
+
+  // ==========================================================
+  // BENTUK LINK WHATSAPP
+  //
+  // Kode OTP disisipkan LANGSUNG ke dalam pesan wa.me yang
+  // sudah di-encode. Kode tersebut hanya pernah "ada" di dalam
+  // URL WhatsApp ini — TIDAK PERNAH dikirim balik ke client
+  // sebagai field terpisah, dan TIDAK PERNAH ditampilkan di
+  // layar/dashboard aplikasi.
+  // ==========================================================
+
+  const whatsappUrl =
+    WhatsAppService.buildPasswordResetUrl(
+      phoneNumber,
+      user.fullName,
+      otpCode
+    );
+
+  // ==========================================================
+  // LOG (server-side saja, tidak pernah dikirim ke client)
+  // ==========================================================
+
+  logger.info(
+    `🔑 Password reset OTP generated for user ${user.id} ` +
+    `(WhatsApp link ready: ${Boolean(whatsappUrl)})`
+  );
+
+  if (ENV.NODE_ENV !== 'production') {
+    // Log dev tetap ada untuk debugging lewat terminal server,
+    // TAPI tidak pernah dikirim ke response/browser pengguna.
+    logger.debug(
+      `[DEV-ONLY LOG] OTP for ${user.email || user.id}: ${otpCode}`
+    );
+  }
+
+  // ==========================================================
+  // RESPONSE KE CLIENT
+  //
+  // Hanya mengembalikan URL WhatsApp (tanpa kode OTP dalam
+  // bentuk field terpisah yang bisa ditampilkan di UI) beserat
+  // nomor HP tujuan (untuk ditampilkan sebagai konfirmasi,
+  // BUKAN kode OTP-nya).
+  //
+  // Frontend WAJIB langsung membuka whatsappUrl ini (window.open)
+  // begitu response diterima — bukan menampilkan/menyimpan kode
+  // OTP-nya di state/UI mana pun. Link wa.me otomatis membuka
+  // WhatsApp Web bila diakses dari browser desktop, dan membuka
+  // aplikasi WhatsApp langsung bila diakses dari HP.
+  // ==========================================================
+
+  return {
+    ...genericResult,
+    phoneNumber,
+    whatsappUrl,
+    message:
+      'Kode reset dibuat. Silakan cek pesan WhatsApp yang baru saja terbuka.',
+  };
+}
 
   // ============================================================
   // 🔒 CONFIRM PASSWORD RESET
@@ -298,7 +415,7 @@ export class AuthService {
       { expiresIn: '7d' }
     );
 
-    await this.authRepository.updateRefreshToken(user.id, refreshToken);
+    await this.authRepository.updateRefreshToken(user.id, this.hashToken(refreshToken));
 
     return {
       accessToken,
@@ -319,12 +436,14 @@ export class AuthService {
     try {
       // 1. Verifikasi JWT
       const decoded = jwt.verify(token, ENV.JWT_REFRESH_SECRET) as any;
+      const tokenHash = this.hashToken(token);
       
-      // 2. 🔒 ATOMIC: Cari user dengan refresh token yang sama
+      // 2. 🔒 ATOMIC: Cari user dengan HASH refresh token yang sama
+      // (bukan token mentah -- lihat komentar di hashToken()).
       const user = await prisma.user.findUnique({
         where: { 
           id: decoded.id,
-          refreshToken: token,
+          refreshToken: tokenHash,
         },
       });
 
@@ -345,14 +464,14 @@ export class AuthService {
         { expiresIn: '7d' }
       );
 
-      // 4. 🔒 UPDATE refresh token di database (atomic)
+      // 4. 🔒 UPDATE hash refresh token baru di database (atomic)
       const updated = await prisma.user.updateMany({
         where: { 
           id: user.id,
-          refreshToken: token, // ← HANYA jika token masih sama
+          refreshToken: tokenHash, // ← HANYA jika hash token masih sama
         },
         data: {
-          refreshToken: newRefreshToken,
+          refreshToken: this.hashToken(newRefreshToken),
         },
       });
 
@@ -415,7 +534,23 @@ export class AuthService {
     const newHash = await bcrypt.hash(newPlain, salt);
 
     await this.authRepository.updateAdminPassword(userId, newHash);
-    logger.info(`Password updated successfully for user id: ${userId}`);
+
+    // 🆕 FIX "Change password belum mencabut refresh session" (audit
+    // lanjutan): SEBELUMNYA ganti password HANYA update passwordHash,
+    // TIDAK PERNAH menyentuh refreshToken -- kalau ada refresh token
+    // yang SUDAH DICURI sebelumnya (mis. lewat XSS sebelum fix
+    // httpOnly, atau device hilang), token curian itu TETAP VALID
+    // TANPA BATAS (terus dirotasi otomatis lewat handleRefreshToken)
+    // MESKIPUN user sudah "mengamankan" akunnya dengan ganti password.
+    // Ganti password TIDAK memberi perlindungan APA PUN terhadap sesi
+    // yang sudah dibajak -- padahal itu justru skenario paling umum
+    // orang mengganti password (curiga akun dibobol). Sekarang refresh
+    // token dicabut (di-null-kan) begitu password berhasil diganti --
+    // SEMUA sesi lain (termasuk yang dicuri) langsung mati, dipaksa
+    // login ulang di device manapun.
+    await this.authRepository.updateRefreshToken(userId, null);
+
+    logger.info(`Password updated successfully for user id: ${userId} -- semua refresh session dicabut.`);
     return true;
   }
 }

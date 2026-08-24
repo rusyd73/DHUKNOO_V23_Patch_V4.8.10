@@ -9,6 +9,7 @@ import { initSentry, registerSentryErrorHandler } from './config/sentry';
 import { SocketService } from './websocket/socket';
 import { BackgroundJobs } from './jobs/cron';
 import { errorHandler } from './core/middleware/error.middleware';
+import { requestIdMiddleware } from './core/middleware/requestId.middleware';
 import { generalRateLimiter } from './core/middleware/rateLimit.middleware';
 import cookieParser from 'cookie-parser';
 
@@ -40,6 +41,7 @@ import { uploadRouter } from './modules/upload/upload.routes';
 import dispatchRouter from './modules/dispatch/dispatch.route';
 import { UPLOAD_DIR_ABSOLUTE, UPLOADS_PUBLIC_PATH } from './modules/upload/upload.config';
 import { fileRouter } from './modules/file/file.routes';
+import { publicRouter } from './modules/public/public.routes';
 
 // ────────────────────────────────────────────────────────────────────────
 // Modul ini HANYA merakit `app` Express + `httpServer` HTTP-nya — TIDAK
@@ -50,6 +52,13 @@ import { fileRouter } from './modules/file/file.routes';
 // ────────────────────────────────────────────────────────────────────────
 
 export const app = express();
+// Backend berada di belakang reverse proxy (Nginx / Cloudflare).
+// Percayai satu hop proxy terdekat agar req.ip dan express-rate-limit
+// dapat membaca X-Forwarded-For dengan benar.
+if (ENV.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
 export const httpServer = createServer(app);
 
 // 1. Initialize Sentry (must be first)
@@ -114,6 +123,13 @@ app.use(express.json());
 app.use(MetricsService.middleware());
 app.use(cookieParser());
 
+// 🆕 FIX P0 "correlation/request ID dan logging terstruktur" (audit
+// driver-jobs): dipasang sedini mungkin (setelah body/cookie parser,
+// sebelum route apa pun) supaya SEMUA request -- termasuk yang gagal di
+// middleware auth/rate-limit sebelum sempat masuk ke route handler --
+// tetap punya requestId yang konsisten untuk dilacak di log.
+app.use(requestIdMiddleware);
+
 // 3. Initialize Realtime WebSockets (Socket.IO) — di-skip saat test agar
 //    tidak membuka handle yang membuat proses Jest menggantung.
 if (process.env.NODE_ENV !== 'test') {
@@ -149,6 +165,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/report', reportRoutes);
 app.use('/api/dispatch', dispatchRouter);
 app.use('/api/files', fileRouter);
+app.use('/api/public', publicRouter);
 
 // ============================================================
 // 🔒 API 404 HANDLER - UNKNOWN API ROUTE (JSON)
@@ -164,8 +181,16 @@ app.use('/api/*', (req, res) => {
   });
 });
 
-// Foto KTP/STNK & bukti bayar disajikan statis dari sini (mis. /uploads/xxxx.jpg)
-//app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE));
+// Media hasil /api/upload/image dikembalikan sebagai URL backend /uploads/... .
+// WAJIB disajikan di backend agar preview dari Vite (localhost:5173) tidak
+// jatuh ke SPA fallback dan berubah menjadi halaman dashboard/landing page.
+// Catatan: ini mempertahankan kontrak upload legacy V4.7.x. Endpoint /api/files
+// tetap menjadi jalur protected untuk file yang sudah tercatat di tabel File.
+app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_DIR_ABSOLUTE, {
+  fallthrough: true,
+  index: false,
+  maxAge: 0,
+}));
 
 // Serve Vite frontend in development, or static build in production
 import fs from 'fs';

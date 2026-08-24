@@ -1,11 +1,22 @@
 export class AppError extends Error {
   public readonly statusCode: number;
   public readonly isOperational: boolean;
+  // 🆕 FIX P0 "Gunakan error code stabil seperti DRIVER_OFFLINE, bukan
+  // parsing string pesan" (audit driver-jobs): `code` opsional ini
+  // memberi identifier MACHINE-READABLE yang stabil untuk error
+  // tertentu (mis. 'DRIVER_OFFLINE'), terpisah dari `message` yang
+  // ditujukan untuk dibaca MANUSIA dan boleh berubah kapan saja (typo
+  // fix, terjemahan, dst) tanpa merusak logic apa pun yang bergantung
+  // padanya. Consumer (frontend, atau catch block lain di backend)
+  // harus cek `code`, BUKAN melakukan `message.includes('offline')`
+  // yang rapuh terhadap perubahan kata sekecil apa pun.
+  public readonly code?: string;
 
-  constructor(message: string, statusCode = 400, isOperational = true) {
+  constructor(message: string, statusCode = 400, isOperational = true, code?: string) {
     super(message);
     this.statusCode = statusCode;
     this.isOperational = isOperational;
+    this.code = code;
     Object.setPrototypeOf(this, new.target.prototype);
     Error.captureStackTrace(this, this.constructor);
   }

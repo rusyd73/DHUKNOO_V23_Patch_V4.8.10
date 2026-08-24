@@ -28,10 +28,13 @@ export const getApiBaseUrl = () => {
 
   if (typeof window === 'undefined') return 'http://localhost:3000';
 
-  const isLocalDev =
-    window.location.origin.includes('localhost') || window.location.origin.includes('127.0.0.1');
+  // Host `localhost` tidak otomatis berarti development. Image Docker
+  // production memang dibuka melalui http://localhost:8080 dan API wajib
+  // tetap same-origin agar diteruskan nginx ke service backend. Deteksi mode
+  // harus memakai flag build Vite, bukan nama host browser.
+  const isViteDev = Boolean((import.meta as any)?.env?.DEV);
 
-  if (isLocalDev) {
+  if (isViteDev) {
     // PERBAIKAN: sebelumnya fungsi ini balikin window.location.origin apa adanya —
     // di development itu berarti http://localhost:5173 (origin Vite dev server
     // itu sendiri, BUKAN backend Express). Semua request jadi ditembakkan balik
@@ -169,6 +172,7 @@ order: {
 
   // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
   merchantCheckout: '/api/order/merchant-checkout',
+  merchantCheckoutPreview: '/api/order/merchant-checkout/preview',
 },
   wallet: {
     balance: '/api/wallet/balance',

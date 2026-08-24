@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageCircle, Send, ShieldCheck, Phone } from 'lucide-react';
+import { MessageCircle, Send, ShieldCheck } from 'lucide-react';
 import { socket, joinRoom } from '../../services/socket';
 import { OrderAPI } from '../../api/order.api';
 import { InAppVoipCall } from './InAppVoipCall';
@@ -137,16 +137,13 @@ export function OrderChatBox({
             otherPartyPhone={otherPartyPhone}
           />
 
-          {/* Fallback Dialing lewat Handphone */}
-          {otherPartyPhone && (
-            <a
-              href={`tel:${otherPartyPhone}`}
-              title={`Telepon GSM ${otherPartyName || 'lawan bicara'}`}
-              className="text-[9px] bg-[#FFD700]/15 hover:bg-[#FFD700]/25 text-[#FFD700] font-bold px-2 py-0.5 rounded-full border border-[#FFD700]/30 flex items-center gap-1 transition-all"
-            >
-              <Phone className="w-3 h-3" /> Dial HP
-            </a>
-          )}
+          {/* 🆕 FIX ("Hilangkan dial hp dalam chat room"): fallback dial via
+              tel: link dihapus -- link ini membocorkan nomor HP ASLI
+              customer/driver satu sama lain lewat native dialer HP, padahal
+              InAppVoipCall di atas sudah menyediakan cara telepon yang aman
+              (nomor tidak pernah terekspos ke pihak lain). Menyimpan
+              otherPartyPhone di props/state (dipakai InAppVoipCall) TETAP
+              perlu, hanya tombol dial manualnya yang dihapus. */}
           <span className="text-[9px] bg-[#00E575]/20 text-[#00E575] font-bold px-2 py-0.5 rounded-full border border-[#00E575]/30 flex items-center gap-1">
             <ShieldCheck className="w-3 h-3" /> In-App Direct
           </span>

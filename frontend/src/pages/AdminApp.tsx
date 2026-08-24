@@ -1,15 +1,17 @@
 import React, { useState, Suspense } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { formatRupiah } from '@obama/shared-utils';
+import { getApiBaseUrl } from '@obama/shared-api';
 import { sendAdminThankYouChat, openWhatsAppMessage } from '../utils/whatsapp';
 import { useAuthStore } from '../store/useAuthStore';
-import { AdminAPI, PaymentAPI, TariffAPI } from '../api';
+import { AdminAPI, PaymentAPI, TariffAPI, api } from '../api';
+import { socket } from '../services/socket';
 import AuthFlow from '../components/auth/AuthFlow';
+import AdminManagementSection from '../components/admin/AdminManagementSection';
 import {
   BarChart2,
   ClipboardList,
   DollarSign,
-  ExternalLink,
   FileSpreadsheet,
   FileText,
   MapIcon,
@@ -50,12 +52,25 @@ interface PortalProps {
 
 function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<'proofs' | 'topups' | 'documents'>('proofs');
+  const [tab, setTab] = useState<'proofs' | 'topups' | 'withdrawals' | 'documents'>('proofs');
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+
+  // Bukti bayar lama pada beberapa order bisa masih tersimpan sebagai
+  // path relatif (/uploads/...). Saat frontend berjalan di Vite :5173,
+  // path relatif akan salah menuju Vite dan SPA fallback dapat membuka
+  // dashboard. Selalu resolve media relatif ke backend API origin.
+  const resolveMediaUrl = React.useCallback((value?: string | null) => {
+    if (!value) return '';
+    if (/^(https?:|data:|blob:)/i.test(value)) return value;
+    const base = getApiBaseUrl().replace(/\/$/, '');
+    return `${base}${value.startsWith('/') ? value : `/${value}`}`;
+  }, []);
 
   const { data: proofsData } = useQuery({ queryKey: ['pendingProofs'], queryFn: PaymentAPI.getPendingProofs });
   const { data: documentsData } = useQuery({ queryKey: ['pendingDriverDocuments'], queryFn: AdminAPI.getPendingDriverDocuments });
   const { data: topupRequestsData } = useQuery({ queryKey: ['pendingTopups'], queryFn: AdminAPI.getPendingTopupRequests });
+  const { data: withdrawalData } = useQuery({ queryKey: ['pendingWithdrawals'], queryFn: AdminAPI.getWithdrawalRequests });
+  const { data: adminAuthorityData } = useQuery({ queryKey: ['adminManagement'], queryFn: AdminAPI.getAdmins, staleTime: 15_000 });
 
   // 🆕 useMemo: array turunan ini di-rebuild ulang setiap render (termasuk
   // render yang dipicu state lain seperti `tab`/`previewImageUrl`/toast) --
@@ -64,6 +79,42 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
   const proofs = React.useMemo(() => proofsData?.proofs || [], [proofsData]);
   const documents = React.useMemo(() => documentsData?.documents || [], [documentsData]);
   const topups = React.useMemo(() => topupRequestsData?.topupRequests || [], [topupRequestsData]);
+  const withdrawals = React.useMemo(() => withdrawalData?.data || [], [withdrawalData]);
+  const canAuthorizeWithdrawal = Boolean(adminAuthorityData?.isSuperAdmin);
+
+  React.useEffect(() => {
+    const onRegistration = (payload: any) => {
+      triggerToast(`🆕 Pendaftar baru: ${payload.fullName || 'Pengguna'} (${payload.role || 'USER'})`);
+      queryClient.invalidateQueries({ queryKey: ['adminDashboard'] });
+      queryClient.invalidateQueries({ queryKey: ['adminRecap'] });
+    };
+    const onTopup = (payload: any) => {
+      triggerToast(`💳 Pengajuan top-up baru: ${formatRupiah(Number(payload.amount || 0))}`);
+      queryClient.invalidateQueries({ queryKey: ['pendingTopups'] });
+    };
+    const onWithdrawal = (payload: any) => {
+      triggerToast(`💸 Pengajuan pencairan baru (${payload.role || 'MITRA'}): ${formatRupiah(Number(payload.amount || 0))}`);
+      queryClient.invalidateQueries({ queryKey: ['pendingWithdrawals'] });
+    };
+    const onOrderFinancialChange = () => {
+      // order_status_changed dapat datang sebelum settlement wallet selesai;
+      // order_paid datang sesudah ledger tercatat. Keduanya invalidasi rekap.
+      queryClient.invalidateQueries({ queryKey: ['adminRecap'] });
+      queryClient.invalidateQueries({ queryKey: ['adminDashboard'] });
+    };
+    socket.on('new_user_registered', onRegistration);
+    socket.on('topup_request_created', onTopup);
+    socket.on('withdrawal_request_created', onWithdrawal);
+    socket.on('order_status_changed', onOrderFinancialChange);
+    socket.on('order_paid', onOrderFinancialChange);
+    return () => {
+      socket.off('new_user_registered', onRegistration);
+      socket.off('topup_request_created', onTopup);
+      socket.off('withdrawal_request_created', onWithdrawal);
+      socket.off('order_status_changed', onOrderFinancialChange);
+      socket.off('order_paid', onOrderFinancialChange);
+    };
+  }, [queryClient, triggerToast]);
 
   // 🆕 Backend sekarang membatasi antrean review ke 100 item terlama (lihat
   // admin.routes.ts / payment.repository.ts) supaya tidak me-render ratusan
@@ -116,6 +167,16 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
     onError: (err: any) => triggerToast(err.response?.data?.error || 'Gagal meninjau dokumen!'),
   });
 
+  const manualWithdrawalMutation = useMutation({
+    mutationFn: ({ id, action, note }: { id: string; action: 'COMPLETE_MANUAL' | 'REFUND_MANUAL'; note: string }) => AdminAPI.reviewWithdrawal(id, action, note),
+    onSuccess: (res: any) => {
+      triggerToast(res.message || 'Status pencairan berhasil diperbarui.');
+      queryClient.invalidateQueries({ queryKey: ['pendingWithdrawals'] });
+      queryClient.invalidateQueries({ queryKey: ['adminRecap'] });
+    },
+    onError: (err: any) => triggerToast(err.response?.data?.error || 'Gagal memproses pencairan.'),
+  });
+
   return (
     <div className="bg-[#0D2E1F] border border-[#00E575]/30 p-6 rounded-3xl flex flex-col gap-5">
       <div>
@@ -144,7 +205,47 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
         >
           Dokumen Driver ({documents.length})
         </button>
+        <button onClick={() => setTab('withdrawals')} className={`text-[10px] font-bold px-3 py-2 rounded-lg transition-all ${tab === 'withdrawals' ? 'bg-[#00E575] text-[#06170E]' : 'bg-[#06170E] text-[#A5C9B8]'}`}>
+          Pencairan ({withdrawals.length})
+        </button>
       </div>
+
+      {tab === 'withdrawals' && (
+        <div className="flex flex-col gap-3">
+          <div className="text-[10px] rounded-lg px-3 py-2 border text-[#00E575] bg-[#00E575]/10 border-[#00E575]/30">
+            Mode hybrid manual-terkontrol: Admin mentransfer ke tujuan yang tertera, lalu memasukkan nomor referensi. Payment gateway otomatis tetap siap untuk diaktifkan nanti.
+          </div>
+          {withdrawals.length === 0 ? <div className="text-center text-[10px] text-[#A5C9B8]/60 py-6 border border-dashed border-[#23583E] rounded-xl">Tidak ada pencairan aktif.</div> : withdrawals.map((w: any) => (
+            <div key={w.id} className="bg-[#06170E] border border-[#23583E] p-3 rounded-xl flex flex-col gap-2 text-[10px]">
+              <div className="flex justify-between"><span className="font-bold text-white">{w.user?.fullName} ({w.user?.role})</span><span className="font-black text-[#FFD700]">{formatRupiah(Number(w.amount))}</span></div>
+              <span className="text-[#A5C9B8]">{w.method} · {w.destinationProvider} · {w.destinationAccount} · a.n. {w.destinationName}</span>
+              <span className="font-bold text-[#00E575]">Status: {w.status.replaceAll('_', ' ')}</span>
+              <div className="text-[9px] text-[#A5C9B8]">Provider: <strong className="text-white">{w.payoutProvider || '-'}</strong> · Status provider: <strong className="text-white">{w.providerStatus || '-'}</strong>{w.failureCode ? ` · ${w.failureCode}` : ''}</div>
+              {w.status === 'PENDING_TRANSFER' && canAuthorizeWithdrawal && (
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <button
+                    disabled={manualWithdrawalMutation.isPending}
+                    onClick={() => {
+                      const reference = window.prompt('Masukkan nomor referensi transfer:')?.trim();
+                      if (reference) manualWithdrawalMutation.mutate({ id: w.id, action: 'COMPLETE_MANUAL', note: reference });
+                    }}
+                    className="bg-[#00E575] text-[#06170E] font-black py-2 rounded-lg disabled:opacity-50"
+                  >Dana Terkirim</button>
+                  <button
+                    disabled={manualWithdrawalMutation.isPending}
+                    onClick={() => {
+                      const reason = window.prompt('Alasan pembatalan dan refund:')?.trim();
+                      if (reason) manualWithdrawalMutation.mutate({ id: w.id, action: 'REFUND_MANUAL', note: reason });
+                    }}
+                    className="bg-red-500/20 text-red-400 font-black py-2 rounded-lg disabled:opacity-50"
+                  >Batalkan & Refund</button>
+                </div>
+              )}
+              {w.status === 'PENDING_TRANSFER' && !canAuthorizeWithdrawal && <span className="text-[9px] text-[#FFD700]">Hanya Super Admin yang dapat mengonfirmasi transfer atau refund.</span>}
+            </div>
+          ))}
+        </div>
+      )}
 
       {tab === 'proofs' && (
         <div className="flex flex-col gap-3">
@@ -177,11 +278,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div
-                    onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img
-                      src={p.proofImageUrl}
+                      src={resolveMediaUrl(p.proofImageUrl)}
                       loading="lazy"
                       decoding="async"
                       alt="Bukti Bayar Order"
@@ -194,19 +295,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Bukti Bayar High-Res
                     </button>
-                    <a
-                      href={p.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -307,11 +407,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div 
-                    onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={t.proofImageUrl}
+                      src={resolveMediaUrl(t.proofImageUrl)}
                       loading="lazy"
                       decoding="async" 
                       alt="Bukti Bayar Topup" 
@@ -324,19 +424,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Dokumen High-Res
                     </button>
-                    <a
-                      href={t.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -405,11 +504,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div 
-                    onClick={() => setPreviewImageUrl(d.imageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={d.imageUrl}
+                      src={resolveMediaUrl(d.imageUrl)}
                       loading="lazy"
                       decoding="async" 
                       alt="Dokumen Driver" 
@@ -422,19 +521,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(d.imageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Dokumen High-Res
                     </button>
-                    <a
-                      href={d.imageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(d.imageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -478,14 +576,7 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
               <img src={previewImageUrl} alt="Dokumen" className="w-full object-contain" />
             </div>
             <div className="flex gap-2">
-              <a
-                href={previewImageUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 bg-[#06170E] hover:bg-[#23583E] text-[#FFD700] border border-[#23583E] font-bold py-2 rounded-xl text-xs text-center flex items-center justify-center gap-1 transition-all"
-              >
-                <ExternalLink className="w-3.5 h-3.5" /> Buka Link Dokumen Asli
-              </a>
+
               <button
                 onClick={() => setPreviewImageUrl(null)}
                 className="flex-1 bg-[#00E575] hover:bg-[#00ff80] text-[#06170E] font-black py-2 rounded-xl text-xs transition-all"
@@ -1011,12 +1102,15 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
 
 function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void }) {
   const [timeframe, setTimeframe] = useState<'daily' | 'weekly' | 'monthly'>('daily');
-  const [activeCategory, setActiveCategory] = useState<'customers' | 'drivers' | 'transactions' | 'revenues'>('customers');
+  const [activeCategory, setActiveCategory] = useState<'customers' | 'drivers' | 'merchants' | 'transactions' | 'revenues' | 'withdrawals'>('customers');
   const [searchQuery, setSearchQuery] = useState('');
 
   const { data: recapData, isLoading, refetch } = useQuery({
     queryKey: ['adminRecap', timeframe],
     queryFn: () => AdminAPI.getRecap(timeframe),
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+    staleTime: 5_000,
   });
 
   const [exportingFormat, setExportingFormat] = useState<'excel' | 'pdf' | null>(null);
@@ -1039,7 +1133,7 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
             <BarChart2 className="w-6 h-6 text-[#00E575]" /> Rekapitulasi Laporan Platform
           </h3>
           <p className="text-xs text-[#A5C9B8] mt-0.5">
-            Laporan rekap menyeluruh pelanggan, driver & perolehan, volume transaksi, serta komisi platform.
+            Laporan pelanggan, mitra, transaksi, komisi platform, dan arus pencairan penghasilan.
           </p>
         </div>
 
@@ -1097,12 +1191,14 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
       </div>
 
       {/* Category Tabs */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
         {[
           { id: 'customers', label: '👥 Pelanggan Terdaftar', count: recapData?.customers?.length || 0 },
           { id: 'drivers', label: '🏍️ Driver & Perolehan', count: recapData?.drivers?.length || 0 },
+          { id: 'merchants', label: '🏪 Merchant Terdaftar', count: recapData?.merchantSummary?.total || recapData?.summary?.totalMerchantsCount || 0 },
           { id: 'transactions', label: '📦 Volume Transaksi', count: recapData?.transactions?.length || 0 },
           { id: 'revenues', label: '💰 Platform Revenue', count: formatRupiah(recapData?.summary?.totalPlatformRevenue || 0) },
+          { id: 'withdrawals', label: '💸 Withdrawal Mitra', count: formatRupiah(recapData?.withdrawalSummary?.totalRequested || 0) },
         ].map((cat) => (
           <button
             key={cat.id}
@@ -1207,8 +1303,47 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
               </tbody>
             </table>
           </div>
-        ) : activeCategory === 'transactions' ? (
-          <div className="overflow-x-auto">
+        ) : activeCategory === 'merchants' ? (
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 p-3">
+              {[
+                ['Total', recapData?.merchantSummary?.total ?? 0],
+                ['Aktif', recapData?.merchantSummary?.active ?? 0],
+                ['Tidak Aktif', recapData?.merchantSummary?.inactive ?? 0],
+                ['Pemilik Nonaktif', recapData?.merchantSummary?.ownerInactive ?? 0],
+                ['Daftar Periode', recapData?.merchantSummary?.registeredInTimeframe ?? 0],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="bg-[#0D2E1F] border border-[#23583E] rounded-xl p-3">
+                  <span className="text-[9px] uppercase text-[#A5C9B8]">{label}</span>
+                  <div className="text-xl font-black text-[#FFD700] mt-1">{value}</div>
+                </div>
+              ))}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#0D2E1F] text-[#FFD700] text-[10px] uppercase border-b border-[#23583E]">
+                  <tr>
+                    <th className="py-3 px-4">Merchant</th><th className="py-3 px-4">Pemilik</th><th className="py-3 px-4">Kategori</th><th className="py-3 px-4">Lokasi / Alamat</th><th className="py-3 px-4">Status</th><th className="py-3 px-4 text-center">Produk</th><th className="py-3 px-4 text-center">Order</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#23583E] text-[#A5C9B8]">
+                  {(recapData?.merchants || [])
+                    .filter((m: any) => [m.name, m.ownerName, m.category, m.address, m.phone].some((v) => String(v || '').toLowerCase().includes(searchQuery.toLowerCase())))
+                    .map((m: any) => (
+                      <tr key={m.id} className="hover:bg-[#0D2E1F]/50 transition-colors">
+                        <td className="py-3 px-4 font-bold text-white">{m.name}<div className="text-[9px] text-gray-500">{m.phone}</div></td>
+                        <td className="py-3 px-4">{m.ownerName}<div className="text-[9px] text-gray-500">{m.ownerEmail}</div></td>
+                        <td className="py-3 px-4">{m.category}</td>
+                        <td className="py-3 px-4 max-w-[320px]">{m.address}<div className="text-[9px] text-[#00E575]">GPS: {Number(m.latitude).toFixed(6)}, {Number(m.longitude).toFixed(6)}</div></td>
+                        <td className="py-3 px-4"><span className={m.status === 'ACTIVE' ? 'text-[#00E575] font-black' : m.status === 'INACTIVE' ? 'text-red-400 font-black' : 'text-[#FFD700] font-black'}>{m.status === 'ACTIVE' ? 'AKTIF' : m.status === 'INACTIVE' ? 'TIDAK AKTIF' : m.status === 'OWNER_INACTIVE' ? 'PEMILIK NONAKTIF' : 'TANPA PEMILIK'}</span></td>
+                        <td className="py-3 px-4 text-center">{m.productCount}</td><td className="py-3 px-4 text-center">{m.orderCount}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : activeCategory === 'transactions' ? (          <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-[#0D2E1F] text-[#FFD700] text-[10px] uppercase border-b border-[#23583E]">
                 <tr>
@@ -1261,6 +1396,27 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
               </tbody>
             </table>
           </div>
+        ) : activeCategory === 'withdrawals' ? (
+          <div className="flex flex-col gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 p-3">
+              {[
+                ['Diajukan', recapData?.withdrawalSummary?.totalRequested || 0, 'text-white'],
+                ['Diproses', recapData?.withdrawalSummary?.totalProcessing || 0, 'text-[#FFD700]'],
+                ['Berhasil', recapData?.withdrawalSummary?.totalCompleted || 0, 'text-[#00E575]'],
+                ['Gagal / Refund', recapData?.withdrawalSummary?.totalFailedRefunded || 0, 'text-red-400'],
+              ].map(([label, value, color]) => <div key={String(label)} className="bg-[#0D2E1F] border border-[#23583E] rounded-xl p-3"><div className="text-[9px] uppercase text-[#A5C9B8]">{label}</div><div className={`text-base font-black mt-1 ${color}`}>{formatRupiah(Number(value))}</div></div>)}
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#0D2E1F] text-[#FFD700] text-[10px] uppercase border-b border-[#23583E]"><tr><th className="py-3 px-4">Mitra</th><th className="py-3 px-4">Tujuan</th><th className="py-3 px-4 text-right">Nominal</th><th className="py-3 px-4">Status</th><th className="py-3 px-4">Provider</th><th className="py-3 px-4">Waktu</th></tr></thead>
+                <tbody className="divide-y divide-[#23583E] text-[#A5C9B8]">
+                  {(recapData?.withdrawals || []).filter((w: any) => [w.userName, w.role, w.destinationProvider, w.destinationAccount, w.status, w.payoutReference].some((v) => String(v || '').toLowerCase().includes(searchQuery.toLowerCase()))).map((w: any) => (
+                    <tr key={w.id} className="hover:bg-[#0D2E1F]/50"><td className="py-3 px-4"><b className="text-white">{w.userName}</b><div className="text-[9px]">{w.role} · {w.userEmail}</div></td><td className="py-3 px-4"><b className="text-white">{w.destinationProvider}</b><div className="font-mono text-[9px]">{w.destinationAccount} · a.n. {w.destinationName}</div></td><td className="py-3 px-4 text-right font-black text-white">{formatRupiah(w.amount)}</td><td className="py-3 px-4 font-black text-[#FFD700]">{w.status.replaceAll('_', ' ')}</td><td className="py-3 px-4">{w.payoutProvider || '-'}<div className="text-[9px]">{w.providerStatus || '-'}{w.failureCode ? ` · ${w.failureCode}` : ''}</div></td><td className="py-3 px-4 text-[10px]">{new Date(w.createdAt).toLocaleString('id-ID')}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
@@ -1269,8 +1425,11 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
                   <th className="py-3 px-4 font-bold">ID Order</th>
                   <th className="py-3 px-4 font-bold">Rute Perjalanan</th>
                   <th className="py-3 px-4 font-bold">Para Pihak</th>
-                  <th className="py-3 px-4 font-bold text-right">Tarif Bruto</th>
-                  <th className="py-3 px-4 font-bold text-right">Komisi Platform (8%)</th>
+                  <th className="py-3 px-4 font-bold text-right">Jarak</th>
+                  <th className="py-3 px-4 font-bold text-right">Subtotal Barang</th>
+                  <th className="py-3 px-4 font-bold text-right">Ongkos Layanan</th>
+                  <th className="py-3 px-4 font-bold text-right">Total Customer</th>
+                  <th className="py-3 px-4 font-bold text-right">Revenue Platform</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#23583E] text-[#A5C9B8]">
@@ -1292,7 +1451,10 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
                         <span className="text-gray-300 block">Pemesan: <b className="text-white">{r.customerName}</b></span>
                         <span className="text-gray-300 block">Driver: <b className="text-white">{r.driverName}</b></span>
                       </td>
-                      <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.grossPrice)}</td>
+                      <td className="py-3 px-4 text-right font-bold text-white">{Number(r.distanceKm || 0).toFixed(2)} km</td>
+                      <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.itemsSubtotal || 0)}</td>
+                      <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.deliveryFee || 0)}</td>
+                      <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.netPrice)}</td>
                       <td className="py-3 px-4 text-right font-black text-[#00E575] text-sm">
                         {formatRupiah(r.platformRevenue)}
                       </td>
@@ -1304,6 +1466,54 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
         )}
       </div>
     </div>
+  );
+}
+
+function PublicBetaInsights() {
+  const [tab, setTab] = useState<'survey' | 'beta'>('survey');
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['publicBetaInsights'],
+    queryFn: async () => (await api.get('/api/public/insights')).data?.data,
+    staleTime: 15_000,
+  });
+
+  const audienceLabel = (value: string) => ({ CUSTOMER: 'Customer', DRIVER: 'Driver', MERCHANT: 'Merchant', GENERAL: 'Umum' }[value] || value);
+  const groups = tab === 'survey' ? (data?.surveyGroups || []) : (data?.betaGroups || []);
+  const rows = tab === 'survey' ? (data?.latestSurvey || []) : (data?.latestBeta || []);
+
+  return (
+    <section className="rounded-3xl border border-[#22C55E]/30 bg-[#0D2E1F] p-5 md:p-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <span className="text-xs font-black uppercase tracking-wider text-[#22C55E]">Public Beta Insight</span>
+          <h3 className="mt-1 text-xl font-black text-white">Survey & Pendaftar Uji Publik</h3>
+          <p className="mt-1 text-[11px] text-[#A5C9B8]">Data langsung dari modul Public Experience DHUKNOO.</p>
+        </div>
+        <button type="button" onClick={() => refetch()} className="flex w-fit items-center gap-2 rounded-xl border border-[#23583E] bg-[#06170E] px-4 py-2 text-xs font-bold text-[#A5C9B8] hover:text-white">
+          <RefreshCw className="h-4 w-4" /> Refresh
+        </button>
+      </div>
+
+      {isError ? <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">Gagal memuat Public Beta Insight.</div> : null}
+      <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <div className="rounded-2xl border border-[#23583E] bg-[#06170E] p-4"><small className="font-bold text-[#A5C9B8]">Total Survey</small><b className="mt-1 block text-2xl text-white">{data?.surveyTotal ?? 0}</b></div>
+        <div className="rounded-2xl border border-[#23583E] bg-[#06170E] p-4"><small className="font-bold text-[#A5C9B8]">Pendaftar Beta</small><b className="mt-1 block text-2xl text-[#22C55E]">{data?.betaTotal ?? 0}</b></div>
+        <div className="col-span-2 rounded-2xl border border-[#23583E] bg-[#06170E] p-4"><small className="font-bold text-[#A5C9B8]">Komposisi {tab === 'survey' ? 'Survey' : 'Beta'}</small><div className="mt-2 flex flex-wrap gap-2">{groups.length ? groups.map((g:any)=><span key={g.audience} className="rounded-lg bg-[#103D27] px-2.5 py-1 text-[10px] font-black text-[#A5C9B8]">{audienceLabel(g.audience)}: <b className="text-white">{g._count?._all || 0}</b></span>) : <span className="text-xs text-[#729B87]">Belum ada data.</span>}</div></div>
+      </div>
+
+      <div className="mt-5 flex gap-2">
+        <button onClick={() => setTab('survey')} className={`rounded-xl px-4 py-2 text-xs font-black ${tab==='survey'?'bg-[#22C55E] text-[#05110A]':'bg-[#06170E] text-[#A5C9B8]'}`}>Survey Terbaru</button>
+        <button onClick={() => setTab('beta')} className={`rounded-xl px-4 py-2 text-xs font-black ${tab==='beta'?'bg-[#22C55E] text-[#05110A]':'bg-[#06170E] text-[#A5C9B8]'}`}>Pendaftar Beta</button>
+      </div>
+
+      <div className="mt-4 overflow-x-auto rounded-2xl border border-[#23583E]">
+        {isLoading ? <div className="p-6 text-center text-xs text-[#A5C9B8]">Memuat insight...</div> : !rows.length ? <div className="p-6 text-center text-xs text-[#729B87]">Belum ada data.</div> : tab === 'survey' ? (
+          <table className="min-w-[720px] w-full text-left text-[11px]"><thead className="bg-[#06170E] text-[#A5C9B8]"><tr><th className="p-3">Waktu</th><th className="p-3">Segmen</th><th className="p-3">Sumber</th><th className="p-3">Ringkasan Jawaban</th></tr></thead><tbody>{rows.map((r:any)=><tr key={r.id} className="border-t border-[#23583E]/60"><td className="p-3 text-[#A5C9B8]">{new Date(r.createdAt).toLocaleString('id-ID')}</td><td className="p-3 font-bold text-white">{audienceLabel(r.audience)}</td><td className="p-3 text-[#22C55E]">{r.source || '-'}</td><td className="max-w-xl p-3 text-[#A5C9B8]">{Object.entries(r.answers || {}).slice(0,3).map(([k,v])=>`${k}: ${Array.isArray(v)?v.join(', '):String(v)}`).join(' · ')}</td></tr>)}</tbody></table>
+        ) : (
+          <table className="min-w-[720px] w-full text-left text-[11px]"><thead className="bg-[#06170E] text-[#A5C9B8]"><tr><th className="p-3">Waktu</th><th className="p-3">Nama</th><th className="p-3">Segmen</th><th className="p-3">WhatsApp</th><th className="p-3">Area</th><th className="p-3">Sumber</th></tr></thead><tbody>{rows.map((r:any)=><tr key={r.id} className="border-t border-[#23583E]/60"><td className="p-3 text-[#A5C9B8]">{new Date(r.createdAt).toLocaleString('id-ID')}</td><td className="p-3 font-bold text-white">{r.fullName}</td><td className="p-3">{audienceLabel(r.audience)}</td><td className="p-3 text-[#22C55E]">{r.whatsapp}</td><td className="p-3">{r.city}</td><td className="p-3 text-[#A5C9B8]">{r.source || '-'}</td></tr>)}</tbody></table>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -1357,7 +1567,7 @@ function AdminApp({ onBack, triggerToast }: PortalProps) {
   return (
     <div className="w-full max-w-7xl mx-auto px-4 py-8 flex flex-col gap-6 flex-1">
       {/* Header Area */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-[#0D2E1F] p-6 rounded-3xl border border-red-500/30">
+      <div className="sticky top-[70px] z-30 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-[#0D2E1F] p-6 rounded-3xl border border-red-500/30 shadow-lg shadow-[#06170E]/30">
         <div>
           <h2 className="text-3xl font-black text-red-400">Dashboard Utama Admin</h2>
           <p className="text-xs text-[#A5C9B8]">Konektivitas langsung ke API Endpoint Admin: `/api/admin/*`</p>
@@ -1710,6 +1920,8 @@ function AdminApp({ onBack, triggerToast }: PortalProps) {
         </div>
       )}
 
+      <PublicBetaInsights />
+      <AdminManagementSection triggerToast={triggerToast} />
       <AdminRecapSection triggerToast={triggerToast} />
       <ReviewPanel triggerToast={triggerToast} />
       <TariffPanel triggerToast={triggerToast} />

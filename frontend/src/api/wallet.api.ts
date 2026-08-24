@@ -18,6 +18,12 @@ export const WalletAPI = {
   getMyTopupRequests: async () =>
     (await api.get('/api/wallet/topup-requests/me')).data,
 
+  getMyWithdrawalRequests: async () =>
+    (await api.get('/api/wallet/withdrawal-requests/me')).data,
+
+  requestWithdrawal: async (data: { amount: number; method: 'BANK_TRANSFER' | 'EWALLET'; destinationProvider: string; destinationAccount: string; destinationName: string; note?: string }) =>
+    (await api.post('/api/wallet/withdrawal-requests', data)).data,
+
   topup: async (data: number | { amount: number; method?: string; proofImageUrl?: string; note?: string }) => {
     const payload = typeof data === 'number' ? { amount: data } : data;
     return (await api.post(API_ENDPOINTS.wallet.topup, payload)).data;

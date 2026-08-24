@@ -81,12 +81,24 @@ let ringLoopIntervalId: ReturnType<typeof setInterval> | null = null;
 
 export function startRingLoop() {
   if (ringLoopIntervalId !== null) return;
-  
+
+  // 🆕 FIX ("tambahkan getar jika dibuka melalui hp"): getar di HP tidak
+  // bergantung pada AudioContext/autoplay policy, jadi tetap terasa oleh
+  // driver walau untuk alasan lain suara gagal keluar (mis. HP di-silent).
+  if ('vibrate' in navigator) {
+    navigator.vibrate([300, 100, 300, 100, 300]);
+  }
+
   // 🔥 Coba mainkan langsung
   playBellRingSound(1.0);
   
   // 🔥 Mulai interval
-  ringLoopIntervalId = setInterval(() => playBellRingSound(1.0), 1600);
+  ringLoopIntervalId = setInterval(() => {
+    if ('vibrate' in navigator) {
+      navigator.vibrate([300, 100, 300, 100, 300]);
+    }
+    playBellRingSound(1.0);
+  }, 1600);
 }
 
 export function stopRingLoop() {

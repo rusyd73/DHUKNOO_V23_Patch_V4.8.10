@@ -62,6 +62,70 @@ const normalizeCity = (query: string): string => {
   return `${query}, Malang Raya`;
 };
 
+
+type NominatimAddress = Record<string, string | undefined>;
+
+const cleanPart = (value?: string): string =>
+  String(value || '')
+    .replace(/\b(?:Kecamatan|Kelurahan)\s+/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const sameText = (a: string, b: string) => a.localeCompare(b, 'id', { sensitivity: 'base' }) === 0;
+
+/**
+ * Bangun label alamat dari komponen terstruktur Nominatim, bukan display_name mentah.
+ * Ini mencegah komponen administratif dari hasil lama/berbeda ikut menempel pada titik
+ * yang baru dipilih (contoh: titik Kota Batu tetapi label masih memuat Lowokwaru).
+ */
+const formatNominatimAddress = (raw: NominatimAddress | undefined, fallback = ''): string => {
+  if (!raw) return cleanPart(fallback);
+
+  const dominantCity = cleanPart(raw.city || raw.town || raw.municipality);
+  const dominantCounty = cleanPart(raw.county);
+  const cityDistrict = cleanPart(raw.city_district || raw.district);
+
+  const isBatu = /(^|\s)kota\s+batu($|\s)|(^|\s)batu($|\s)/i.test(dominantCity);
+  const isMalangCity = /kota\s+malang/i.test(dominantCity);
+
+  // Nama kecamatan di Malang Raya tidak boleh menyeberang ke kota/kabupaten
+  // lain setelah titik dipilih. Nominatim kadang mengirim city_district yang
+  // tidak konsisten dengan city/town pada hasil yang sama.
+  const batuDistricts = /batu|bumiaji|junrejo/i;
+  const malangCityDistricts = /lowokwaru|klojen|blimbing|sukun|kedungkandang/i;
+  const districtMatchesDominantCity =
+    !cityDistrict ||
+    (isBatu ? batuDistricts.test(cityDistrict) :
+      isMalangCity ? malangCityDistricts.test(cityDistrict) : true);
+
+  const candidates = [
+    raw.amenity || raw.building || raw.shop || raw.tourism,
+    raw.road || raw.pedestrian || raw.residential,
+    raw.neighbourhood || raw.quarter,
+    raw.suburb || raw.village || raw.hamlet,
+    // city_district hanya dipakai bila konsisten dengan kota dominan.
+    districtMatchesDominantCity ? cityDistrict : undefined,
+    dominantCity || dominantCounty,
+    dominantCity && dominantCounty && !sameText(dominantCity, dominantCounty) ? dominantCounty : undefined,
+    raw.state,
+  ].map(cleanPart).filter(Boolean);
+
+  const filtered = candidates.filter((part) => {
+    // Guard khusus Malang Raya: bila Nominatim sudah menegaskan Kota Batu,
+    // jangan campurkan kecamatan Kota Malang seperti Lowokwaru.
+    if (isBatu && /lowokwaru|klojen|blimbing|sukun|kedungkandang|kota\s+malang|kabupaten\s+malang/i.test(part)) return false;
+    if (isMalangCity && /bumiaji|junrejo|kota\s+batu/i.test(part)) return false;
+    return true;
+  });
+
+  const unique: string[] = [];
+  for (const part of filtered) {
+    if (!unique.some((existing) => sameText(existing, part))) unique.push(part);
+  }
+
+  return unique.join(', ') || cleanPart(fallback);
+};
+
 // Sub-component to handle map view updates (panning) when coordinates change
 function ChangeView({ center }: { center: LatLng | null }) {
   const map = useMap();
@@ -97,6 +161,8 @@ export default function LocationPicker({
   const [isReverseGeocoding, setIsReverseGeocoding] = useState(false);
 
   const skipNextAutoGeocodeRef = useRef(false);
+  const requestSeqRef = useRef(0);
+  const activeRequestRef = useRef<AbortController | null>(null);
 
   // Sync searchQuery with the parent address prop
   useEffect(() => {
@@ -106,85 +172,84 @@ export default function LocationPicker({
 
   const isMapActionRef = useRef(false);
 
-  // ✅ PERBAIKAN 4: Perform Geocoding - Case INSENSITIVE + normalisasi
+  // FIX8: Forward geocoding memakai request terbaru saja + addressdetails terstruktur.
   const handleGeocode = async (queryToSearch: string) => {
     if (!queryToSearch || !queryToSearch.trim()) return;
+
+    const requestId = ++requestSeqRef.current;
+    activeRequestRef.current?.abort();
+    const controller = new AbortController();
+    activeRequestRef.current = controller;
+
     setIsSearching(true);
     isMapActionRef.current = false;
 
     try {
-      // Normalisasi query (case insensitive + tambah konteks area)
       const normalizedQuery = normalizeCity(queryToSearch.trim());
-      
-      // Coba cari dengan query yang sudah dinormalisasi
       let formattedQuery = normalizedQuery;
-      
-      // Jika masih tidak ada nama kota, tambahkan "Malang Raya"
-      if (!formattedQuery.toLowerCase().includes('malang') && 
+
+      if (!formattedQuery.toLowerCase().includes('malang') &&
           !formattedQuery.toLowerCase().includes('batu') &&
           !formattedQuery.toLowerCase().includes('lowokwaru')) {
         formattedQuery = `${formattedQuery}, Malang Raya`;
       }
 
-      const response = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(formattedQuery)}&limit=1&countrycodes=id&accept-language=id`
-      );
-      const data = await response.json();
+      const search = async (q: string) => {
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&q=${encodeURIComponent(q)}&limit=1&countrycodes=id&accept-language=id`,
+          { signal: controller.signal }
+        );
+        if (!response.ok) throw new Error(`Geocoding HTTP ${response.status}`);
+        return response.json();
+      };
+
+      let data = await search(formattedQuery);
+      if ((!data || data.length === 0) && formattedQuery.includes('Malang Raya')) {
+        data = await search(queryToSearch.trim());
+      }
+
+      if (requestId !== requestSeqRef.current || controller.signal.aborted) return;
 
       if (data && data.length > 0) {
         const lat = parseFloat(data[0].lat);
         const lng = parseFloat(data[0].lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+        const displayName = formatNominatimAddress(data[0].address, data[0].display_name);
         onChange({ lat, lng });
-        
-        // ✅ PERBAIKAN 5: Bersihkan alamat dari "kecamatan" yang tidak perlu
-        let displayName = data[0].display_name;
-        // Hapus "Kecamatan" dan "Kelurahan" dari display_name
-        displayName = displayName.replace(/Kecamatan\s+/g, '').replace(/Kelurahan\s+/g, '');
-        
         onAddressChange(displayName);
         skipNextAutoGeocodeRef.current = true;
         setSearchQuery(displayName);
-      } else {
-        // Jika tidak ditemukan, coba tanpa "Malang Raya"
-        if (formattedQuery.includes('Malang Raya')) {
-          const retryQuery = queryToSearch.trim();
-          const retryResponse = await fetch(
-            `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(retryQuery)}&limit=1&countrycodes=id&accept-language=id`
-          );
-          const retryData = await retryResponse.json();
-          if (retryData && retryData.length > 0) {
-            const lat = parseFloat(retryData[0].lat);
-            const lng = parseFloat(retryData[0].lon);
-            onChange({ lat, lng });
-            onAddressChange(retryData[0].display_name);
-            skipNextAutoGeocodeRef.current = true;
-            setSearchQuery(retryData[0].display_name);
-          }
-        }
       }
-    } catch (err) {
-      console.error('Error during geocoding:', err);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') console.error('Error during geocoding:', err);
     } finally {
-      setIsSearching(false);
+      if (requestId === requestSeqRef.current) setIsSearching(false);
     }
   };
 
-  // ✅ PERBAIKAN 6: Perform Reverse Geocoding dengan filter alamat
+  // FIX8: Reverse geocoding membatalkan pencarian lama dan memakai komponen alamat terstruktur.
   const handleReverseGeocode = async (coords: LatLng) => {
+    const requestId = ++requestSeqRef.current;
+    activeRequestRef.current?.abort();
+    const controller = new AbortController();
+    activeRequestRef.current = controller;
+
     setIsReverseGeocoding(true);
     isMapActionRef.current = true;
 
     try {
       const response = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${coords.lat}&lon=${coords.lng}&zoom=16&accept-language=id`
+        `https://nominatim.openstreetmap.org/reverse?format=json&addressdetails=1&lat=${coords.lat}&lon=${coords.lng}&zoom=18&accept-language=id`,
+        { signal: controller.signal }
       );
+      if (!response.ok) throw new Error(`Reverse geocoding HTTP ${response.status}`);
       const data = await response.json();
 
+      if (requestId !== requestSeqRef.current || controller.signal.aborted) return;
+
       if (data && data.display_name) {
-        // ✅ PERBAIKAN 7: Bersihkan alamat dari "Kecamatan" dan "Kelurahan"
-        let displayName = data.display_name;
-        displayName = displayName.replace(/Kecamatan\s+/g, '').replace(/Kelurahan\s+/g, '');
-        
+        const displayName = formatNominatimAddress(data.address, data.display_name);
         onAddressChange(displayName);
         skipNextAutoGeocodeRef.current = true;
         setSearchQuery(displayName);
@@ -194,10 +259,10 @@ export default function LocationPicker({
         skipNextAutoGeocodeRef.current = true;
         setSearchQuery(fallback);
       }
-    } catch (err) {
-      console.error('Error during reverse geocoding:', err);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') console.error('Error during reverse geocoding:', err);
     } finally {
-      setIsReverseGeocoding(false);
+      if (requestId === requestSeqRef.current) setIsReverseGeocoding(false);
     }
   };
 
@@ -252,6 +317,10 @@ export default function LocationPicker({
     );
   };
 
+  useEffect(() => () => {
+    activeRequestRef.current?.abort();
+  }, []);
+
   const customIcon = L.divIcon({
     className: '',
     html: `<div style="width:20px;height:20px;border-radius:50%;background:${
@@ -271,7 +340,7 @@ export default function LocationPicker({
   const markerPosition = (value && isValidCoords(value)) ? value : null;
 
   return (
-    <div id={`location-picker-${label.toLowerCase().replace(/\s+/g, '-')}`} className="flex flex-col gap-2 bg-[#06170E] p-4 rounded-2xl border border-[#23583E]">
+    <div id={`location-picker-${label.toLowerCase().replace(/\s+/g, '-')}`} className="flex flex-col gap-2 bg-[#06170E] p-4 rounded-2xl border border-[#23583E] isolate">
       <div className="flex justify-between items-center">
         <label className="text-[10px] font-bold text-[#A5C9B8] uppercase tracking-wide flex items-center gap-1.5">
           <MapPin className={`w-3.5 h-3.5 ${markerColor === 'green' ? 'text-[#00E575]' : 'text-[#EF4444]'}`} />

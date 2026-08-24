@@ -11,7 +11,7 @@ import React, { useEffect, useState } from 'react';
 import { merchantApi } from '../api/merchant.api';
 import { SkeletonList } from '../components/common/Skeleton';
 import { QueryErrorState } from '../components/common/QueryErrorState';
-import { Loader2, Package, User, Bike, RefreshCw, Bell, CheckCircle, XCircle, Truck } from 'lucide-react';
+import { Loader2, Package, User, Bike, RefreshCw, Bell, CheckCircle, XCircle, Truck, Clock } from 'lucide-react';
 
 interface OrderItemRow {
   id: string;
@@ -23,6 +23,7 @@ interface OrderItemRow {
 
 interface MerchantOrder {
   id: string;
+  orderNumber?: string;
   status: string;
   price: number | string;
   dropoffAddress: string;
@@ -45,13 +46,23 @@ const STATUS_LABEL: Record<string, { label: string; color: string; icon: React.R
     icon: <Truck className="w-3.5 h-3.5" />
   },
   ON_THE_WAY: { 
-    label: 'Diantar ke Pelanggan', 
+    label: 'Driver Menuju Toko', 
     color: 'text-[#00E575] bg-[#00E575]/10 border-[#00E575]/20',
     icon: <Truck className="w-3.5 h-3.5" />
   },
   ARRIVED: { 
-    label: 'Driver Tiba di Tujuan', 
+    label: 'Driver Tiba di Toko', 
     color: 'text-[#00E575] bg-[#00E575]/10 border-[#00E575]/20',
+    icon: <CheckCircle className="w-3.5 h-3.5" />
+  },
+  PICKED_UP: {
+    label: 'Pesanan Diambil · Menuju Customer',
+    color: 'text-violet-400 bg-violet-400/10 border-violet-400/20',
+    icon: <Truck className="w-3.5 h-3.5" />
+  },
+  ARRIVED_CUSTOMER: {
+    label: 'Driver Tiba di Customer',
+    color: 'text-sky-400 bg-sky-400/10 border-sky-400/20',
     icon: <CheckCircle className="w-3.5 h-3.5" />
   },
   COMPLETED: { 
@@ -67,7 +78,7 @@ const STATUS_LABEL: Record<string, { label: string; color: string; icon: React.R
 };
 
 // Import Clock untuk icon
-import { Clock } from 'lucide-react';
+//import { Clock } from 'lucide-react';
 
 export function MerchantOrders() {
   const [orders, setOrders] = useState<MerchantOrder[]>([]);

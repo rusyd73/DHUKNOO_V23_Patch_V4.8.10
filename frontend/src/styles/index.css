@@ -2,7 +2,85 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  font-family: Arial, Helvetica, sans-serif;
+/*
+ * DHUKNOO UI BASELINE
+ * V4.3 CSS/Build Restoration
+ *
+ * Business/lifecycle logic is intentionally untouched.
+ * Tailwind 3 is the single frontend utility CSS pipeline.
+ */
+
+@layer base {
+  html {
+    min-height: 100%;
+    background: #06170E;
+    /* 🆕 FIX: mencegah overflow horizontal di seluruh aplikasi (mis. akibat
+       elemen lebar-tetap yang belum responsif). Overflow horizontal pada
+       body membuat "layout viewport" browser mobile jadi lebih lebar dari
+       layar sebenarnya, sehingga elemen fixed yang diposisikan dengan
+       persentase/center (seperti notifikasi/toast global) ikut bergeser
+       dan terpotong di pojok kanan layar. */
+    /* `hidden` membuat elemen ini menjadi scroll-container di sebagian
+       browser dan memutus position:sticky milik header turunannya. `clip`
+       tetap menahan overflow horizontal tanpa membuat scroll-container. */
+    overflow-x: clip;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #06170E;
+    color: #E4F3EC;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: clip;
+  }
+
+  #root {
+    min-height: 100vh;
+    overflow-x: clip;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+}
+
+@layer components {
+  /*
+   * These classes are referenced by the existing DHUKNOO JSX.
+   * They were previously present in markup but had no definition
+   * inside the V4.2 CSS pipeline.
+   */
+  .glass-card {
+    @apply bg-[#0B2318]/80 backdrop-blur-md border border-[#23583E]/60 shadow-xl;
+  }
+
+  .font-heading {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  .dhuknoo-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: #23583E #06170E;
+  }
+
+  .dhuknoo-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .dhuknoo-scrollbar::-webkit-scrollbar-track {
+    background: #06170E;
+  }
+
+  .dhuknoo-scrollbar::-webkit-scrollbar-thumb {
+    background: #23583E;
+    border-radius: 9999px;
+  }
 }

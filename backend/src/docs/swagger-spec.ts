@@ -28,7 +28,19 @@ export const SwaggerSpecification = {
           email: { type: 'string', format: 'email', example: 'pembeli@gmail.com' },
           password: { type: 'string', minLength: 4, example: 'pembeli123' },
           fullName: { type: 'string', example: 'Budi Santoso' },
-          role: { type: 'string', enum: ['CUSTOMER', 'DRIVER', 'ADMIN', 'MERCHANT'], example: 'CUSTOMER' },
+          role: {
+            type: 'string',
+            enum: ['CUSTOMER', 'DRIVER', 'MERCHANT'],
+            example: 'CUSTOMER',
+            description:
+              // 🆕 FIX P2 "Sinkronkan Swagger/OpenAPI dengan route dan schema aktual" (audit):
+              // SEBELUMNYA enum ini mencantumkan 'ADMIN' sebagai role yang valid untuk registrasi
+              // publik, padahal backend registerSchema (core/validation/schemas.ts) SUDAH menolak
+              // role ADMIN sejak awal -- dokumentasi ini menyesatkan (menjanjikan sesuatu yang
+              // ditolak 400 di server sungguhan). Akun ADMIN hanya bisa dibuat lewat seed database
+              // awal, atau oleh admin yang SUDAH LOGIN lewat POST /api/admin/create-admin.
+              'ADMIN tidak termasuk di sini dengan sengaja -- registrasi publik sebagai ADMIN selalu ditolak. Lihat POST /api/admin/create-admin untuk membuat admin baru (khusus admin yang sudah login).',
+          },
           vehiclePlate: { type: 'string', example: 'N 1234 BAT', description: 'Wajib jika role = DRIVER' },
           vehicleModel: { type: 'string', example: 'Honda Vario', description: 'Wajib jika role = DRIVER' },
           merchantName: { type: 'string', example: 'Warung Bakso Pak Karto', description: 'Wajib jika role = MERCHANT' },
@@ -58,7 +70,7 @@ export const SwaggerSpecification = {
         type: 'object',
         required: ['serviceType', 'price', 'pickupAddress', 'pickupLat', 'pickupLng', 'dropoffAddress', 'dropoffLat', 'dropoffLng'],
         properties: {
-          serviceType: { type: 'string', enum: ['BIKE', 'CAR', 'SEND'], example: 'BIKE' },
+          serviceType: { type: 'string', enum: ['BIKE', 'CAR', 'SEND', 'MART'], example: 'BIKE' },
           price: { type: 'number', example: 15000 },
           pickupAddress: { type: 'string', example: 'Alun-alun Kota Batu' },
           pickupLat: { type: 'number', example: -7.8712 },
@@ -73,7 +85,7 @@ export const SwaggerSpecification = {
         type: 'object',
         required: ['status'],
         properties: {
-          status: { type: 'string', enum: ['ON_THE_WAY', 'ARRIVED', 'COMPLETED', 'CANCELLED'], example: 'ON_THE_WAY' },
+          status: { type: 'string', enum: ['ON_THE_WAY', 'ARRIVED', 'PICKED_UP', 'ARRIVED_CUSTOMER', 'COMPLETED', 'CANCELLED'], example: 'ON_THE_WAY' },
         },
       },
       TopupInput: {
@@ -214,7 +226,7 @@ export const SwaggerSpecification = {
     },
     '/api/auth/register': {
       post: {
-        summary: 'Mendaftarkan akun baru (Customer / Driver / Admin)',
+        summary: 'Mendaftarkan akun baru (Customer / Driver / Merchant -- BUKAN Admin, lihat catatan role di RegisterInput)',
         requestBody: {
           required: true,
           content: {
@@ -639,7 +651,11 @@ export const SwaggerSpecification = {
           required: true,
           content: { 'multipart/form-data': { schema: { type: 'object', properties: { image: { type: 'string', format: 'binary' } } } } },
         },
-        responses: { 201: { description: 'Upload berhasil, mengembalikan { url }.' } },
+        responses: {
+          201: { description: 'Upload berhasil, mengembalikan { url }.' },
+          400: { description: 'Isi file tidak sesuai JPEG/PNG/WebP (dicek dari magic bytes, bukan cuma klaim Content-Type), atau melebihi 5MB.' },
+          429: { description: 'Terlalu banyak upload dalam 5 menit terakhir (maks 20).' },
+        },
       },
     },
     '/api/payment/confirm-cash': {
@@ -738,6 +754,29 @@ export const SwaggerSpecification = {
         summary: 'Daftar dokumen driver yang menunggu ditinjau (khusus ADMIN)',
         security: [{ BearerAuth: [] }],
         responses: { 200: { description: 'Daftar dokumen pending.' } },
+      },
+    },
+    // 🆕 FIX P2 "Sinkronkan Swagger/OpenAPI dengan route dan schema aktual"
+    // (audit a1.3/a1.4): dua endpoint reconciliation baru (P1 audit a1.4,
+    // lihat reconciliation.service.ts) didokumentasikan di sini supaya
+    // tidak langsung jadi endpoint "siluman" lagi begitu ditambahkan.
+    '/api/admin/reconciliation/pending': {
+      get: {
+        summary: 'Daftar order yang settlement finansialnya masih menggantung (settlementStatus RETRY_REQUIRED/FAILED, khusus ADMIN)',
+        security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Daftar order yang perlu direkonsiliasi, diurutkan dari yang paling lama menggantung.' } },
+      },
+    },
+    '/api/admin/reconciliation/{orderId}/retry': {
+      post: {
+        summary: 'Retry settlement untuk satu order WALLET yang gagal (khusus ADMIN) — idempotent, aman diklik berkali-kali',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'orderId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
+        responses: {
+          200: { description: 'Settlement berhasil diretry (atau sudah SETTLED sebelumnya — idempotent replay).' },
+          400: { description: 'Order bukan metode WALLET — CASH/QRIS/TRANSFER/EWALLET butuh tindakan manual berbeda (lihat pesan error).' },
+          409: { description: 'Order sudah SETTLED, tidak perlu diretry.' },
+        },
       },
     },
     '/api/admin/driver-documents/{documentId}/review': {

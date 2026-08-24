@@ -1,36 +1,59 @@
 // modules/dispatch/dispatch.redis.ts
-import Redis from 'ioredis';
+import { RedisService } from '../../config/redis';
 import { logger } from '../../config/logger';
 
-// 🆕 CATATAN "Redis architecture" (audit lanjutan, belum sepenuhnya
-// diselesaikan di sini -- didokumentasikan sebagai known limitation):
-// modul ini bikin koneksi Redis SENDIRI, terpisah total dari
-// RedisService (config/redis.ts) yang jadi "koneksi resmi" app --
-// dua koneksi independen ke Redis yang sama, tidak saling terhubung.
-// RedisService py fallback in-memory otomatis kalau Redis down;
-// koneksi di sini TIDAK -- karena dispatch lock WAJIB benar-benar
-// atomik lintas instance (fallback in-memory PER-INSTANCE justru akan
-// merusak jaminan mutual-exclusion-nya kalau dipakai multi-instance --
-// dua instance beda bisa sama-sama "berhasil" acquire lock yang
-// harusnya saling meniadakan kalau masing-masing fallback ke memory
-// lokalnya sendiri). Konsolidasi penuh ke RedisService (menambahkan
-// method atomic-lock & JSON helpers di sana) adalah perbaikan lanjutan
-// yang direkomendasikan, di luar scope perbaikan kritis sesi ini.
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const redis = new Redis(REDIS_URL);
-
-// 🆕 FIX KRITIS "Redis architecture" -- STABILITAS PRODUKSI:
-// SEBELUMNYA tidak ada listener 'error' sama sekali di client ini.
-// Node.js EventEmitter (dasar ioredis) akan THROW UNCAUGHT EXCEPTION
-// dan BISA MENJATUHKAN SELURUH PROSES NODE kalau event 'error' terjadi
-// tanpa ada listener terpasang -- artinya gangguan koneksi Redis
-// SEKECIL APAPUN (restart Redis, network blip sesaat) berpotensi
-// CRASH TOTAL seluruh backend (bukan cuma fitur dispatch), bukan cuma
-// gagal dengan graceful degradation. Ditambahkan listener supaya error
-// koneksi di-log, bukan menjatuhkan proses.
-redis.on('error', (err) => {
-  logger.error('[DispatchRedis] Redis connection error: %s', err.message || err);
-});
+// 🆕 FIX "Redis architecture" -- KONSOLIDASI KE SATU KONEKSI (audit
+// lanjutan, menuntaskan catatan yang sebelumnya cuma didokumentasikan):
+// SEBELUMNYA modul ini bikin koneksi Redis SENDIRI (`new Redis(REDIS_URL)`),
+// terpisah total dari RedisService (config/redis.ts) yang jadi "koneksi
+// resmi" app -- DUA koneksi/connection-pool independen ke Redis yang
+// sama, boros resource, dan tidak saling terhubung status
+// connect/disconnect-nya.
+//
+// Sekarang dikonsolidasi memakai RedisService.getClient() -- SATU
+// koneksi ioredis yang sama dipakai seluruh app (sudah py listener
+// 'error' & retryStrategy sendiri, jadi tidak perlu duplikasi lagi
+// di sini).
+//
+// TAPI SENGAJA TIDAK memakai method wrapper RedisService (get/set/dst)
+// yang PUNYA fallback in-memory otomatis kalau Redis down -- dispatch
+// lock WAJIB benar-benar atomik LINTAS INSTANCE; fallback in-memory
+// PER-INSTANCE justru akan merusak jaminan mutual-exclusion-nya di
+// deployment multi-instance (dua instance beda bisa sama-sama
+// "berhasil" acquire lock yang harusnya saling meniadakan kalau
+// masing-masing diam-diam fallback ke memory lokalnya sendiri).
+// getRedisOrThrow() di bawah mengambil client MENTAH dari
+// RedisService.getClient() dan memanggil command Redis langsung di
+// atasnya -- kalau Redis benar-benar tidak terhubung, method-method di
+// bawah GAGAL EKSPLISIT (throw), BUKAN diam-diam "berhasil" pakai
+// memori lokal yang salah secara semantik untuk use-case ini.
+function getRedisOrThrow() {
+  // 🆕 FIX P0/P1 "Redis readiness" (audit): SEBELUMNYA fungsi ini HANYA
+  // mengecek `RedisService.getClient()` tidak null -- tapi client ioredis
+  // TETAP non-null (objek instance-nya tetap ada) bahkan ketika koneksi
+  // benar-benar putus (setelah event 'error', sebelum reconnect berhasil,
+  // atau sebelum event 'connect' pertama sama sekali). ioredis defaultnya
+  // BUFFER command saat disconnected dan baru mengirim setelah reconnect
+  // -- artinya operasi dispatch lock/state DIAM-DIAM ANTRE alih-alih
+  // gagal cepat, memberi ILUSI dispatch sehat (request tidak error, tapi
+  // juga tidak benar-benar selesai tepat waktu) persis yang diperingatkan
+  // audit P0 #9 ("service tidak boleh diam-diam berjalan dalam mode yang
+  // memberikan ilusi dispatch sehat").
+  //
+  // RedisService.isReady() melacak status KONEKSI SUNGGUHAN lewat event
+  // 'connect'/'error' (lihat config/redis.ts) -- sekarang WAJIB true
+  // juga, bukan cuma client-nya ada. Kalau Redis belum/tidak ready,
+  // gagal EKSPLISIT SEKARANG JUGA (fail-closed) alih-alih menunggu buffer
+  // command ioredis yang tidak terlihat dari luar.
+  if (!RedisService.isReady()) {
+    throw new Error('[DispatchRedis] Redis belum/tidak ready (readiness check gagal) -- operasi dispatch (lock/state) tidak bisa dijamin atomik lintas instance tanpa Redis yang benar-benar terhubung. Menolak beroperasi daripada diam-diam salah.');
+  }
+  const client = RedisService.getClient();
+  if (!client) {
+    throw new Error('[DispatchRedis] Redis tidak terhubung -- operasi dispatch (lock/state) tidak bisa dijamin atomik lintas instance tanpa Redis. Menolak beroperasi daripada diam-diam salah.');
+  }
+  return client;
+}
 
 const PREFIX = 'dispatch:';
 const LOCK_PREFIX = 'lock:';
@@ -46,7 +69,7 @@ const DRIVER_BUSY_TTL = 300;
 export class DispatchRedis {
   static async setDispatchState(orderId: string, driverIds: string[]): Promise<void> {
     const key = `${PREFIX}${orderId}`;
-    await redis.setex(key, DISPATCH_TTL, JSON.stringify({
+    await getRedisOrThrow().setex(key, DISPATCH_TTL, JSON.stringify({
       orderId,
       driverIds,
       currentIndex: 0,
@@ -57,7 +80,7 @@ export class DispatchRedis {
 
   static async getDispatchState(orderId: string): Promise<any> {
     const key = `${PREFIX}${orderId}`;
-    const data = await redis.get(key);
+    const data = await getRedisOrThrow().get(key);
     return data ? JSON.parse(data) : null;
   }
 
@@ -65,23 +88,23 @@ export class DispatchRedis {
     const key = `${PREFIX}${orderId}`;
     const current = await this.getDispatchState(orderId);
     if (!current) return;
-    await redis.setex(key, DISPATCH_TTL, JSON.stringify({ ...current, ...updates }));
+    await getRedisOrThrow().setex(key, DISPATCH_TTL, JSON.stringify({ ...current, ...updates }));
   }
 
   static async clearDispatchState(orderId: string): Promise<void> {
-    await redis.del(`${PREFIX}${orderId}`);
+    await getRedisOrThrow().del(`${PREFIX}${orderId}`);
   }
 
   static async setCurrentDriver(orderId: string, driverId: string): Promise<void> {
-    await redis.setex(`${OFFER_PREFIX}${orderId}`, OFFER_TTL, driverId);
+    await getRedisOrThrow().setex(`${OFFER_PREFIX}${orderId}`, OFFER_TTL, driverId);
   }
 
   static async getCurrentDriver(orderId: string): Promise<string | null> {
-    return redis.get(`${OFFER_PREFIX}${orderId}`);
+    return getRedisOrThrow().get(`${OFFER_PREFIX}${orderId}`);
   }
 
   static async clearCurrentDriver(orderId: string): Promise<void> {
-    await redis.del(`${OFFER_PREFIX}${orderId}`);
+    await getRedisOrThrow().del(`${OFFER_PREFIX}${orderId}`);
   }
 
   // 🆕 FIX KRITIS "Redis architecture" -- LOCK TIDAK ATOMIK:
@@ -97,42 +120,40 @@ export class DispatchRedis {
   // bisa "terputus di tengah".
   static async acquireLock(orderId: string): Promise<boolean> {
     const key = `${LOCK_PREFIX}${orderId}`;
-    const result = await redis.set(key, 'locked', 'EX', LOCK_TTL, 'NX');
+    const result = await getRedisOrThrow().set(key, 'locked', 'EX', LOCK_TTL, 'NX');
     return result === 'OK';
   }
 
   static async releaseLock(orderId: string): Promise<void> {
-    await redis.del(`${LOCK_PREFIX}${orderId}`);
+    await getRedisOrThrow().del(`${LOCK_PREFIX}${orderId}`);
   }
 
   static async setDriverBusy(driverId: string, orderId: string): Promise<void> {
-    await redis.setex(`${DRIVER_PREFIX}${driverId}`, DRIVER_BUSY_TTL, orderId);
+    await getRedisOrThrow().setex(`${DRIVER_PREFIX}${driverId}`, DRIVER_BUSY_TTL, orderId);
   }
 
   static async getDriverBusy(driverId: string): Promise<string | null> {
-    return redis.get(`${DRIVER_PREFIX}${driverId}`);
+    return getRedisOrThrow().get(`${DRIVER_PREFIX}${driverId}`);
   }
 
   static async clearDriverBusy(driverId: string): Promise<void> {
-    await redis.del(`${DRIVER_PREFIX}${driverId}`);
+    await getRedisOrThrow().del(`${DRIVER_PREFIX}${driverId}`);
   }
 
   static async scheduleTimeout(orderId: string, delaySeconds: number): Promise<void> {
-    await redis.setex(`${TIMEOUT_PREFIX}${orderId}`, delaySeconds, 'pending');
+    await getRedisOrThrow().setex(`${TIMEOUT_PREFIX}${orderId}`, delaySeconds, 'pending');
   }
 
   static async checkTimeout(orderId: string): Promise<boolean> {
-    return (await redis.exists(`${TIMEOUT_PREFIX}${orderId}`)) === 1;
+    return (await getRedisOrThrow().exists(`${TIMEOUT_PREFIX}${orderId}`)) === 1;
   }
 
   static async cancelTimeout(orderId: string): Promise<void> {
-    await redis.del(`${TIMEOUT_PREFIX}${orderId}`);
+    await getRedisOrThrow().del(`${TIMEOUT_PREFIX}${orderId}`);
   }
 
   static async recoverPendingDispatches(): Promise<string[]> {
-    const keys = await redis.keys(`${PREFIX}*`);
+    const keys = await getRedisOrThrow().keys(`${PREFIX}*`);
     return keys.map(k => k.replace(PREFIX, ''));
   }
 }
-
-export default redis;

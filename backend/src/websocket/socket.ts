@@ -34,6 +34,11 @@ export class SocketService {
   private static io: AppServer | null = null;
   private static lastLocationEmitAt = new Map<string, number>();
   private static lastChatEmitAt = new Map<string, number>();
+  // 🆕 FIX P0 "Availability state machine / grace period" (audit
+  // driver-jobs): timer OFFLINE yang tertunda per driver -- lihat
+  // komentar lengkap di handler "disconnect" di bawah.
+  private static pendingOfflineTimers = new Map<string, NodeJS.Timeout>();
+  private static readonly OFFLINE_GRACE_PERIOD_MS = 20_000;
 
   public static init(server: HttpServer): AppServer {
     // 🆕 FIX "WebSocket security": konsisten dengan fix CORS Express di
@@ -103,20 +108,44 @@ export class SocketService {
 
       // ✅ REGISTER MULTIPLE SOCKETS PAKAI REDIS SET (untuk driver)
       if (user.role === "DRIVER") {
+        // 🆕 FIX P0 "Availability state machine / grace period" (audit
+        // driver-jobs): kalau driver ini punya timer OFFLINE yang masih
+        // tertunda dari disconnect SEBELUMNYA (mis. reconnect cepat
+        // karena pindah WiFi<->seluler, app di-background sebentar),
+        // batalkan timer itu SEKARANG -- socket baru ini membuktikan
+        // driver sebenarnya masih terhubung, jadi status ONLINE di
+        // database tidak perlu (dan tidak boleh) diturunkan jadi
+        // OFFLINE oleh timer lama yang sudah tidak relevan lagi.
+        const pendingTimer = this.pendingOfflineTimers.get(user.id);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          this.pendingOfflineTimers.delete(user.id);
+          logger.info(`[SOCKET] Driver ${user.id} reconnect dalam grace period -- timer OFFLINE dibatalkan.`);
+        }
+
         const setKey = `${DRIVER_SOCKETS_SET}${user.id}`;
-        RedisService.sadd(setKey, socket.id).catch((err) => {
-          logger.error(`[SOCKET] Gagal menambahkan socket driver ${user.id} ke Redis Set: ${(err as Error).message}`);
-        });
-        RedisService.expire(setKey, 60 * 60 * 24 * 7).catch((err) => {
-          logger.error(`[SOCKET] Gagal set expire untuk driver ${user.id}: ${(err as Error).message}`);
-        });
-
-        // SIMPAN juga individual key (untuk backward compatibility)
-        RedisService.setex(`${SOCKET_PREFIX}${user.id}`, 60 * 60 * 24 * 7, socket.id).catch((err) => {
-          logger.error(`[SOCKET] Gagal mendaftarkan socket driver ${user.id} ke Redis: ${(err as Error).message}`);
-        });
-
-        logger.info(`[SOCKET] Driver ${user.id} registered (total sockets: ${RedisService.scard(setKey)})`);
+        // 🆕 FIX: sebelumnya `RedisService.sadd(...)` dipanggil tanpa
+        // `await` (fire-and-forget) lalu `scard(setKey)` langsung
+        // dimasukkan ke template string tanpa `await` juga -- karena
+        // `scard` itu Promise, hasilnya selalu tercetak sebagai literal
+        // "[object Promise]" di log (lihat log driver login), BUKAN angka
+        // jumlah socket yang sebenarnya. Selain itu `scard` bisa saja
+        // terbaca SEBELUM `sadd` selesai menulis ke Redis, sehingga
+        // hitungannya juga tidak akurat. Dibungkus IIFE async supaya
+        // urutannya benar (sadd -> expire -> setex -> baru scard) tanpa
+        // perlu mengubah seluruh connection handler jadi async.
+        (async () => {
+          try {
+            await RedisService.sadd(setKey, socket.id);
+            await RedisService.expire(setKey, 60 * 60 * 24 * 7);
+            // SIMPAN juga individual key (untuk backward compatibility)
+            await RedisService.setex(`${SOCKET_PREFIX}${user.id}`, 60 * 60 * 24 * 7, socket.id);
+            const totalSockets = await RedisService.scard(setKey);
+            logger.info(`[SOCKET] Driver ${user.id} registered (total sockets: ${totalSockets})`);
+          } catch (err) {
+            logger.error(`[SOCKET] Gagal mendaftarkan socket driver ${user.id} ke Redis: ${(err as Error).message}`);
+          }
+        })();
       }
 
       // ──────────────────────────────────────────────────────────────────
@@ -173,7 +202,7 @@ export class SocketService {
 
           // Kalau driver sedang punya order aktif, siarkan juga ke room order itu
           const activeOrder = await prisma.order.findFirst({
-            where: { driverId: driverProfile.id, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED"] } },
+            where: { driverId: driverProfile.id, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED", "PICKED_UP", "ARRIVED_CUSTOMER"] } },
             select: { id: true },
           });
           if (activeOrder) {
@@ -304,6 +333,55 @@ export class SocketService {
         logger.info(`[CALL] Panggilan diakhiri order ${data.orderId} oleh ${user.role}(${user.id}) — durasi ${data.durationSeconds ?? 0}s`);
       });
 
+      /**
+       * WebRTC media signaling. Event call_* di atas hanya mengatur state UI;
+       * tiga event di bawah meneruskan SDP + ICE secara private ke lawan bicara.
+       * Tanpa signaling ini browser memang bisa membuka mikrofon, tetapi tidak
+       * pernah membentuk RTCPeerConnection sehingga kedua pihak tidak mungkin
+       * mendengar audio satu sama lain.
+       */
+      socket.on("call_webrtc_offer", async (data: { orderId: string; targetUserId: string; sdp: any }) => {
+        if (!this.io || !data?.orderId || !data?.targetUserId || !data?.sdp) return;
+        const senderAllowed = await SocketService.isOrderParticipant(user, data.orderId);
+        const targetAllowed = await SocketService.isUserIdOrderParticipant(data.targetUserId, data.orderId);
+        if (!senderAllowed || !targetAllowed || data.targetUserId === user.id) {
+          logger.warn(`[CALL] WebRTC offer ditolak order=${data.orderId} sender=${user.id} target=${data.targetUserId}`);
+          return;
+        }
+        this.io.to(`user_${data.targetUserId}`).emit("call_webrtc_offer", {
+          orderId: data.orderId,
+          senderId: user.id,
+          targetUserId: data.targetUserId,
+          sdp: data.sdp,
+        });
+      });
+
+      socket.on("call_webrtc_answer", async (data: { orderId: string; targetUserId: string; sdp: any }) => {
+        if (!this.io || !data?.orderId || !data?.targetUserId || !data?.sdp) return;
+        const senderAllowed = await SocketService.isOrderParticipant(user, data.orderId);
+        const targetAllowed = await SocketService.isUserIdOrderParticipant(data.targetUserId, data.orderId);
+        if (!senderAllowed || !targetAllowed || data.targetUserId === user.id) return;
+        this.io.to(`user_${data.targetUserId}`).emit("call_webrtc_answer", {
+          orderId: data.orderId,
+          senderId: user.id,
+          targetUserId: data.targetUserId,
+          sdp: data.sdp,
+        });
+      });
+
+      socket.on("call_webrtc_ice", async (data: { orderId: string; targetUserId: string; candidate: any }) => {
+        if (!this.io || !data?.orderId || !data?.targetUserId || !data?.candidate) return;
+        const senderAllowed = await SocketService.isOrderParticipant(user, data.orderId);
+        const targetAllowed = await SocketService.isUserIdOrderParticipant(data.targetUserId, data.orderId);
+        if (!senderAllowed || !targetAllowed || data.targetUserId === user.id) return;
+        this.io.to(`user_${data.targetUserId}`).emit("call_webrtc_ice", {
+          orderId: data.orderId,
+          senderId: user.id,
+          targetUserId: data.targetUserId,
+          candidate: data.candidate,
+        });
+      });
+
       // ──────────────────────────────────────────────────────────────────
       // 🔥 DISCONNECT - Cleanup (TANPA KEYS * + MULTI DEVICE SUPPORT)
       // ──────────────────────────────────────────────────────────────────
@@ -340,13 +418,51 @@ export class SocketService {
               // Hapus lokasi
               await RedisService.del(`${DRIVER_LOCATION_PREFIX}${userId}`);
 
-              // Update status offline di database
-              await prisma.driverProfile.update({
-                where: { userId: userId },
-                data: { isOnline: false }
-              });
+              // 🆕 FIX P0 "Availability state machine / grace period"
+              // (audit driver-jobs): SEBELUMNYA isOnline langsung
+              // diset false DI SINI, SEKETIKA socket terakhir putus --
+              // termasuk untuk disconnect SESAAT yang murni jaringan
+              // (pindah WiFi ke seluler, app di-background beberapa
+              // detik, tunnel reconnect) yang lumrah terjadi di mobile.
+              // Efeknya: driver "kedip-kedip" ONLINE/OFFLINE terus-
+              // menerus, dan setiap kali status jatuh ke OFFLINE, GET
+              // /api/driver/jobs langsung 403 "Driver is offline" --
+              // persis blocker yang dilaporkan audit, padahal driver
+              // sebenarnya tetap aktif memakai aplikasi.
+              //
+              // Sekarang OFFLINE tidak langsung ditulis ke database --
+              // dijadwalkan dulu (grace period, lihat
+              // OFFLINE_GRACE_PERIOD_MS di atas) dan BARU benar-benar
+              // ditulis kalau setelah grace period itu driver TERBUKTI
+              // masih belum reconnect (dicek ulang activeCount dari
+              // Redis, bukan diasumsikan). Kalau driver reconnect
+              // sebelum grace period habis, timer ini dibatalkan di
+              // connection handler di atas -- isOnline TIDAK PERNAH
+              // sempat ditulis false untuk disconnect sesaat.
+              const existingTimer = this.pendingOfflineTimers.get(userId);
+              if (existingTimer) clearTimeout(existingTimer);
 
-              logger.info(`🔴 Driver ${userId} disconnected (all ${activeCount} sockets closed), set offline`);
+              const timer = setTimeout(async () => {
+                this.pendingOfflineTimers.delete(userId);
+                try {
+                  const stillActiveSockets = await RedisService.smembers(setKey);
+                  if (stillActiveSockets.length === 0) {
+                    await prisma.driverProfile.update({
+                      where: { userId },
+                      data: { isOnline: false },
+                    });
+                    SocketService.emitToAdmins("driver_status_changed", { driverId: userId, isOnline: false });
+                    logger.info(`🔴 Driver ${userId} masih terputus setelah grace period ${SocketService.OFFLINE_GRACE_PERIOD_MS}ms -- diset OFFLINE.`);
+                  } else {
+                    logger.info(`🟢 Driver ${userId} sudah reconnect sebelum grace period habis -- tetap ONLINE.`);
+                  }
+                } catch (timerErr: any) {
+                  logger.error(`[SOCKET] Gagal memproses grace-period OFFLINE untuk driver ${userId}: ${timerErr?.message || timerErr}`);
+                }
+              }, this.OFFLINE_GRACE_PERIOD_MS);
+
+              this.pendingOfflineTimers.set(userId, timer);
+              logger.info(`🟡 Driver ${userId} kehilangan semua socket -- menunggu grace period ${this.OFFLINE_GRACE_PERIOD_MS}ms sebelum diset OFFLINE.`);
             } else {
               // Masih ada socket aktif, tetap online
               logger.info(`🟢 Driver ${userId} still online (${activeCount} active sockets)`);
@@ -385,13 +501,12 @@ export class SocketService {
     //   merchant manapun bisa join lalu memantau/menguntit pergerakan
     //   semua driver, bukan cuma driver yang sedang mengantar order
     //   mereka. Risiko keamanan fisik nyata buat driver.
-    // - "drivers_pool" menyiarkan detail SETIAP order baru
-    //   (pickupAddress, dropoffAddress, price -- lihat
-    //   emitToDriversPool('new_order_available', ...)) ke siapa pun di
-    //   room ini -- customer/merchant manapun bisa join lalu memanen
-    //   alamat rumah & harga order customer LAIN secara real-time.
-    // Sekarang keduanya HANYA untuk role DRIVER (yang memang butuh info
-    // ini untuk bekerja) atau ADMIN (sudah return true di baris atas).
+    // - "drivers_pool" dipakai hanya untuk sinyal pool yang non-private
+    //   seperti order_taken. Actionable offer `new_order_available` TIDAK
+    //   lagi dibroadcast ke pool; offer dikirim private oleh DispatchService
+    //   hanya kepada driver kandidat yang eligible.
+    // Sekarang keduanya HANYA untuk role DRIVER (yang memang membutuhkan
+    // pool untuk sinkronisasi kerja) atau ADMIN (sudah return true di atas).
     if (roomId === "map_updates" || roomId === "drivers_pool") {
       return user.role === "DRIVER";
     }
@@ -411,7 +526,7 @@ export class SocketService {
         const customerProfile = await prisma.customerProfile.findUnique({ where: { userId: user.id } });
         if (!customerProfile) return false;
         const activeOrder = await prisma.order.findFirst({
-          where: { customerId: customerProfile.id, driverId, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED"] } },
+          where: { customerId: customerProfile.id, driverId, status: { in: ["ACCEPTED", "ON_THE_WAY", "ARRIVED", "PICKED_UP", "ARRIVED_CUSTOMER"] } },
           select: { id: true },
         });
         return !!activeOrder;
@@ -434,6 +549,15 @@ export class SocketService {
     if (user.role === "CUSTOMER") return order.customer.userId === user.id;
     if (user.role === "DRIVER") return order.driver?.userId === user.id;
     return false;
+  }
+
+  private static async isUserIdOrderParticipant(userId: string, orderId: string): Promise<boolean> {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { customer: true, driver: true },
+    });
+    if (!order) return false;
+    return order.customer.userId === userId || order.driver?.userId === userId;
   }
 
   // ──────────────────────────────────────────────────────────────────

@@ -23,6 +23,11 @@ export interface TariffCalculationInput {
   // 🔒 TIMESTAMP UNTUK WAIT TIME
   createdAt?: Date;
   acceptedAt?: Date;
+  // 🆕 MULTI-DESTINATION: jumlah tujuan TAMBAHAN di luar 1 tujuan
+  // standar (mis. order dengan 3 tujuan total -> extraStopCount = 2).
+  // 0/undefined = order 1-tujuan biasa, tidak ada biaya tambahan sama
+  // sekali -- behaviour lama 100% tidak berubah.
+  extraStopCount?: number;
 }
 
 export interface TariffBreakdown {
@@ -34,6 +39,10 @@ export interface TariffBreakdown {
   parkingFee: number;
   weatherSurcharge: number;
   holidaySurcharge: number;
+  // 🆕 MULTI-DESTINATION: total biaya tambahan untuk semua titik tujuan
+  // ekstra (extraStopCount x tarif per-titik-tambahan). 0 untuk order
+  // 1-tujuan biasa.
+  multiStopFee: number;
   promoDiscount: number;
   finalFare: number;
   commissionRate: number;
@@ -203,10 +212,13 @@ export class TariffEngineService {
     }
 
     // STEP 9: Komponen dasar
-    const baseFare = Number(rule.baseFare);
-    const pickupFee = Number(rule.pickupFee);
-    const distanceFee = Number(rule.perKmFee) * Math.max(0, input.distanceKm);
-    const waitFee = Number(rule.perMinuteWaitFee) * Math.max(0, waitMinutes);
+    // Semua nominal disimpan sebagai rupiah utuh. Math.round menerapkan
+    // pembulatan half-up untuk nilai positif: 124,5 menjadi 125.
+    const roundRupiah = (value: number) => Math.round(value);
+    const baseFare = roundRupiah(Number(rule.baseFare));
+    const pickupFee = roundRupiah(Number(rule.pickupFee));
+    const distanceFee = roundRupiah(Number(rule.perKmFee) * Math.max(0, input.distanceKm));
+    const waitFee = roundRupiah(Number(rule.perMinuteWaitFee) * Math.max(0, waitMinutes));
 
     // STEP 10: Komponen regional
     let tollFee = 0;
@@ -217,22 +229,34 @@ export class TariffEngineService {
     if (zoneId) {
       const policy = await this.tariffRepo.findActiveRegionalPolicy(zoneId);
       if (policy) {
-        tollFee = hasToll ? Number(policy.tollFee) : 0;
-        parkingFee = hasParking ? Number(policy.parkingFee) : 0;
-        weatherSurcharge = isBadWeather ? Number(policy.weatherSurcharge) : 0;
-        holidaySurcharge = isHoliday ? Number(policy.holidaySurcharge) : 0;
+        tollFee = hasToll ? roundRupiah(Number(policy.tollFee)) : 0;
+        parkingFee = hasParking ? roundRupiah(Number(policy.parkingFee)) : 0;
+        weatherSurcharge = isBadWeather ? roundRupiah(Number(policy.weatherSurcharge)) : 0;
+        holidaySurcharge = isHoliday ? roundRupiah(Number(policy.holidaySurcharge)) : 0;
       }
+    }
+
+    // 🆕 STEP 10b: MULTI-DESTINATION -- biaya tambahan per titik tujuan
+    // ekstra (mis. Rp3.000/titik tambahan, dapat diatur Admin lewat
+    // PlatformConfig key 'ADDITIONAL_STOP_FEE'). 0 kalau order 1-tujuan
+    // biasa (extraStopCount tidak dikirim/0) -- tidak mempengaruhi tarif
+    // order lama sama sekali.
+    const extraStopCount = Math.max(0, Math.floor(input.extraStopCount || 0));
+    let multiStopFee = 0;
+    if (extraStopCount > 0) {
+      const feePerExtraStop = await this.getAdditionalStopFee();
+      multiStopFee = feePerExtraStop * extraStopCount;
     }
 
     // 🔒 PROMO DISCOUNT - dihitung terpisah (bukan dari input)
     const promoDiscount = 0;
 
     const subtotal =
-      baseFare + pickupFee + distanceFee + waitFee + tollFee + parkingFee + weatherSurcharge + holidaySurcharge;
-    const finalFare = Math.max(0, subtotal - promoDiscount);
+      baseFare + pickupFee + distanceFee + waitFee + tollFee + parkingFee + weatherSurcharge + holidaySurcharge + multiStopFee;
+    const finalFare = roundRupiah(Math.max(0, subtotal - promoDiscount));
 
     const { rate: commissionRate, tariffVersionId } = await this.resolveCommissionRate(finalFare);
-    const commissionAmount = finalFare * commissionRate;
+    const commissionAmount = roundRupiah(finalFare * commissionRate);
     const driverEarning = finalFare - commissionAmount;
 
     return {
@@ -244,6 +268,7 @@ export class TariffEngineService {
       parkingFee,
       weatherSurcharge,
       holidaySurcharge,
+      multiStopFee,
       promoDiscount,
       finalFare,
       commissionRate,
@@ -265,6 +290,27 @@ export class TariffEngineService {
               Math.cos(this.toRad(lat1)) * Math.cos(this.toRad(lat2)) * 
               Math.sin(dLon/2)**2;
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  // ============================================================
+  // 🆕 MULTI-DESTINATION: total jarak (Haversine) menyusuri pickup ->
+  // titik 1 -> titik 2 -> ... -> titik terakhir, dijumlah per-etape.
+  // Dipakai sebagai FALLBACK/validasi kasar sebelum verifikasi jarak
+  // jalan sebenarnya (per-etape) di OrderService -- pola yang sama
+  // seperti `calculateDistance` dipakai sebagai fallback untuk order
+  // 1-tujuan (lihat DistanceService.getVerifiedDistance).
+  calculateMultiStopDistance(
+    pickup: { lat: number; lng: number },
+    stops: { lat: number; lng: number }[]
+  ): number {
+    if (!stops.length) return 0;
+    let total = 0;
+    let prev = pickup;
+    for (const stop of stops) {
+      total += this.calculateDistance(prev.lat, prev.lng, stop.lat, stop.lng);
+      prev = stop;
+    }
+    return total;
   }
 
   private toRad(deg: number): number {
@@ -304,5 +350,18 @@ export class TariffEngineService {
     if (!config) return 0.1;
     const parsed = Number(config.value);
     return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.1;
+  }
+
+  // 🆕 MULTI-DESTINATION: biaya tambahan per titik tujuan EKSTRA (di luar
+  // tujuan pertama), dapat diatur Admin lewat PlatformConfig key
+  // 'ADDITIONAL_STOP_FEE'. Default Rp3.000/titik tambahan kalau Admin
+  // belum pernah mengatur -- angka wajar untuk kompensasi waktu berhenti
+  // tambahan bagi driver, konsisten dengan pola tarif multi-stop di
+  // platform ride-hailing pada umumnya.
+  async getAdditionalStopFee(): Promise<number> {
+    const config = await this.tariffRepo.getConfig('ADDITIONAL_STOP_FEE');
+    if (!config) return 3000;
+    const parsed = Number(config.value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
   }
 }

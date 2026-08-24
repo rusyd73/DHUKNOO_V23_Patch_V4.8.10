@@ -367,7 +367,7 @@ async function main() {
       { zoneId: zoneMalang.id, serviceType: ServiceType.BIKE, baseFare: 6000, pickupFee: 1500, perKmFee: 2200, perMinuteWaitFee: 250 },
     ],
   });
-  console.log('💲 Seeded PricingRule untuk BIKE/CAR/SEND (fallback + zona Batu & Malang).');
+  console.log('💲 Seeded PricingRule untuk BIKE/CAR/SEND/MART (fallback + zona Batu & Malang).');
 
   await prisma.regionalPolicy.create({
     data: {

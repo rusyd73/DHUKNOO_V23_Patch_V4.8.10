@@ -14,7 +14,18 @@ const getStoredToken = () => localStorage.getItem("dhuknoo_token");
 export const socket = io(getApiBaseUrl(), {
   transports: ["websocket"],
   autoConnect: false,
-  auth: { token: getStoredToken() },
+  // 🆕 FIX ("driver online >15 menit, socket reconnect pakai token basi"):
+  // sebelumnya `auth: { token: getStoredToken() }` -- object literal ini
+  // dievaluasi SEKALI saat file ini pertama dimuat, nilainya "dibekukan"
+  // selamanya. Setiap kali socket reconnect (mis. setelah HP di-lock,
+  // app di-background, jaringan sempat putus -- lumrah terjadi driver
+  // yang online lama menunggu order), token BASI yang sama tetap
+  // dikirim walau access token aslinya sudah lama kadaluarsa (15 menit),
+  // sehingga handshake ditolak dan driver diam-diam berhenti menerima
+  // notifikasi order sama sekali. Sekarang `auth` berupa function --
+  // socket.io-client memanggilnya ulang di SETIAP percobaan (re)connect,
+  // jadi selalu ambil token TERBARU dari localStorage.
+  auth: (cb) => cb({ token: getStoredToken() }),
   
   // ✅ TAMBAHAN: Konfigurasi reconnect
   reconnection: true,
@@ -120,6 +131,28 @@ export function onReportReady(callback: (payload: ReportReadyPayload) => void): 
   socket.on("report_ready", handler);
   return () => {
     socket.off("report_ready", handler);
+  };
+}
+
+// ============================================
+// FORCE LOGOUT EVENT (single-device login lock)
+// ============================================
+export interface ForceLogoutPayload {
+  reason: string;
+  at: string;
+}
+
+/**
+ * Dengarkan event `force_logout` (dikirim backend lewat SocketService.emitToUser
+ * di auth.service.ts setiap kali akun yang sama login dari device/tab lain --
+ * fitur "penguncian hanya 1 akun login pada satu waktu"). Balikin fungsi
+ * unsubscribe supaya gampang dibersihkan di useEffect cleanup.
+ */
+export function onForceLogout(callback: (payload: ForceLogoutPayload) => void): () => void {
+  const handler = (payload: ForceLogoutPayload) => callback(payload);
+  socket.on("force_logout", handler);
+  return () => {
+    socket.off("force_logout", handler);
   };
 }
 

@@ -266,6 +266,7 @@ export default function AdminRecapSection({ triggerToast }: { triggerToast: (m: 
                   <th className="py-3 px-4 font-bold">ID Order</th>
                   <th className="py-3 px-4 font-bold">Rute Perjalanan</th>
                   <th className="py-3 px-4 font-bold">Para Pihak</th>
+                  <th className="py-3 px-4 font-bold text-right">Jarak</th>
                   <th className="py-3 px-4 font-bold text-right">Tarif Bruto</th>
                   <th className="py-3 px-4 font-bold text-right">Komisi Platform (8%)</th>
                 </tr>
@@ -289,6 +290,7 @@ export default function AdminRecapSection({ triggerToast }: { triggerToast: (m: 
                         <span className="text-gray-300 block">Pemesan: <b className="text-white">{r.customerName}</b></span>
                         <span className="text-gray-300 block">Driver: <b className="text-white">{r.driverName}</b></span>
                       </td>
+                      <td className="py-3 px-4 text-right font-bold text-white">{Number(r.distanceKm || 0).toFixed(2)} km</td>
                       <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.grossPrice)}</td>
                       <td className="py-3 px-4 text-right font-black text-[#00E575] text-sm">
                         {formatRupiah(r.platformRevenue)}

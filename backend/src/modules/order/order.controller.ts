@@ -13,6 +13,17 @@ import { AuditLogger } from '../../core/logging/audit.logger';
 export class OrderController {
   private orderService = new OrderService();
 
+  giveTip = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const result = await this.orderService.giveDriverTip(req.user!.id, req.params.id, req.body?.amount);
+      return res.status(200).json({ message: 'Tips berhasil dikirim 100% kepada driver.', data: result });
+    } catch (err: any) {
+      logger.error('OrderController.giveTip error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Gagal mengirim tips.' });
+    }
+  };
+
   create = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
@@ -33,6 +44,17 @@ export class OrderController {
   };
 
   // 🆕 (Link Merchant <-> Order): checkout keranjang belanja dari satu toko.
+  previewMerchantCheckout = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const breakdown = await this.orderService.previewMerchantOrder(req.body);
+      return res.status(200).json({ breakdown });
+    } catch (err: any) {
+      logger.error('OrderController.previewMerchantCheckout error: %s', err.message);
+      const status = err instanceof AppError ? err.statusCode : 500;
+      return res.status(status).json({ error: err.message || 'Gagal menghitung total pesanan.' });
+    }
+  };
+
   checkoutMerchant = async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.user!.id;
@@ -69,8 +91,28 @@ export class OrderController {
       return res.status(200).json({ message: 'Order berhasil diterima!', order });
     } catch (err: any) {
       logger.error('OrderController.accept error: %s', err.message);
+      try {
+        await AuditLogger.log(req.user!.id, 'DRIVER_ACCEPT_REJECTED', `Accept order #${req.params.id} ditolak: ${err.message}`);
+      } catch {
+        // Audit best-effort; respons utama tidak boleh berubah bila audit gagal.
+      }
       const status = err instanceof AppError ? err.statusCode : 500;
       return res.status(status).json({ error: err.message || 'Gagal menerima order.' });
+    }
+  };
+
+  updateStopStatus = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const userId = req.user!.id;
+      const { id, stopId } = req.params;
+      const { status } = req.body;
+      if (!['ARRIVED', 'COMPLETED'].includes(status)) return res.status(400).json({ error: 'Status tujuan harus ARRIVED atau COMPLETED.' });
+      const order = await this.orderService.updateStopStatus(userId, id, stopId, status);
+      return res.status(200).json({ message: status === 'ARRIVED' ? 'Tiba di tujuan.' : 'Tujuan selesai, lanjut ke tujuan berikutnya.', order });
+    } catch (err: any) {
+      logger.error('OrderController.updateStopStatus error: %s', err.message);
+      const code = err instanceof AppError ? err.statusCode : 500;
+      return res.status(code).json({ error: err.message || 'Gagal memperbarui tujuan.' });
     }
   };
 
@@ -83,7 +125,17 @@ export class OrderController {
 
       await AuditLogger.log(userId, 'ORDER_STATUS_UPDATE', `Order #${id} status diubah menjadi ${status}`);
 
-      return res.status(200).json({ message: 'Status order berhasil diperbarui!', order });
+      const isMart = order.serviceType === 'MART';
+      const isSend = order.serviceType === 'SEND';
+      const statusMessage: Record<string, string> = {
+        ON_THE_WAY: isMart ? 'Menuju lokasi merchant.' : isSend ? 'Menuju lokasi pengambilan barang.' : 'Menuju lokasi jemput customer.',
+        ARRIVED: isMart ? 'Tiba di lokasi merchant.' : isSend ? 'Tiba di lokasi pengambilan barang.' : 'Tiba di lokasi jemput customer.',
+        PICKED_UP: isMart ? 'Pesanan diambil dan menuju customer.' : isSend ? 'Barang diambil dan menuju lokasi penerima.' : 'Customer dijemput dan menuju lokasi tujuan.',
+        ARRIVED_CUSTOMER: isMart ? 'Tiba di lokasi customer.' : isSend ? 'Tiba di lokasi penerima barang.' : 'Tiba di lokasi tujuan customer.',
+        COMPLETED: 'Order telah selesai.',
+        CANCELLED: 'Order telah dibatalkan.',
+      };
+      return res.status(200).json({ message: statusMessage[status] || 'Status order berhasil diperbarui!', order });
     } catch (err: any) {
       logger.error('OrderController.updateStatus error: %s', err.message);
       const status = err instanceof AppError ? err.statusCode : 500;

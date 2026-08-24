@@ -70,6 +70,10 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
   const [dropoffCoords, setDropoffCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [paymentMethod, setPaymentMethod] = useState<'WALLET' | 'CASH'>('WALLET');
   const [submitting, setSubmitting] = useState(false);
+  const [preview, setPreview] = useState<{ itemsSubtotal: number; deliveryFee: number; additionalFees: number; discount: number; distanceKm: number; totalPayable: number } | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewError, setPreviewError] = useState('');
+  const [previewRefresh, setPreviewRefresh] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -127,6 +131,38 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
   const cartTotal = cartLines.reduce((sum, line) => sum + Number(line.product.price) * line.quantity, 0);
   const cartCount = cartLines.reduce((sum, line) => sum + line.quantity, 0);
 
+  useEffect(() => {
+    if (step !== 'checkout' || !selectedMerchant || !dropoffAddress || !dropoffCoords || cartLines.length === 0) {
+      setPreview(null);
+      setPreviewError('');
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setPreviewing(true);
+      setPreviewError('');
+      try {
+        const response = await CustomerAPI.previewMerchantCheckout({
+          merchantId: selectedMerchant.id,
+          items: cartLines.map((line) => ({ productId: line.product.id, quantity: line.quantity })),
+          dropoffAddress,
+          dropoffLat: dropoffCoords.lat,
+          dropoffLng: dropoffCoords.lng,
+          paymentMethod,
+        });
+        if (!cancelled) setPreview(response.breakdown);
+      } catch (err: any) {
+        if (!cancelled) {
+          setPreview(null);
+          setPreviewError(err.response?.data?.error || 'Gagal menghitung total. Pilih ulang titik pengantaran.');
+        }
+      } finally {
+        if (!cancelled) setPreviewing(false);
+      }
+    }, 500);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [step, selectedMerchant, dropoffAddress, dropoffCoords, cart, paymentMethod, previewRefresh]);
+
   const filteredMerchants = merchants.filter(
     (m) =>
       m.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -142,6 +178,10 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
       triggerToast('Pilih alamat pengantaran di peta terlebih dahulu!');
       return;
     }
+    if (!preview || previewing) {
+      triggerToast('Tunggu sampai total pembayaran selesai dihitung.');
+      return;
+    }
     setSubmitting(true);
     try {
       await CustomerAPI.checkoutMerchant({
@@ -151,11 +191,16 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
         dropoffLat: dropoffCoords.lat,
         dropoffLng: dropoffCoords.lng,
         paymentMethod,
+        expectedTotal: preview.totalPayable,
       });
       triggerToast(`✅ Pesanan dari ${selectedMerchant!.name} berhasil dibuat! Mencari driver...`);
       onCheckoutSuccess();
       onClose();
     } catch (err: any) {
+      if (err.response?.status === 409) {
+        setPreview(null);
+        setPreviewRefresh((value) => value + 1);
+      }
       triggerToast(err.response?.data?.error || 'Gagal membuat pesanan.');
     } finally {
       setSubmitting(false);
@@ -302,7 +347,12 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
                   <span>Subtotal Belanja</span>
                   <span>Rp{cartTotal.toLocaleString('id-ID')}</span>
                 </div>
-                <p className="text-[10px] text-[#A5C9B8] mt-1">+ ongkos antar (dihitung otomatis dari jarak toko ke alamat Anda)</p>
+                <div className="flex justify-between text-sm text-white mt-1"><span>Ongkos antar</span><span>{preview ? `Rp${preview.deliveryFee.toLocaleString('id-ID')}` : previewing ? 'Menghitung...' : '-'}</span></div>
+                {preview && preview.additionalFees > 0 && <div className="flex justify-between text-xs text-[#A5C9B8] mt-1"><span>Termasuk biaya tambahan</span><span>Rp{preview.additionalFees.toLocaleString('id-ID')}</span></div>}
+                {preview && preview.discount > 0 && <div className="flex justify-between text-sm text-[#00E575] mt-1"><span>Diskon</span><span>-Rp{preview.discount.toLocaleString('id-ID')}</span></div>}
+                <div className="border-t border-[#23583E] mt-2 pt-2 flex justify-between text-base font-black text-[#00E575]"><span>Total Pembayaran</span><span>{preview ? `Rp${preview.totalPayable.toLocaleString('id-ID')}` : '-'}</span></div>
+                {preview && <p className="text-[10px] text-[#A5C9B8] mt-1">Jarak pengantaran {preview.distanceKm.toFixed(2)} km · dihitung oleh server</p>}
+                {previewError && <p className="text-[10px] text-red-400 mt-1">{previewError}</p>}
               </div>
 
               <div>
@@ -341,10 +391,10 @@ export default function MerchantOrderModal({ onClose, onCheckoutSuccess, trigger
 
               <button
                 onClick={handleCheckout}
-                disabled={submitting}
+                disabled={submitting || previewing || !preview}
                 className="px-4 py-3 rounded-xl bg-[#FF6B6B] text-[#06170E] font-black hover:bg-[#FF8787] transition-all disabled:opacity-60"
               >
-                {submitting ? 'Memproses...' : `Buat Pesanan — Rp${cartTotal.toLocaleString('id-ID')}+`}
+                {submitting ? 'Memproses...' : previewing ? 'Menghitung Total...' : preview ? `Buat Pesanan — Rp${preview.totalPayable.toLocaleString('id-ID')}` : 'Pilih Titik Pengantaran'}
               </button>
             </div>
           )}

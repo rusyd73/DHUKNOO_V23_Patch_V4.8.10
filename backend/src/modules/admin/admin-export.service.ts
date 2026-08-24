@@ -40,6 +40,15 @@ export async function buildRecapExcel(recap: AdminRecap): Promise<Buffer> {
     { metric: 'Total Transaksi', value: recap.summary.totalTransactionsCount },
     { metric: 'Total Volume Transaksi', value: formatRupiah(recap.summary.totalVolumeValue) },
     { metric: 'Total Revenue Platform', value: formatRupiah(recap.summary.totalPlatformRevenue) },
+    { metric: 'Withdrawal Diajukan', value: formatRupiah(recap.withdrawalSummary.totalRequested) },
+    { metric: 'Withdrawal Diproses', value: formatRupiah(recap.withdrawalSummary.totalProcessing) },
+    { metric: 'Withdrawal Berhasil', value: formatRupiah(recap.withdrawalSummary.totalCompleted) },
+    { metric: 'Withdrawal Gagal/Refund', value: formatRupiah(recap.withdrawalSummary.totalFailedRefunded) },
+    { metric: 'Total Merchant', value: recap.merchantSummary?.total ?? recap.summary.totalMerchantsCount ?? 0 },
+    { metric: 'Merchant Aktif', value: recap.merchantSummary?.active ?? recap.summary.activeMerchantsCount ?? 0 },
+    { metric: 'Merchant Tidak Aktif', value: recap.merchantSummary?.inactive ?? recap.summary.inactiveMerchantsCount ?? 0 },
+    { metric: 'Akun Pemilik Nonaktif', value: recap.merchantSummary?.ownerInactive ?? recap.summary.ownerInactiveMerchantsCount ?? 0 },
+    { metric: 'Merchant Terdaftar dalam Periode', value: recap.merchantSummary?.registeredInTimeframe ?? recap.summary.merchantsRegisteredInTimeframe ?? 0 },
     { metric: '', value: '' },
     { metric: '── Arus Kas per Metode Pembayaran ──', value: '' },
     ...recap.paymentMethodBreakdown.map((b) => ({
@@ -88,7 +97,34 @@ export async function buildRecapExcel(recap: AdminRecap): Promise<Buffer> {
   );
   driverSheet.getRow(1).font = { bold: true };
 
-  // ── Sheet 4: Transaksi ──────────────────────────────────────────────
+  // ── Sheet 4: Merchant ───────────────────────────────────────────────
+  const merchantSheet = workbook.addWorksheet('Merchant');
+  merchantSheet.columns = [
+    { header: 'Nama Merchant', key: 'name', width: 26 },
+    { header: 'Pemilik', key: 'ownerName', width: 24 },
+    { header: 'Email Pemilik', key: 'ownerEmail', width: 28 },
+    { header: 'Kategori', key: 'category', width: 18 },
+    { header: 'No. HP', key: 'phone', width: 16 },
+    { header: 'Alamat', key: 'address', width: 42 },
+    { header: 'Latitude', key: 'latitude', width: 14 },
+    { header: 'Longitude', key: 'longitude', width: 14 },
+    { header: 'Status Merchant', key: 'status', width: 18 },
+    { header: 'Akun Pemilik Aktif', key: 'ownerIsActive', width: 18 },
+    { header: 'Produk', key: 'productCount', width: 10 },
+    { header: 'Order', key: 'orderCount', width: 10 },
+    { header: 'Terdaftar', key: 'registeredAt', width: 20 },
+  ];
+  (recap.merchants || []).forEach((m) =>
+    merchantSheet.addRow({
+      ...m,
+      status: m.status === 'ACTIVE' ? 'Aktif' : m.status === 'INACTIVE' ? 'Tidak Aktif' : m.status === 'OWNER_INACTIVE' ? 'Pemilik Nonaktif' : 'Tanpa Pemilik',
+      ownerIsActive: m.ownerIsActive ? 'Ya' : 'Tidak',
+      registeredAt: formatDate(m.registeredAt),
+    })
+  );
+  merchantSheet.getRow(1).font = { bold: true };
+
+  // ── Sheet 5: Transaksi ──────────────────────────────────────────────
   const txSheet = workbook.addWorksheet('Transaksi');
   txSheet.columns = [
     { header: 'ID Order', key: 'id', width: 38 },
@@ -116,14 +152,38 @@ export async function buildRecapExcel(recap: AdminRecap): Promise<Buffer> {
     { header: 'Layanan', key: 'serviceType', width: 12 },
     { header: 'Customer', key: 'customerName', width: 22 },
     { header: 'Driver', key: 'driverName', width: 22 },
+    { header: 'Jarak (km)', key: 'distanceKm', width: 12 },
     { header: 'Harga Kotor (Rp)', key: 'grossPrice', width: 16 },
     { header: 'Diskon (Rp)', key: 'discount', width: 14 },
+    { header: 'Subtotal Barang (Rp)', key: 'itemsSubtotal', width: 20 },
+    { header: 'Ongkos Layanan (Rp)', key: 'deliveryFee', width: 20 },
     { header: 'Harga Bersih (Rp)', key: 'netPrice', width: 16 },
     { header: 'Revenue Platform (Rp)', key: 'platformRevenue', width: 18 },
     { header: 'Waktu', key: 'createdAt', width: 20 },
   ];
   recap.platformRevenues.forEach((r) => revenueSheet.addRow({ ...r, createdAt: formatDate(r.createdAt) }));
   revenueSheet.getRow(1).font = { bold: true };
+
+  const withdrawalSheet = workbook.addWorksheet('Withdrawal Mitra');
+  withdrawalSheet.columns = [
+    { header: 'ID', key: 'id', width: 38 },
+    { header: 'Nama Mitra', key: 'userName', width: 24 },
+    { header: 'Peran', key: 'role', width: 12 },
+    { header: 'Nominal (Rp)', key: 'amount', width: 16 },
+    { header: 'Metode', key: 'method', width: 16 },
+    { header: 'Bank/E-Wallet', key: 'destinationProvider', width: 18 },
+    { header: 'Rekening Tujuan', key: 'destinationAccount', width: 22 },
+    { header: 'Nama Rekening', key: 'destinationName', width: 24 },
+    { header: 'Status Internal', key: 'status', width: 18 },
+    { header: 'Provider Payout', key: 'payoutProvider', width: 16 },
+    { header: 'Status Provider', key: 'providerStatus', width: 18 },
+    { header: 'Referensi', key: 'payoutReference', width: 38 },
+    { header: 'Kode Gagal', key: 'failureCode', width: 22 },
+    { header: 'Diajukan', key: 'createdAt', width: 20 },
+    { header: 'Selesai', key: 'completedAt', width: 20 },
+  ];
+  recap.withdrawals.forEach((w) => withdrawalSheet.addRow({ ...w, createdAt: formatDate(w.createdAt), completedAt: w.completedAt ? formatDate(w.completedAt) : '-' }));
+  withdrawalSheet.getRow(1).font = { bold: true };
 
   const arrayBuffer = await workbook.xlsx.writeBuffer();
   return Buffer.from(arrayBuffer);
@@ -159,6 +219,14 @@ export function buildRecapPdf(recap: AdminRecap): Promise<Buffer> {
       ['Total Transaksi', String(recap.summary.totalTransactionsCount)],
       ['Total Volume Transaksi', formatRupiah(recap.summary.totalVolumeValue)],
       ['Total Revenue Platform', formatRupiah(recap.summary.totalPlatformRevenue)],
+      ['Withdrawal Diajukan', formatRupiah(recap.withdrawalSummary.totalRequested)],
+      ['Withdrawal Diproses', formatRupiah(recap.withdrawalSummary.totalProcessing)],
+      ['Withdrawal Berhasil', formatRupiah(recap.withdrawalSummary.totalCompleted)],
+      ['Withdrawal Gagal/Refund', formatRupiah(recap.withdrawalSummary.totalFailedRefunded)],
+      ['Total Merchant', String(recap.merchantSummary?.total ?? recap.summary.totalMerchantsCount ?? 0)],
+      ['Merchant Aktif', String(recap.merchantSummary?.active ?? recap.summary.activeMerchantsCount ?? 0)],
+      ['Merchant Tidak Aktif', String(recap.merchantSummary?.inactive ?? recap.summary.inactiveMerchantsCount ?? 0)],
+      ['Pemilik Nonaktif', String(recap.merchantSummary?.ownerInactive ?? recap.summary.ownerInactiveMerchantsCount ?? 0)],
     ];
     doc.fontSize(10).fillColor('#111111');
     kpis.forEach(([label, value]) => {
@@ -212,6 +280,14 @@ export function buildRecapPdf(recap: AdminRecap): Promise<Buffer> {
       doc.y = y + 15;
       doc.x = startX;
     };
+
+    const merchantRows = (recap.merchants || []).slice(0, 20);
+    drawTable(
+      `Merchant Terdaftar (${merchantRows.length} ditampilkan)`,
+      ['Merchant', 'Kategori', 'Status', 'Alamat'],
+      merchantRows.map((m) => [m.name, m.category, m.status === 'ACTIVE' ? 'Aktif' : m.status === 'INACTIVE' ? 'Tidak Aktif' : m.status === 'OWNER_INACTIVE' ? 'Pemilik Nonaktif' : 'Tanpa Pemilik', m.address]),
+      [150, 90, 90, 220]
+    );
 
     // Top 15 driver berdasarkan perolehan
     const topDrivers = [...recap.drivers].sort((a, b) => b.perolehan - a.perolehan).slice(0, 15);

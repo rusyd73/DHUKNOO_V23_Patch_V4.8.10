@@ -179,6 +179,11 @@ const toggleStatusHandler = async (req: AuthenticatedRequest, res: Response) => 
             driverId: driverProfile.id,
           }
         );
+        // Driver yang baru online harus melakukan discovery dari database,
+        // bukan hanya menunggu event order yang dibuat sesudah ia online.
+        SocketService.emitToUser(userId, "jobs_refresh_required", {
+          reason: "DRIVER_WENT_ONLINE",
+        });
       }
 
       return res.status(200).json({

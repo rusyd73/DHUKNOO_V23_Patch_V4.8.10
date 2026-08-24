@@ -2,15 +2,57 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { formatRupiah } from '@obama/shared-utils';
+import { getApiBaseUrl } from '@obama/shared-api';
 import { openWhatsAppMessage, sendAdminThankYouChat } from '../../utils/whatsapp';
 import { PaymentAPI, AdminAPI } from '../../api';
-import { UserCheck, ExternalLink, MessageCircle, PhoneCall } from 'lucide-react';
+import { UserCheck, MessageCircle, PhoneCall } from 'lucide-react';
 
 // (Tempelkan semua kode fungsi ReviewPanel Anda yang asli di sini...)
 function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<'proofs' | 'topups' | 'documents'>('proofs');
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [driverDocumentPreviewUrls, setDriverDocumentPreviewUrls] = useState<Record<string, string>>({});
+  const [loadingDriverDocumentId, setLoadingDriverDocumentId] = useState<string | null>(null);
+  const driverDocumentPreviewUrlsRef = React.useRef<Record<string, string>>({});
+
+  // Bukti bayar lama pada beberapa order bisa masih tersimpan sebagai
+  // path relatif (/uploads/...). Saat frontend berjalan di Vite :5173,
+  // path relatif akan salah menuju Vite dan SPA fallback dapat membuka
+  // dashboard. Selalu resolve media relatif ke backend API origin.
+  const resolveMediaUrl = React.useCallback((value?: string | null) => {
+    if (!value) return '';
+    if (/^(https?:|data:|blob:)/i.test(value)) return value;
+    const base = getApiBaseUrl().replace(/\/$/, '');
+    return `${base}${value.startsWith('/') ? value : `/${value}`}`;
+  }, []);
+
+  const loadDriverDocumentPreview = React.useCallback(async (documentId: string) => {
+    const cached = driverDocumentPreviewUrls[documentId];
+    if (cached) {
+      setPreviewImageUrl(cached);
+      return;
+    }
+
+    setLoadingDriverDocumentId(documentId);
+    try {
+      const blob = await AdminAPI.getDriverDocumentFile(documentId);
+      const objectUrl = URL.createObjectURL(blob);
+      driverDocumentPreviewUrlsRef.current[documentId] = objectUrl;
+      setDriverDocumentPreviewUrls((current) => ({ ...current, [documentId]: objectUrl }));
+      setPreviewImageUrl(objectUrl);
+    } catch (err: any) {
+      triggerToast(err.response?.data?.error || 'Dokumen driver tidak dapat ditampilkan.');
+    } finally {
+      setLoadingDriverDocumentId(null);
+    }
+  }, [driverDocumentPreviewUrls, triggerToast]);
+
+  React.useEffect(() => {
+    return () => {
+      Object.values(driverDocumentPreviewUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
 
   const { data: proofsData } = useQuery({ queryKey: ['pendingProofs'], queryFn: PaymentAPI.getPendingProofs });
   const { data: documentsData } = useQuery({ queryKey: ['pendingDriverDocuments'], queryFn: AdminAPI.getPendingDriverDocuments });
@@ -114,11 +156,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div
-                    onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img
-                      src={p.proofImageUrl}
+                      src={resolveMediaUrl(p.proofImageUrl)}
                       alt="Bukti Bayar Order"
                       className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105"
                     />
@@ -129,19 +171,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(p.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Bukti Bayar High-Res
                     </button>
-                    <a
-                      href={p.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(p.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -237,11 +278,11 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
                   </div>
                   <div 
-                    onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                    onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                     className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
                   >
                     <img 
-                      src={t.proofImageUrl} 
+                      src={resolveMediaUrl(t.proofImageUrl)} 
                       alt="Bukti Bayar Topup" 
                       className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105" 
                     />
@@ -252,19 +293,18 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                   <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(t.proofImageUrl)}
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
                       🔍 Lightbox Zoom Dokumen High-Res
                     </button>
-                    <a
-                      href={t.proofImageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setPreviewImageUrl(resolveMediaUrl(t.proofImageUrl))}
                       className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
                     >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
+                      🔍 Perbesar / Tinjau Bukti
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -325,37 +365,38 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
                     <span className="font-bold text-white flex items-center gap-1">
                       📄 Dokumen Driver ({d.type}):
                     </span>
-                    <span className="text-[#00E575] font-semibold">Klik gambar untuk zoom</span>
+                    <span className="text-[#00E575] font-semibold">Pratinjau aman melalui API Admin</span>
                   </div>
-                  <div 
-                    onClick={() => setPreviewImageUrl(d.imageUrl)}
-                    className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer max-h-52 flex items-center justify-center p-1"
+                  <button
+                    type="button"
+                    onClick={() => loadDriverDocumentPreview(d.id)}
+                    disabled={loadingDriverDocumentId === d.id}
+                    className="relative group rounded-xl overflow-hidden border border-[#23583E] bg-black/50 cursor-pointer min-h-24 max-h-52 flex items-center justify-center p-1 disabled:opacity-60"
                   >
-                    <img 
-                      src={d.imageUrl} 
-                      alt="Dokumen Driver" 
-                      className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105" 
-                    />
+                    {driverDocumentPreviewUrls[d.id] ? (
+                      <img
+                        src={driverDocumentPreviewUrls[d.id]}
+                        alt="Dokumen Driver"
+                        className="w-full max-h-48 object-contain rounded-lg transition-transform duration-300 group-hover:scale-105"
+                      />
+                    ) : (
+                      <span className="text-[10px] text-[#A5C9B8]">
+                        {loadingDriverDocumentId === d.id ? 'Memuat dokumen...' : '🔐 Klik untuk melihat dokumen'}
+                      </span>
+                    )}
                     <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-[10px] font-bold gap-1 rounded-lg">
                       🔍 Perbesar Dokumen Driver Lightbox
                     </div>
-                  </div>
-                  <div className="flex justify-between items-center text-[9px] pt-1.5 border-t border-[#23583E]">
+                  </button>
+                  <div className="flex justify-end items-center text-[9px] pt-1.5 border-t border-[#23583E]">
                     <button
                       type="button"
-                      onClick={() => setPreviewImageUrl(d.imageUrl)}
-                      className="text-[#00E575] text-[10px] font-bold hover:underline flex items-center gap-1"
+                      onClick={() => loadDriverDocumentPreview(d.id)}
+                      disabled={loadingDriverDocumentId === d.id}
+                      className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1 disabled:opacity-50"
                     >
-                      🔍 Lightbox Zoom Dokumen High-Res
+                      🔍 Perbesar / Tinjau Dokumen
                     </button>
-                    <a
-                      href={d.imageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-[#FFD700] text-[10px] font-bold hover:underline flex items-center gap-1"
-                    >
-                      <ExternalLink className="w-3 h-3" /> Buka Link Dokumen Asli
-                    </a>
                   </div>
                 </div>
               ) : (
@@ -399,14 +440,7 @@ function ReviewPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
               <img src={previewImageUrl} alt="Dokumen" className="w-full object-contain" />
             </div>
             <div className="flex gap-2">
-              <a
-                href={previewImageUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 bg-[#06170E] hover:bg-[#23583E] text-[#FFD700] border border-[#23583E] font-bold py-2 rounded-xl text-xs text-center flex items-center justify-center gap-1 transition-all"
-              >
-                <ExternalLink className="w-3.5 h-3.5" /> Buka Link Dokumen Asli
-              </a>
+
               <button
                 onClick={() => setPreviewImageUrl(null)}
                 className="flex-1 bg-[#00E575] hover:bg-[#00ff80] text-[#06170E] font-black py-2 rounded-xl text-xs transition-all"

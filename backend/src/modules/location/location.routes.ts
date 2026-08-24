@@ -52,6 +52,13 @@ router.get(
     locationController.listOnline as any
 );
 
+router.get(
+    "/drivers/nearby-availability",
+    authenticateToken as any,
+    authorizeRoles("CUSTOMER") as any,
+    locationController.nearbyAvailability as any
+);
+
 /*
 |--------------------------------------------------------------------------
 | Map Engine

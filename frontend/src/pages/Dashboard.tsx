@@ -2,6 +2,7 @@
 import React, { useEffect, useState } from 'react';
 import { useAuthStore } from '../store/useAuthStore';
 import { merchantApi } from '../api/merchant.api';
+import { WithdrawalPanel } from '../components/wallet/WithdrawalPanel';
 import { 
   ResponsiveContainer, AreaChart, Area, BarChart, Bar, 
   XAxis, YAxis, Tooltip, CartesianGrid, Legend 
@@ -247,6 +248,8 @@ export function MerchantDashboard({ onNavigateTab, triggerToast }: MerchantDashb
           change="+21.5% bulan ini"
         />
       </div>
+
+      <WithdrawalPanel />
 
       {/* ==========================================
           CHART SECTION (From File 1 - Enhanced)
