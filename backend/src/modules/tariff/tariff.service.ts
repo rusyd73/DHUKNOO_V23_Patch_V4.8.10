@@ -2,6 +2,7 @@ import { ServiceType } from '@prisma/client';
 import { TariffRepository } from './tariff.repository';
 import { AppError } from '../../core/errors/AppError';
 import { logger } from '../../config/logger';
+import { calculatePlatformContribution } from './monetization.policy';
 
 export interface TariffCalculationInput {
   serviceType: ServiceType;
@@ -256,8 +257,14 @@ export class TariffEngineService {
     const finalFare = roundRupiah(Math.max(0, subtotal - promoDiscount));
 
     const { rate: commissionRate, tariffVersionId } = await this.resolveCommissionRate(finalFare);
-    const commissionAmount = roundRupiah(finalFare * commissionRate);
-    const driverEarning = finalFare - commissionAmount;
+    const platformContribution = calculatePlatformContribution(input.serviceType, finalFare, commissionRate);
+    // FIX: commissionAmount tidak boleh melebihi finalFare -- kalau tidak,
+    // preview/breakdown tarif bisa menampilkan komisi lebih besar dari total
+    // ongkos (mis. minimumPlatformContribution BIKE Rp1.000 pada order
+    // Rp800), tidak konsisten dengan payment.service.ts (calculatePaymentSplit)
+    // yang sudah meng-cap platformFee ke amountToCharge.
+    const commissionAmount = Math.min(finalFare, platformContribution.contribution);
+    const driverEarning = Math.max(0, finalFare - commissionAmount);
 
     return {
       baseFare,
@@ -346,10 +353,14 @@ export class TariffEngineService {
   }
 
   async getMerchantPlatformFeeRate(): Promise<number> {
+    // MONETIZATION_V1: default standar 3% (lihat MONETIZATION_V1.merchantFee.standardRate
+    // dan seed PlatformConfig 'MERCHANT_PLATFORM_FEE_RATE'). Sebelumnya fallback ini 0.1
+    // (10%), tidak sinkron dengan nilai seed 0.03 -- environment yang belum menjalankan
+    // seed/migration akan diam-diam kena rate berbeda dari kebijakan V1.
     const config = await this.tariffRepo.getConfig('MERCHANT_PLATFORM_FEE_RATE');
-    if (!config) return 0.1;
+    if (!config) return 0.03;
     const parsed = Number(config.value);
-    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.1;
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.03;
   }
 
   // 🆕 MULTI-DESTINATION: biaya tambahan per titik tujuan EKSTRA (di luar

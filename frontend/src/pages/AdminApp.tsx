@@ -953,32 +953,32 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
       {/* ── COMMISSION AUDIT (BAR CHART & METRICS) ── */}
       {activeTab === 'commissionAudit' && (
         <div className="flex flex-col gap-5">
-          {/* Summary KPI Cards */}
+          {/* Summary KPI Cards — accounting source of truth */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div className="bg-[#06170E] border border-[#00E575]/30 p-3.5 rounded-xl flex flex-col justify-between">
               <span className="text-[10px] text-[#A5C9B8] uppercase font-bold flex items-center gap-1">
-                <DollarSign className="w-3.5 h-3.5 text-[#00E575]" /> Total Komisi (7 Hari)
+                <DollarSign className="w-3.5 h-3.5 text-[#00E575]" /> Gross Contribution (7 Hari)
               </span>
               <span className="text-lg font-black text-[#00E575] mt-1">
-                {formatRupiah(auditData?.summary?.totalCommissionEarned || 0)}
+                {formatRupiah(auditData?.summary?.grossPlatformContribution || 0)}
+              </span>
+            </div>
+
+            <div className="bg-[#06170E] border border-orange-400/30 p-3.5 rounded-xl flex flex-col justify-between">
+              <span className="text-[10px] text-[#A5C9B8] uppercase font-bold flex items-center gap-1">
+                <TrendingUp className="w-3.5 h-3.5 text-orange-400" /> Pickup Subsidy (7 Hari)
+              </span>
+              <span className="text-lg font-black text-orange-400 mt-1">
+                -{formatRupiah(auditData?.summary?.totalPickupSubsidy || 0)}
               </span>
             </div>
 
             <div className="bg-[#06170E] border border-[#FFD700]/30 p-3.5 rounded-xl flex flex-col justify-between">
               <span className="text-[10px] text-[#A5C9B8] uppercase font-bold flex items-center gap-1">
-                <TrendingUp className="w-3.5 h-3.5 text-[#FFD700]" /> Komisi Hari Ini
+                <Percent className="w-3.5 h-3.5 text-[#FFD700]" /> Net Contribution (7 Hari)
               </span>
               <span className="text-lg font-black text-[#FFD700] mt-1">
-                {formatRupiah(auditData?.summary?.todayCommission || 0)}
-              </span>
-            </div>
-
-            <div className="bg-[#06170E] border border-[#23583E] p-3.5 rounded-xl flex flex-col justify-between">
-              <span className="text-[10px] text-[#A5C9B8] uppercase font-bold flex items-center gap-1">
-                <Percent className="w-3.5 h-3.5 text-emerald-400" /> Rata-Rata Harian
-              </span>
-              <span className="text-lg font-black text-white mt-1">
-                {formatRupiah(auditData?.summary?.averageDailyCommission || 0)}
+                {formatRupiah(auditData?.summary?.netPlatformContribution || 0)}
               </span>
             </div>
 
@@ -997,10 +997,10 @@ function TariffPanel({ triggerToast }: { triggerToast: (msg: string) => void }) 
             <div className="flex justify-between items-center border-b border-[#23583E] pb-3">
               <div>
                 <h4 className="text-xs font-black text-white uppercase tracking-wider flex items-center gap-2">
-                  <TrendingUp className="w-4 h-4 text-[#00E575]" /> Grafik Komisi Platform Harian
+                  <TrendingUp className="w-4 h-4 text-[#00E575]" /> Grafik Net Contribution Platform Harian
                 </h4>
                 <p className="text-[10px] text-[#A5C9B8] mt-0.5">
-                  Visualisasi total pendapatan komisi bersih yang diperoleh sistem DHUKNOO per hari
+                  Gross contribution dikurangi pickup subsidy; bersumber dari Ledger dan fallback MONETIZATION_V1 untuk order legacy.
                 </p>
               </div>
               <button
@@ -1429,7 +1429,7 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
                   <th className="py-3 px-4 font-bold text-right">Subtotal Barang</th>
                   <th className="py-3 px-4 font-bold text-right">Ongkos Layanan</th>
                   <th className="py-3 px-4 font-bold text-right">Total Customer</th>
-                  <th className="py-3 px-4 font-bold text-right">Revenue Platform</th>
+                  <th className="py-3 px-4 font-bold text-right">Net Revenue Platform</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#23583E] text-[#A5C9B8]">
@@ -1455,8 +1455,11 @@ function AdminRecapSection({ triggerToast }: { triggerToast: (m: string) => void
                       <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.itemsSubtotal || 0)}</td>
                       <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.deliveryFee || 0)}</td>
                       <td className="py-3 px-4 text-right font-bold text-white">{formatRupiah(r.netPrice)}</td>
-                      <td className="py-3 px-4 text-right font-black text-[#00E575] text-sm">
-                        {formatRupiah(r.platformRevenue)}
+                      <td className={`py-3 px-4 text-right font-black text-sm ${Number(r.platformRevenue || 0) < 0 ? 'text-[#FF6B6B]' : 'text-[#00E575]'}`}>
+                        <span className="block">{formatRupiah(r.platformRevenue)}</span>
+                        <span className="block text-[9px] font-medium text-[#8FB7A4] mt-1">
+                          Gross {formatRupiah(r.grossPlatformContribution || 0)} − Pickup {formatRupiah(r.pickupSubsidy || 0)}
+                        </span>
                       </td>
                     </tr>
                   ))}

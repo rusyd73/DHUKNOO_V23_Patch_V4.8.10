@@ -207,7 +207,7 @@ export class JobService {
         },
         options: {
           minimumDeposit,
-          maxDistanceKm: 5,
+          maxDistanceKm: 3,
           maxDailyOrders: 20,
           checkLocationFreshness: false,
         },
@@ -326,7 +326,7 @@ export class JobService {
         },
         options: {
           minimumDeposit,
-          maxDistanceKm: 5,
+          maxDistanceKm: 3,
           maxDailyOrders: 20,
         },
       });

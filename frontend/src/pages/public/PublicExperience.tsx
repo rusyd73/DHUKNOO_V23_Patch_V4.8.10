@@ -108,9 +108,9 @@ function Landing({ go }: { go: (v: View) => void }) {
     <section className="mx-auto max-w-7xl px-4 py-16 md:px-6">
       <div className="mb-8 max-w-3xl"><span className="text-xs font-black uppercase tracking-[.18em] text-[#22C55E]">Satu ekosistem</span><h2 className="mt-2 text-3xl font-black text-white md:text-5xl">Murah tidak harus mengorbankan kualitas.</h2></div>
       <div className="grid gap-4 md:grid-cols-3">
-        <AudienceCard icon={<Users />} title="Untuk Customer" points={['Ride & Car untuk mobilitas', 'SEND untuk pengiriman barang', 'Merchant untuk kebutuhan lokal', 'Tip sukarela langsung untuk mitra']} />
-        <AudienceCard icon={<Bike />} title="Untuk Driver" points={['Order sesuai layanan & kendaraan', 'Status perjalanan yang jelas', 'Penghasilan dan deposit tercatat', 'Porsi mitra dijaga secara transparan']} />
-        <AudienceCard icon={<Store />} title="Untuk Merchant" points={['Nilai produk tetap milik merchant', 'Delivery dipisahkan dari nilai produk', 'Ekosistem lokal dalam satu platform', 'Tidak perlu mengatur pembagian driver/platform']} />
+        <AudienceCard icon={<Users />} title="Untuk Customer" points={['Layanan Ride & Car untuk mobilitas', 'Harga yang cukup kompetitif', 'SEND untuk pengiriman barang', 'Merchant untuk kebutuhan belaja lokal', 'Tip sukarela langsung untuk mitra']} />
+        <AudienceCard icon={<Bike />} title="Untuk Driver" points={['Order sesuai layanan & kendaraan', 'Status perjalanan yang jelas', 'Penghasilan dan deposit tercatat', 'Porsi mitra kami pastikan jauh lebih besar', 'Ekosistem dijaga secara sehat dan transparan']} />
+        <AudienceCard icon={<Store />} title="Untuk Merchant" points={['Nilai produk tetap milik merchant', 'Delivery dipisahkan dari nilai produk', 'Ekosistem lokal dalam satu platform', 'Tidak ada tambahan tidak ada potongan']} />
       </div>
     </section>
 

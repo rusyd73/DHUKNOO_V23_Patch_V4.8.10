@@ -8,6 +8,7 @@ import { DispatchLock } from "./dispatch.lock";
 import { DISPATCH_CONSTANTS } from "./dispatch.constants";
 import { prisma } from "../../config/prisma";
 import { logger } from "../../config/logger";
+import { ServiceType } from "@prisma/client";
 import { TariffEngineService } from "../tariff/tariff.service";
 import { getOrderNumber } from "../../core/utils/order-number";
 import {
@@ -16,6 +17,7 @@ import {
   DispatchResult,
 } from "./dispatch.types";
 import { DriverPickupCompensationService } from "../driver/services/driver-pickup-compensation.service";
+import { calculateSmartPickupCompensation, projectedNetContribution } from "../tariff/monetization.policy";
 
 export class DispatchService {
   private pickupCompensationService = new DriverPickupCompensationService();
@@ -81,7 +83,7 @@ export class DispatchService {
           },
           options: {
             minimumDeposit: await this.tariffEngine.getMinimumDriverDeposit(),
-            maxDistanceKm: 5,
+            maxDistanceKm: 3, // MONETIZATION_V1: extended radius diturunkan dari 5km -> 3km
             maxDailyOrders: 20,
             checkLocationFreshness: true,
             locationFreshnessMinutes: 5,
@@ -224,6 +226,46 @@ export class DispatchService {
       return this.offerNextDriver(request, candidates);
     }
 
+    const pickupDistanceKm = Math.max(0, Number(driver.distanceMeters || 0) / 1000);
+    const pickupPolicy = calculateSmartPickupCompensation(pickupDistanceKm);
+    const pickupCompensationPreview = pickupPolicy.compensation;
+    const netFare = Math.max(0, Number(request.order.price) - Number(request.order.discount));
+
+    // MONETIZATION_V1 FIX: untuk order MART, dasar komisi platform HARUS
+    // ongkir (deliveryFee) saja -- konsisten dengan calculateMartPaymentSplit
+    // di payment.service.ts -- bukan netFare (yang masih memuat nilai
+    // barang/itemsSubtotal). Memakai netFare penuh membuat proyeksi
+    // kontribusi platform jauh lebih besar dari kenyataan dan membuat
+    // guardrail negative-contribution tidak pernah terpicu untuk MART.
+    const isMartOrder = request.order.serviceType === ServiceType.MART;
+    let commissionBase = netFare;
+    if (isMartOrder) {
+      const orderItems = await prisma.orderItem.findMany({
+        where: { orderId },
+        select: { subtotal: true },
+      });
+      const itemsSubtotal = orderItems.reduce((sum, item) => sum + Number(item.subtotal), 0);
+      commissionBase = Math.max(0, netFare - itemsSubtotal);
+    }
+
+    const commissionRate = (await this.tariffEngine.resolveCommissionRate(commissionBase)).rate;
+    const economics = projectedNetContribution({
+      serviceType: request.order.serviceType,
+      commissionBase,
+      commissionRate,
+      pickupDistanceKm,
+    });
+
+    // Guardrail V1: negative projected contribution is not offered normally.
+    // Exceptional pickup may proceed only when it remains non-negative.
+    if (economics.projectedNet < 0) {
+      logger.warn(`[MONETIZATION_V1] order ${orderId}: skip driver ${driver.driverId}; projectedNet=Rp${economics.projectedNet}, pickup=${pickupDistanceKm.toFixed(3)}km.`);
+      await DispatchState.next(orderId);
+      return this.offerNextDriver(request, candidates);
+    }
+
+    // Economic guardrail MUST run before auto-accept. Auto-accept is only
+    // an acceptance preference, never a bypass around Monetization V1.
     if (driver.autoAcceptEnabled) {
       logger.info(`[DISPATCH] order ${orderId}: driver ${driver.driverId} autoAcceptEnabled=true, mencoba auto-accept...`);
 
@@ -238,9 +280,6 @@ export class DispatchService {
       }
     }
 
-    const pickupRate = await this.pickupCompensationService.resolveRatePerKm(request.order.serviceType);
-    const pickupDistanceKm = Math.max(0, Number(driver.distanceMeters || 0) / 1000);
-    const pickupCompensationPreview = Math.max(0, Math.round(pickupDistanceKm * pickupRate.rate));
     const stops = await prisma.orderStop.findMany({
       where: { orderId },
       orderBy: { sequence: 'asc' },
@@ -266,8 +305,10 @@ export class DispatchService {
         etaMinutes: driver.etaMinutes,
         distanceMeters: driver.distanceMeters,
         driverPickupDistanceKm: Math.round(pickupDistanceKm * 1000) / 1000,
-        driverPickupRatePerKm: pickupRate.rate,
+        driverPickupRatePerKm: pickupPolicy.effectiveRatePerKm,
         driverPickupCompensation: pickupCompensationPreview,
+        driverPickupDispatchClass: pickupPolicy.dispatchClass,
+        projectedPlatformContribution: economics.projectedNet,
         itemDescription: request.order.itemDescription,
         packageSize: request.order.packageSize,
         estimatedWeightKg: request.order.estimatedWeightKg,

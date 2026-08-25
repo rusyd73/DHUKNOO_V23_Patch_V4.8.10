@@ -10,6 +10,11 @@ import { WalletAdminController } from '../wallet/wallet.admin.controller';
 import { ReconciliationController } from '../reconciliation/reconciliation.controller';
 import { buildAdminRecap } from './admin-recap.service';
 import { buildRecapExcel, buildRecapPdf } from './admin-export.service';
+// FIX single source of truth komisi (lihat komentar di endpoint
+// GET /commission-audit di bawah): dipakai sebagai fallback SoT untuk
+// order legacy yang belum lengkap tercatat di Ledger, menggantikan
+// angka 8% hardcoded yang terputus dari MONETIZATION_V1.
+import { calculatePlatformContribution } from '../tariff/monetization.policy';
 
 const authService = new AuthService();
 const walletAdminControllerForAdminRoutes = new WalletAdminController();
@@ -508,79 +513,191 @@ router.patch(
 );
 
 // ── Commission Audit Platform Endpoint ────────────────────────────────────
+//
+// FINAL ACCOUNTING ARCHITECTURE:
+// - Ledger adalah source of truth nominal aktual.
+// - PLATFORM_FEE = gross platform contribution (driver/service + merchant fee).
+// - PLATFORM_PICKUP_SUBSIDY = biaya pickup yang ditanggung platform (negatif di Ledger).
+// - Net platform contribution = gross contribution - pickup subsidy.
+// - Fallback hanya untuk order COMPLETED yang sudah paid/SETTLED dan BELUM
+//   memiliki PLATFORM_FEE ledger; fallback memakai PricingHistory + MONETIZATION_V1.
+// - Kehadiran pickup-subsidy ledger saja TIDAK dianggap settlement platform lengkap.
 router.get(
   '/commission-audit',
   authenticateToken as any,
   authorizeRoles('ADMIN') as any,
   async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const completedOrders = await prisma.order.findMany({
-        where: { status: 'COMPLETED' },
-        select: { id: true, price: true, discount: true, createdAt: true },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      const feeTx = await prisma.transaction.findMany({
-        where: { type: 'PLATFORM_FEE' },
-        select: { amount: true, createdAt: true },
-      });
-
-      const dailyMap = new Map<string, { totalCommission: number; orderCount: number }>();
       const today = new Date();
+      const dailyMap = new Map<string, {
+        grossPlatformContribution: number;
+        pickupSubsidy: number;
+        netPlatformContribution: number;
+        orderCount: number;
+      }>();
 
       for (let i = 6; i >= 0; i--) {
         const d = new Date(today);
         d.setDate(d.getDate() - i);
         const dateStr = d.toISOString().split('T')[0];
-        dailyMap.set(dateStr, { totalCommission: 0, orderCount: 0 });
+        dailyMap.set(dateStr, {
+          grossPlatformContribution: 0,
+          pickupSubsidy: 0,
+          netPlatformContribution: 0,
+          orderCount: 0,
+        });
       }
 
-      feeTx.forEach((tx) => {
-        const dateStr = new Date(tx.createdAt).toISOString().split('T')[0];
-        if (dailyMap.has(dateStr)) {
-          const curr = dailyMap.get(dateStr)!;
-          curr.totalCommission += Number(tx.amount);
-        }
+      const rangeStart = new Date(today);
+      rangeStart.setDate(rangeStart.getDate() - 6);
+      rangeStart.setHours(0, 0, 0, 0);
+
+      const completedOrders = await prisma.order.findMany({
+        where: { status: 'COMPLETED', createdAt: { gte: rangeStart } },
+        select: {
+          id: true,
+          serviceType: true,
+          price: true,
+          discount: true,
+          createdAt: true,
+          isPaid: true,
+          settlementStatus: true,
+          pricingHistory: true,
+          orderItems: { select: { subtotal: true } },
+        },
+        orderBy: { createdAt: 'desc' },
       });
 
-      completedOrders.forEach((o) => {
-        const dateStr = new Date(o.createdAt).toISOString().split('T')[0];
-        if (dailyMap.has(dateStr)) {
-          const curr = dailyMap.get(dateStr)!;
-          curr.orderCount += 1;
-          if (feeTx.length === 0) {
-            const netPrice = Number(o.price) - Number(o.discount || 0);
-            curr.totalCommission += Math.round(netPrice * 0.08);
-          }
+      const orderIds = completedOrders.map((o) => o.id);
+      const platformLedger = orderIds.length > 0
+        ? await prisma.ledger.findMany({
+            where: {
+              orderId: { in: orderIds },
+              type: { in: ['PLATFORM_FEE', 'PLATFORM_PICKUP_SUBSIDY', 'DRIVER_PICKUP_COMPENSATION'] },
+            },
+            select: { orderId: true, type: true, amount: true, createdAt: true },
+          })
+        : [];
+
+      // Partial-ledger guard: fallback dianggap tidak perlu HANYA jika
+      // PLATFORM_FEE benar-benar ada. Pickup subsidy sendirian tidak cukup.
+      const ordersWithPlatformFee = new Set<string>();
+      const ordersWithPickupSubsidy = new Set<string>();
+      const driverPickupCompensationByOrder = new Map<string, number>();
+      for (const entry of platformLedger) {
+        if (!entry.orderId) continue;
+        const dateStr = new Date(entry.createdAt).toISOString().split('T')[0];
+        const curr = dailyMap.get(dateStr);
+        if (!curr) continue;
+
+        if (entry.type === 'PLATFORM_FEE') {
+          ordersWithPlatformFee.add(entry.orderId);
+          curr.grossPlatformContribution += Math.max(0, Number(entry.amount));
+        } else if (entry.type === 'PLATFORM_PICKUP_SUBSIDY') {
+          ordersWithPickupSubsidy.add(entry.orderId);
+          curr.pickupSubsidy += Math.abs(Number(entry.amount));
+        } else if (entry.type === 'DRIVER_PICKUP_COMPENSATION') {
+          driverPickupCompensationByOrder.set(
+            entry.orderId,
+            (driverPickupCompensationByOrder.get(entry.orderId) || 0) + Math.max(0, Number(entry.amount)),
+          );
         }
-      });
+      }
+
+      for (const o of completedOrders) {
+        const dateStr = new Date(o.createdAt).toISOString().split('T')[0];
+        const curr = dailyMap.get(dateStr);
+        if (!curr) continue;
+        curr.orderCount += 1;
+
+        if (!(o.isPaid || o.settlementStatus === 'SETTLED')) continue;
+
+        const snapshot = o.pricingHistory?.breakdown as any;
+
+        // Partial-ledger guard untuk PICKUP. PLATFORM_FEE bisa sudah ada
+        // sementara PLATFORM_PICKUP_SUBSIDY belum ada pada data historis.
+        // Jangan tampilkan Pickup Rp0 dalam kondisi itu. Urutan fallback:
+        // canonical platform subsidy Ledger -> driver compensation Ledger ->
+        // PricingHistory snapshot yang dikunci ketika order diterima.
+        if (!ordersWithPickupSubsidy.has(o.id)) {
+          const pickupFallback = Math.max(
+            0,
+            driverPickupCompensationByOrder.get(o.id)
+              ?? Number(snapshot?.driverPickupCompensation ?? 0),
+          );
+          curr.pickupSubsidy += pickupFallback;
+        }
+
+        if (ordersWithPlatformFee.has(o.id)) continue;
+        const netPrice = Math.max(0, Number(o.price) - Number(o.discount || 0));
+        const itemsSubtotal = o.serviceType === 'MART'
+          ? Number(
+              snapshot?.itemsSubtotal ??
+              o.orderItems.reduce((sum, item) => sum + Number(item.subtotal), 0),
+            )
+          : 0;
+        const deliveryFee = Math.max(0, netPrice - itemsSubtotal);
+        const commissionRate = Math.max(0, Number(snapshot?.commissionRate ?? 0));
+        const driverContribution = Math.min(
+          deliveryFee,
+          calculatePlatformContribution(o.serviceType, deliveryFee, commissionRate).contribution,
+        );
+        const merchantFee = o.serviceType === 'MART'
+          ? Math.max(
+              0,
+              Number(
+                snapshot?.merchantFeeAmount ??
+                Math.round(itemsSubtotal * Math.max(0, Number(snapshot?.merchantFeeRate ?? 0))),
+              ),
+            )
+          : 0;
+
+        curr.grossPlatformContribution += driverContribution + merchantFee;
+      }
+
+      for (const curr of dailyMap.values()) {
+        curr.netPlatformContribution = curr.grossPlatformContribution - curr.pickupSubsidy;
+      }
 
       const daysOfWeek = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
       const monthsOfYear = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
-
       const dailyData = Array.from(dailyMap.entries()).map(([dateStr, data]) => {
         const d = new Date(dateStr);
-        const dayLabel = `${daysOfWeek[d.getDay()]} ${d.getDate()} ${monthsOfYear[d.getMonth()]}`;
         return {
           date: dateStr,
-          dayLabel,
-          totalCommission: data.totalCommission,
-          orderCount: data.orderCount,
+          dayLabel: `${daysOfWeek[d.getDay()]} ${d.getDate()} ${monthsOfYear[d.getMonth()]}`,
+          // Backward-compatible alias. Setelah frontend lama hilang, alias ini
+          // boleh dihapus pada major API version berikutnya.
+          totalCommission: data.grossPlatformContribution,
+          ...data,
         };
       });
 
-      const totalCommission = dailyData.reduce((acc, item) => acc + item.totalCommission, 0);
-      const totalOrdersProcessed = dailyData.reduce((acc, item) => acc + item.orderCount, 0);
+      const grossPlatformContribution = dailyData.reduce(
+        (sum, item) => sum + item.grossPlatformContribution,
+        0,
+      );
+      const totalPickupSubsidy = dailyData.reduce((sum, item) => sum + item.pickupSubsidy, 0);
+      const netPlatformContribution = grossPlatformContribution - totalPickupSubsidy;
+      const totalOrdersProcessed = dailyData.reduce((sum, item) => sum + item.orderCount, 0);
       const todayStr = today.toISOString().split('T')[0];
-      const todayCommission = dailyMap.get(todayStr)?.totalCommission || 0;
-      const averageDaily = Math.round(totalCommission / 7);
+      const todayData = dailyMap.get(todayStr);
 
       return res.status(200).json({
         summary: {
-          totalCommissionEarned: totalCommission,
-          todayCommission,
-          averageDailyCommission: averageDaily,
+          // Legacy aliases retained for backward compatibility only.
+          totalCommissionEarned: grossPlatformContribution,
+          todayCommission: todayData?.grossPlatformContribution || 0,
+          averageDailyCommission: Math.round(grossPlatformContribution / 7),
           totalOrdersProcessed,
+
+          grossPlatformContribution,
+          totalPickupSubsidy,
+          netPlatformContribution,
+          todayGrossPlatformContribution: todayData?.grossPlatformContribution || 0,
+          todayPickupSubsidy: todayData?.pickupSubsidy || 0,
+          todayNetPlatformContribution: todayData?.netPlatformContribution || 0,
+          averageDailyNetPlatformContribution: Math.round(netPlatformContribution / 7),
         },
         dailyData,
       });

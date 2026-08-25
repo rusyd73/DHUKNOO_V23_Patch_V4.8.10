@@ -458,6 +458,7 @@ function LauncherHub({
         </div>
         <p className={`max-w-2xl text-xs md:text-sm ${textMutedLightClass} leading-relaxed`}>
           Platform layanan Ride (motor/mobil), Food, Merchant, dan Send.
+		  Lebih Dekat, Terjangkau, Lebih Adil
         </p>
       </div>
 

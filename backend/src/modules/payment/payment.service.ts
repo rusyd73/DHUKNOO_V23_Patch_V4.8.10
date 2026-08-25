@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, ServiceType } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { PaymentRepository } from './payment.repository';
 import { WalletRepository } from '../wallet/wallet.repository';
@@ -7,6 +7,7 @@ import { AppError, NotFoundError, ForbiddenError } from '../../core/errors/AppEr
 import { SocketService } from '../../websocket/socket';
 import { LedgerService } from '../ledger/ledger.service';
 import { AuditLogger } from '../../core/logging/audit.logger';
+import { calculatePlatformContribution, MONETIZATION_V1 } from '../tariff/monetization.policy';
 
 /**
  * Menghitung pembagian pembayaran satu order: berapa yang ditagih ke customer
@@ -17,10 +18,12 @@ import { AuditLogger } from '../../core/logging/audit.logger';
 export function calculatePaymentSplit(
   price: Prisma.Decimal.Value,
   discount: Prisma.Decimal.Value,
-  commissionRate: number
+  commissionRate: number,
+  serviceType: ServiceType = ServiceType.BIKE
 ) {
   const amountToCharge = new Prisma.Decimal(price).minus(discount);
-  const platformFee = amountToCharge.times(commissionRate);
+  const contribution = calculatePlatformContribution(serviceType, amountToCharge.toNumber(), commissionRate);
+  const platformFee = new Prisma.Decimal(Math.min(amountToCharge.toNumber(), contribution.contribution));
   const driverEarning = amountToCharge.minus(platformFee);
   return { amountToCharge, platformFee, driverEarning };
 }
@@ -52,14 +55,19 @@ export function calculateMartPaymentSplit(
   // Ongkir = total ditagih - nilai barang (diskon, kalau ada, dianggap memotong ongkir dulu).
   const deliveryFee = amountToCharge.minus(itemsSubtotalDecimal);
 
-  const merchantFeeRate = 0;
-  const merchantFee = new Prisma.Decimal(0);
-  const merchantEarning = itemsSubtotalDecimal;
+  const merchantFeeRate = Math.max(0, Math.min(MONETIZATION_V1.merchantFee.maxEarlyRate, _legacyMerchantFeeRate));
+  const merchantFee = itemsSubtotalDecimal.times(merchantFeeRate);
+  const merchantEarning = itemsSubtotalDecimal.minus(merchantFee);
 
-  const driverCommission = deliveryFee.times(driverCommissionRate);
+  const deliveryContribution = calculatePlatformContribution(
+    ServiceType.MART,
+    Math.max(0, deliveryFee.toNumber()),
+    driverCommissionRate,
+  );
+  const driverCommission = new Prisma.Decimal(Math.min(Math.max(0, deliveryFee.toNumber()), deliveryContribution.contribution));
   const driverEarning = deliveryFee.minus(driverCommission);
 
-  const platformFee = driverCommission;
+  const platformFee = driverCommission.plus(merchantFee);
 
   return {
     amountToCharge,
@@ -136,7 +144,12 @@ export class PaymentService {
         ? breakdown.commissionRate
         : (await this.tariffEngine.resolveCommissionRate(deliveryFeeRaw)).rate;
 
-    return calculateMartPaymentSplit(order.price, order.discount, itemsSubtotal, driverCommissionRate);
+    const merchantFeeRate =
+      breakdown && typeof breakdown.merchantFeeRate === 'number'
+        ? breakdown.merchantFeeRate
+        : await this.tariffEngine.getMerchantPlatformFeeRate();
+
+    return calculateMartPaymentSplit(order.price, order.discount, itemsSubtotal, driverCommissionRate, merchantFeeRate);
   }
 
   async chargeOrder(customerUserId: string, orderId: string, idempotencyKey: string) {
@@ -187,7 +200,7 @@ export class PaymentService {
 
     const { amountToCharge, platformFee, driverEarning } = isMartOrder
       ? martSplit!
-      : calculatePaymentSplit(order.price, order.discount, commissionRate);
+      : calculatePaymentSplit(order.price, order.discount, commissionRate, order.serviceType);
     const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
     const customerWallet = await this.walletRepo.findOrCreateByUserId(customerUserId);
@@ -220,8 +233,8 @@ export class PaymentService {
           driverEarning,
           'EARNING',
           isMartOrder
-            ? `Ongkir order #${order.id} (setelah komisi platform ${(commissionRate * 100).toFixed(1)}%)`
-            : `Pendapatan order #${order.id} (setelah komisi platform ${(commissionRate * 100).toFixed(1)}%)`,
+            ? `Ongkir order #${order.id} (setelah kontribusi platform)`
+            : `Pendapatan order #${order.id} (setelah kontribusi platform)`,
           order.id,
           `${idempotencyKey}:credit`
         );
@@ -343,7 +356,7 @@ export class PaymentService {
     const commissionRate = isMartOrder ? martSplit!.driverCommissionRate : await this.resolveCommissionRateForOrder(order);
     const paymentSplit = isMartOrder
       ? martSplit!
-      : calculatePaymentSplit(order.price, order.discount, commissionRate);
+      : calculatePaymentSplit(order.price, order.discount, commissionRate, order.serviceType);
     const { platformFee } = paymentSplit;
     const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
@@ -599,7 +612,7 @@ export class PaymentService {
     // yang langsung mengkreditkan driverEarning tanpa proses debit.
     const martSplit = isMartOrder ? await this.resolveMartSplit(order) : null;
     const commissionRate = isMartOrder ? martSplit!.driverCommissionRate : await this.resolveCommissionRateForOrder(order);
-    const driverEarning = isMartOrder ? martSplit!.driverEarning : calculatePaymentSplit(order.price, order.discount, commissionRate).driverEarning;
+    const driverEarning = isMartOrder ? martSplit!.driverEarning : calculatePaymentSplit(order.price, order.discount, commissionRate, order.serviceType).driverEarning;
     const pickupCompensation = await this.resolveDriverPickupCompensation(order.id);
 
     const driverWallet = await this.walletRepo.findOrCreateByUserId(driverProfile.userId);
@@ -696,7 +709,7 @@ export class PaymentService {
             },
           }
         : (() => {
-            const split = calculatePaymentSplit(order.price, order.discount, commissionRate);
+            const split = calculatePaymentSplit(order.price, order.discount, commissionRate, order.serviceType);
             return {
               orderId: order.id,
               customerPayment: Number(split.amountToCharge),

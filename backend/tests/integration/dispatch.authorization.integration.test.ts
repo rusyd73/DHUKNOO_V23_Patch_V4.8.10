@@ -1,6 +1,7 @@
 import request from 'supertest';
 import { app } from '../../src/app';
 import { prisma } from '../../src/config/prisma';
+import { DispatchState } from '../../src/modules/dispatch/dispatch.state';
 
 // 🆕 FIX P2 "Aktifkan test untuk ... dispatch authorization" (audit E.2),
 // menguji perbaikan P1 #1 "Dispatch status authorization" -- GET
@@ -20,6 +21,8 @@ let ownerToken: string;
 let strangerToken: string;
 let driverToken: string;
 let orderId: string;
+let currentSpy: jest.SpyInstance;
+let existsSpy: jest.SpyInstance;
 
 async function registerAndLogin(email: string, fullName: string, role: 'CUSTOMER' | 'DRIVER') {
   const extra =
@@ -38,6 +41,12 @@ async function registerAndLogin(email: string, fullName: string, role: 'CUSTOMER
 }
 
 beforeAll(async () => {
+  // Test ini menguji AUTHORIZATION endpoint, bukan konektivitas Redis.
+  // Dispatch state dimock agar hasil test deterministik dan tidak bergantung
+  // pada service eksternal. Redis fail-closed tetap dipertahankan di production.
+  currentSpy = jest.spyOn(DispatchState, 'current').mockResolvedValue(null);
+  existsSpy = jest.spyOn(DispatchState, 'exists').mockResolvedValue(false);
+
   ownerToken = await registerAndLogin(ownerEmail, 'Pemilik Order Uji', 'CUSTOMER');
   strangerToken = await registerAndLogin(strangerEmail, 'Orang Asing Uji', 'CUSTOMER');
   driverToken = await registerAndLogin(driverEmail, 'Driver Uji', 'DRIVER');
@@ -67,6 +76,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  currentSpy?.mockRestore();
+  existsSpy?.mockRestore();
   await prisma.order.deleteMany({ where: { id: orderId } });
   await prisma.user.deleteMany({ where: { email: { in: [ownerEmail, strangerEmail, driverEmail] } } });
   await prisma.$disconnect();

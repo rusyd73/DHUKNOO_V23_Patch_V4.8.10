@@ -54,6 +54,13 @@ const serviceLabel = (serviceType: unknown) => ({
   MART: 'Belanja Merchant',
 }[String(serviceType || '').toUpperCase()] || String(serviceType || '-'));
 
+// UI/accounting transparency: histori lama menyimpan label persentase komisi
+// (contoh 8.0%), padahal Monetization V1 dapat menerapkan minimum platform
+// contribution. Normalisasi ini hanya mengubah tampilan, bukan data historis.
+const normalizeAccountingDescription = (value: unknown) =>
+  String(value || '')
+    .replace(/\(setelah komisi platform\s+\d+(?:[.,]\d+)?%\)/gi, '(setelah kontribusi platform)');
+
 interface PortalProps {
   onBack: () => void;
   triggerToast: (m: string) => void;
@@ -1039,7 +1046,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
               </h3>
               <p className="text-[10px] text-[#A5C9B8]/70 -mt-2">
                 Order ini dibayar tunai oleh customer. Konfirmasi kalau uangnya sudah benar-benar Anda terima —
-                komisi platform akan otomatis dipotong dari deposit Anda.
+                kontribusi platform akan otomatis dipotong dari deposit Anda.
               </p>
               {jobsData.jobs
                 .filter((j: any) => j.status === 'COMPLETED' && !j.isPaid && j.paymentMethod === 'CASH' && j.driverId === profileData?.profile?.id)
@@ -1286,7 +1293,7 @@ function DriverApp({ onBack, triggerToast }: PortalProps) {
                 {profileData.wallet.transactions.map((tx: any) => (
                   <div key={tx.id} className="bg-[#06170E] border border-[#23583E] p-2.5 rounded-xl flex justify-between items-center text-xs">
                     <div>
-                      <span className="text-white font-bold block">{tx.description}</span>
+                      <span className="text-white font-bold block">{normalizeAccountingDescription(tx.description)}</span>
                       <span className="text-[9px] text-gray-400">{new Date(tx.createdAt).toLocaleTimeString('id-ID')}</span>
                     </div>
                     <span className={`font-black ${Number(tx.amount) >= 0 ? 'text-[#00E575]' : 'text-red-400'}`}>

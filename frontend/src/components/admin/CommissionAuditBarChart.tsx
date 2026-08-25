@@ -12,7 +12,15 @@ import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGri
 import { formatRupiah } from '@obama/shared-utils';
 
 interface CommissionAuditBarChartProps {
-  dailyData: Array<{ date: string; dayLabel: string; orderCount: number; totalCommission: number }>;
+  dailyData: Array<{
+    date: string;
+    dayLabel: string;
+    orderCount: number;
+    totalCommission: number;
+    grossPlatformContribution?: number;
+    pickupSubsidy?: number;
+    netPlatformContribution?: number;
+  }>;
 }
 
 export default function CommissionAuditBarChart({ dailyData }: CommissionAuditBarChartProps) {
@@ -36,7 +44,13 @@ export default function CommissionAuditBarChart({ dailyData }: CommissionAuditBa
                 <div className="bg-[#0D2E1F] border border-[#00E575] p-3 rounded-xl shadow-xl text-xs flex flex-col gap-1">
                   <span className="font-black text-[#FFD700]">{label}</span>
                   <div className="text-white font-bold">
-                    Komisi: <span className="text-[#00E575]">{formatRupiah(item.totalCommission)}</span>
+                    Gross: <span className="text-[#00E575]">{formatRupiah(item.grossPlatformContribution ?? item.totalCommission ?? 0)}</span>
+                  </div>
+                  <div className="text-orange-300 text-[10px]">
+                    Pickup Subsidy: -{formatRupiah(item.pickupSubsidy ?? 0)}
+                  </div>
+                  <div className="text-[#FFD700] font-bold">
+                    Net: {formatRupiah(item.netPlatformContribution ?? item.totalCommission ?? 0)}
                   </div>
                   <div className="text-[#A5C9B8] text-[10px]">
                     Order Selesai: <strong className="text-white">{item.orderCount}</strong>
@@ -47,9 +61,9 @@ export default function CommissionAuditBarChart({ dailyData }: CommissionAuditBa
             return null;
           }}
         />
-        <Bar dataKey="totalCommission" radius={[6, 6, 0, 0]}>
+        <Bar dataKey="netPlatformContribution" radius={[6, 6, 0, 0]}>
           {(dailyData || []).map((entry, index) => (
-            <Cell key={`cell-${index}`} fill={entry.totalCommission > 0 ? '#00E575' : '#1e3e2d'} />
+            <Cell key={`cell-${index}`} fill={(entry.netPlatformContribution ?? entry.totalCommission) > 0 ? '#00E575' : '#1e3e2d'} />
           ))}
         </Bar>
       </BarChart>

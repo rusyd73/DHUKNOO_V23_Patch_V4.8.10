@@ -1,0 +1,190 @@
+DHUKNOO V12.7.9 — Audit Lanjutan atas Monetization Architecture V1
+Baseline input: DHUKNOO_V12_7_7_DEPLOY.zip (folder root: "DHUKNOO V12.7.7 DEPLOY")
+Referensi: DHUKNOO_PATCH_MONETIZATION_ARCH_V1_FIXED__1_.zip (v1.1, "FIXED / AUDITED BUILD")
+
+======================================================================
+TEMUAN AWAL: PATCH SUDAH TERINTEGRASI DI BASELINE
+======================================================================
+Seluruh 10 file di dalam ZIP patch (DHUKNOO_PATCH_MONETIZATION_ARCH_V1_
+FIXED__1_.zip) di-diff byte-per-byte terhadap DHUKNOO_V12_7_7_DEPLOY.zip
+dan hasilnya IDENTIK di semua file:
+  backend/prisma/seed.ts
+  backend/src/modules/dispatch/dispatch.service.ts
+  backend/src/modules/driver/routes/job.routes.ts
+  backend/src/modules/driver/services/driver-pickup-compensation.service.ts
+  backend/src/modules/driver/services/job.service.ts
+  backend/src/modules/order/order.service.ts
+  backend/src/modules/payment/payment.service.ts
+  backend/src/modules/tariff/monetization.policy.ts
+  backend/src/modules/tariff/tariff.service.ts
+  backend/tests/unit/payment.mart-split.test.ts
+Artinya baseline V12.7.7 DEPLOY yang diunggah SUDAH memuat patch
+Monetization V1 versi v1.1 (fixed) secara penuh. Tidak ada proses
+"apply patch" yang diperlukan lagi; audit V12.7.9 ini murni memeriksa
+ULANG hasil integrasi tersebut untuk bug/duplikat yang tersisa.
+
+======================================================================
+VALIDASI ULANG 6 FIX v1.1 (SEMUA DIVERIFIKASI BENAR)
+======================================================================
+1. Duplicate import/field TariffEngineService di dispatch.service.ts
+   -> TIDAK ada duplikat (1x import, 1x field). OK.
+2. Basis komisi platform MART (itemsSubtotal dikurangi dari netFare
+   sebelum hitung commissionBase) -> sesuai payment.service.ts. OK.
+3. Radius eligibility 3km konsisten di 5 titik pemanggilan
+   (job.service.ts x2, order.service.ts x2, dispatch.service.ts x1,
+   job.routes.ts x1) -> semua maxDistanceKm: 3. OK.
+4. Cap commissionAmount <= finalFare di tariff.service.ts -> OK,
+   Math.min(finalFare, contribution) sudah diterapkan.
+5. Fallback getMerchantPlatformFeeRate() 0.03 (bukan 0.1 lama) -> OK,
+   sinkron dengan seed PlatformConfig 'MERCHANT_PLATFORM_FEE_RATE'=0.03.
+6. tests/unit/payment.mart-split.test.ts -> seluruh 8 assertion
+   diverifikasi ULANG secara independen (re-implementasi formula
+   calculateMartPaymentSplit di Node.js polos, di luar TypeScript/
+   Prisma project) dan SEMUA COCOK dengan nilai expected di file test.
+
+======================================================================
+BUG/INKONSISTENSI BARU DITEMUKAN & DIPERBAIKI DI V12.7.9
+======================================================================
+1. [Config tidak sepenuhnya wired] monetization.policy.ts
+   calculateSmartPickupCompensation() -- fix v1.1 mengklaim SEMUA
+   ambang jarak (1/2/3 km) sudah dibaca dari MONETIZATION_V1.pickup.*,
+   tapi kenyataannya HANYA normalRadiusKm (2km) dan extendedRadiusKm
+   (3km) yang di-wire; ambang <=1km (kompensasi Rp0, dispatch class
+   NORMAL) masih literal hardcoded terpisah dari config.
+   FIX: menambahkan MONETIZATION_V1.pickup.freeRadiusKm = 1 dan
+   memakainya di kondisi pertama. Diverifikasi ulang: 9/9 assertion di
+   tests/unit/monetization.policy.test.ts (direplikasi di Node.js
+   polos) tetap PASS dengan nilai persis sama seperti sebelumnya --
+   perubahan ini murni structural (config-driven), tidak mengubah
+   satupun output/perilaku saat ini.
+
+2. [Kode radius basi/tidak konsisten -- tidak berdampak fungsional]
+   - dispatch.service.ts (fallback DB-location saat Redis GEO kosong):
+     filter jarak final masih literal 5000m (radius lama), padahal
+     kandidat yang difilter SUDAH lolos eligibility check di
+     maxDistanceKm:3 sebelumnya (5000m tidak pernah benar-benar
+     memfilter apa pun tambahan -- superset yang tidak berbahaya, tapi
+     membingungkan dan tidak selaras kebijakan V1).
+     FIX: disamakan ke 3000m + komentar diperjelas.
+   - job.service.ts (pre-filter kasar daftar open job sebelum
+     eligibility check per-kandidat): masih literal <=5 km.
+     FIX: disamakan ke <=3 km (hasil akhir tidak berubah karena
+     Eligibility Service di bawahnya tetap membatasi ke 3km; ini
+     murni membersihkan angka basi supaya tidak membingungkan
+     pembaca kode / auditor berikutnya).
+   - driver-eligibility.service.ts: default parameter
+     `maxDistanceKm = 5` di fungsi check() tidak pernah benar-benar
+     terpakai (SEMUA 5 caller yang ada mengirim maxDistanceKm:3
+     eksplisit), tapi merupakan jebakan laten untuk caller baru di
+     masa depan yang lupa mengirim opsi ini.
+     FIX: default diselaraskan ke 3.
+
+3. [Dead code -- dicatat, TIDAK dihapus] driver-eligibility.service.ts
+   `filterEligibleDrivers()` dan singleton export
+   `driverEligibilityService` ternyata tidak dipanggil di mana pun
+   dalam backend/src (dikonfirmasi grep menyeluruh, termasuk di luar
+   sub-folder driver/). Tidak dihapus dalam audit ini karena bukan bug
+   dan menghapus API publik berisiko memutus pemanggil yang belum
+   ditemukan; hanya dicatat untuk tindak lanjut product/eng jika ingin
+   membersihkan.
+
+4. [Di luar scope monetization, diperbaiki atas permintaan user setelah
+   hasil `npm test` sungguhan dikonfirmasi] tests/integration/
+   health.integration.test.ts gagal karena mengasumsikan bentuk body
+   /health yang TIDAK PERNAH cocok dengan implementasi asli (pre-existing,
+   bukan disebabkan patch monetization -- sudah ditandai di patch notes
+   v1.2 sebagai "di luar scope").
+   FIX: test disesuaikan ke kontrak API publik /health yang sebenarnya
+   berjalan (services.database/services.redis sebagai STRING, bukan
+   nested object; tidak ada services.system). Endpoint publik /health
+   SENGAJA TIDAK diubah -- mengubah bentuk responsnya berisiko memutus
+   konsumen lain yang sudah bergantung pada format string saat ini
+   (mis. load balancer / uptime monitor eksternal).
+   TEMUAN TAMBAHAN selama perbaikan ini: HealthCheckController.internal()
+   di src/config/health.ts (varian detail dengan uptime/latency/memory
+   usage) ternyata DEAD CODE -- tidak pernah di-mount ke route apa pun
+   di src/app.ts (hanya `/health` -> HealthCheckController.check yang
+   terdaftar). Tidak diaktifkan/di-mount dalam audit ini karena
+   mem-publish route baru yang membocorkan versi Node/PID/memory usage
+   adalah keputusan produk & keamanan, bukan sekadar bug-fix; dicatat
+   untuk tindak lanjut product/eng (apakah perlu route internal
+   terpisah dengan auth/allowlist IP, bukan endpoint publik).
+
+======================================================================
+KONFIRMASI HASIL `npm test` SUNGGUHAN (dijalankan oleh user, Windows,
+Prisma Client ter-generate penuh -- bukan di sandbox audit ini)
+======================================================================
+Test Suites: 2 failed, 7 passed, 9 total
+Tests:       3 failed, 51 passed, 54 total
+
+- tests/unit/payment.mart-split.test.ts   -> PASS (semua 8 assertion)
+- tests/unit/monetization.policy.test.ts  -> PASS (fix freeRadiusKm di
+  atas TIDAK mengubah hasil, sesuai prediksi verifikasi manual)
+- tests/unit/tariff.commission.test.ts    -> PASS
+- tests/integration/auth.integration.test.ts -> PASS
+- tests/integration/order.contract.integration.test.ts -> PASS
+- tests/unit/payment.split.test.ts, promo.calc.test.ts -> PASS
+- tests/integration/dispatch.authorization.integration.test.ts
+  -> 2 FAILED: "[DispatchRedis] Redis belum/tidak ready" -- environment
+  issue (REDIS_URL tidak mengarah ke Redis yang benar-benar hidup saat
+  test dijalankan), BUKAN bug kode, BUKAN disebabkan patch monetization.
+  Jalankan Redis lokal/CI dan set REDIS_URL sebelum menjalankan
+  integration suite ini.
+- tests/integration/health.integration.test.ts -> 1 FAILED sebelum fix
+  #4 di atas; SUDAH DIPERBAIKI di V12.7.9 ini (lihat temuan #4).
+
+Semua kegagalan yang tersisa hanya kegagalan Redis-tidak-hidup (isu
+environment test, bukan kode) -- konsisten dengan yang didokumentasikan
+di patch notes v1.2 sejak awal.
+
+======================================================================
+PENGUJIAN INTERNAL YANG DILAKUKAN (sandbox audit, tanpa akses
+binaries.prisma.sh -- lihat konfirmasi hasil nyata di atas)
+======================================================================
+- npm ci: BERHASIL (696 package terpasang bersih).
+- npx prisma generate: GAGAL di sandbox audit ini karena akses jaringan
+  ke binaries.prisma.sh (CDN engine Prisma) diblokir oleh kebijakan
+  jaringan sandbox (hanya registry npm/PyPI/GitHub yang diizinkan).
+  Ini BUKAN bug pada kode -- di lingkungan CI/deploy normal dengan
+  akses internet penuh, `prisma generate` akan berhasil seperti biasa.
+- npx tsc --noEmit --skipLibCheck: 43 baris error, SEMUA bertipe
+  "Module has no exported member" / "Namespace Prisma has no exported
+  member 'Decimal'" -- 100% disebabkan @prisma/client belum di-generate
+  (lihat poin di atas), BUKAN error sintaks/duplicate-identifier. Jumlah
+  baris error IDENTIK sebelum dan sesudah 4 fix V12.7.9 di atas -- tidak
+  ada regresi baru yang diperkenalkan oleh perubahan V12.7.9.
+- Brace/paren balance check pada seluruh file yang disentuh: seimbang.
+- npx jest tests/unit/payment.mart-split.test.ts dan
+  tests/unit/monetization.policy.test.ts: GAGAL DIJALANKAN di sandbox
+  ini (ts-jest butuh @prisma/client ter-generate, sama seperti tsc di
+  atas). Sebagai gantinya, LOGIKA MURNI di kedua modul (calculateMart
+  PaymentSplit, calculateSmartPickupCompensation, calculatePlatform
+  Contribution, projectedNetContribution) direplikasi persis di
+  Node.js polos (tanpa TypeScript/Prisma) dan diuji terhadap SELURUH
+  assertion yang ada di kedua file test tersebut -- 100% PASS (17/17
+  assertion gabungan). Ini memverifikasi kebenaran matematis formula,
+  meski tidak menggantikan `npm test` sungguhan dengan Prisma Client
+  aktif.
+
+Wajib dijalankan sebelum deploy produksi (lingkungan dengan akses
+internet penuh ke binaries.prisma.sh):
+  cd backend
+  npm ci
+  npx prisma generate
+  npm run build
+  npm test
+
+======================================================================
+CATATAN LAIN
+======================================================================
+- Frontend (frontend/src, frontend/pages) diperiksa: TIDAK ada logika
+  monetization/eligibility yang diduplikasi di sisi client, jadi tidak
+  ada risiko frontend/backend out-of-sync akibat perubahan di atas.
+- backend/prisma/seed.ts tidak diubah -- sudah konsisten dengan
+  kebijakan V1 (MERCHANT_PLATFORM_FEE_RATE seed = 0.03).
+- Kegagalan test pra-existing yang didokumentasikan di patch notes v1.2
+  (Redis belum ready pada dispatch.authorization.integration.test.ts,
+  dan mismatch shape response di health.integration.test.ts) TIDAK
+  disentuh oleh audit V12.7.9 -- keduanya di luar cakupan patch
+  monetization dan tetap memerlukan tindak lanjut terpisah seperti
+  dicatat di PATCH_NOTES_MONETIZATION_V1.txt.

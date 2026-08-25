@@ -158,7 +158,9 @@ export async function buildRecapExcel(recap: AdminRecap): Promise<Buffer> {
     { header: 'Subtotal Barang (Rp)', key: 'itemsSubtotal', width: 20 },
     { header: 'Ongkos Layanan (Rp)', key: 'deliveryFee', width: 20 },
     { header: 'Harga Bersih (Rp)', key: 'netPrice', width: 16 },
-    { header: 'Revenue Platform (Rp)', key: 'platformRevenue', width: 18 },
+    { header: 'Gross Contribution (Rp)', key: 'grossPlatformContribution', width: 22 },
+    { header: 'Pickup Subsidy (Rp)', key: 'pickupSubsidy', width: 18 },
+    { header: 'Net Revenue Platform (Rp)', key: 'platformRevenue', width: 22 },
     { header: 'Waktu', key: 'createdAt', width: 20 },
   ];
   recap.platformRevenues.forEach((r) => revenueSheet.addRow({ ...r, createdAt: formatDate(r.createdAt) }));

@@ -1,4 +1,5 @@
 import { prisma } from '../../config/prisma';
+import { calculatePlatformContribution } from '../tariff/monetization.policy';
 
 export type RecapTimeframe = 'daily' | 'weekly' | 'monthly';
 
@@ -97,19 +98,36 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
   const financialLedger = await prisma.ledger.findMany({
     where: {
       createdAt: { gte: startDate },
-      type: { in: ['DRIVER_EARNING', 'DRIVER_COMMISSION', 'DRIVER_TIP', 'PLATFORM_FEE'] },
+      type: { in: ['DRIVER_EARNING', 'DRIVER_COMMISSION', 'DRIVER_TIP', 'DRIVER_PICKUP_COMPENSATION', 'PLATFORM_FEE', 'PLATFORM_PICKUP_SUBSIDY'] },
     },
     select: { orderId: true, userId: true, type: true, amount: true },
   });
   const driverEarningsByUser = new Map<string, number>();
-  const platformRevenueByOrder = new Map<string, number>();
+  const grossPlatformContributionByOrder = new Map<string, number>();
+  const pickupSubsidyByOrder = new Map<string, number>();
+  const driverPickupCompensationByOrder = new Map<string, number>();
   for (const entry of financialLedger) {
     const amount = Number(entry.amount);
     if (entry.type === 'DRIVER_EARNING' || entry.type === 'DRIVER_COMMISSION' || entry.type === 'DRIVER_TIP') {
       driverEarningsByUser.set(entry.userId, (driverEarningsByUser.get(entry.userId) || 0) + amount);
     }
     if (entry.type === 'PLATFORM_FEE' && entry.orderId) {
-      platformRevenueByOrder.set(entry.orderId, (platformRevenueByOrder.get(entry.orderId) || 0) + amount);
+      grossPlatformContributionByOrder.set(
+        entry.orderId,
+        (grossPlatformContributionByOrder.get(entry.orderId) || 0) + Math.max(0, amount),
+      );
+    }
+    if (entry.type === 'PLATFORM_PICKUP_SUBSIDY' && entry.orderId) {
+      pickupSubsidyByOrder.set(
+        entry.orderId,
+        (pickupSubsidyByOrder.get(entry.orderId) || 0) + Math.abs(amount),
+      );
+    }
+    if (entry.type === 'DRIVER_PICKUP_COMPENSATION' && entry.orderId) {
+      driverPickupCompensationByOrder.set(
+        entry.orderId,
+        (driverPickupCompensationByOrder.get(entry.orderId) || 0) + Math.max(0, amount),
+      );
     }
   }
 
@@ -175,7 +193,11 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
       : 0;
     const deliveryFee = Math.max(0, netPrice - itemsSubtotal);
     const commissionRate = Math.max(0, Number(snapshot?.commissionRate ?? 0));
-    const driverNet = Math.max(0, deliveryFee - deliveryFee * commissionRate);
+    const historicalContribution = Math.min(
+      deliveryFee,
+      calculatePlatformContribution(order.serviceType, deliveryFee, commissionRate).contribution,
+    );
+    const driverNet = Math.max(0, deliveryFee - historicalContribution);
     driverEarningsByUser.set(
       order.driver.userId,
       (driverEarningsByUser.get(order.driver.userId) || 0) + driverNet
@@ -229,11 +251,38 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
       ? Number(snapshot?.itemsSubtotal ?? o.orderItems.reduce((sum, item) => sum + Number(item.subtotal), 0))
       : 0;
     const deliveryFee = Math.max(0, netPrice - itemsSubtotal);
-    const commissionRate = Number(snapshot?.commissionRate ?? 0);
-    // Ledger tetap sumber utama. Fallback snapshot hanya untuk order historis
-    // yang sudah SETTLED sebelum pencatatan ledger CASH lengkap diperbaiki.
-    const snapshotPlatformRevenue = Math.max(0, deliveryFee * commissionRate);
-    const platformRevenue = Math.max(0, platformRevenueByOrder.get(o.id) ?? snapshotPlatformRevenue);
+    const commissionRate = Math.max(0, Number(snapshot?.commissionRate ?? 0));
+    // Ledger tetap sumber utama. Fallback snapshot untuk order historis juga
+    // WAJIB memakai MONETIZATION_V1 yang sama dengan settlement: percentage
+    // vs minimum platform contribution + merchant fee snapshot. Jangan pernah
+    // kembali ke `deliveryFee * rate` karena itu mengabaikan floor per service.
+    const driverContribution = Math.min(
+      deliveryFee,
+      calculatePlatformContribution(o.serviceType, deliveryFee, commissionRate).contribution,
+    );
+    const merchantFee = o.serviceType === 'MART'
+      ? Math.max(0, Number(snapshot?.merchantFeeAmount ?? Math.round(itemsSubtotal * Math.max(0, Number(snapshot?.merchantFeeRate ?? 0)))))
+      : 0;
+    const snapshotGrossContribution = driverContribution + merchantFee;
+    const grossPlatformContribution = Math.max(
+      0,
+      grossPlatformContributionByOrder.get(o.id) ?? snapshotGrossContribution,
+    );
+    // Pickup subsidy memakai urutan SoT yang tahan partial-ledger:
+    // 1) PLATFORM_PICKUP_SUBSIDY (pasangan debit platform yang canonical),
+    // 2) DRIVER_PICKUP_COMPENSATION dari Ledger bila sisi platform historis
+    //    belum tercatat,
+    // 3) snapshot PricingHistory yang dikunci saat driver menerima order.
+    // Dengan demikian Dashboard Admin tidak kembali ke Rp0 hanya karena
+    // satu sisi pasangan ledger historis belum ada.
+    const snapshotPickupCompensation = Math.max(0, Number(snapshot?.driverPickupCompensation ?? 0));
+    const pickupSubsidy = Math.max(
+      0,
+      pickupSubsidyByOrder.get(o.id)
+        ?? driverPickupCompensationByOrder.get(o.id)
+        ?? snapshotPickupCompensation,
+    );
+    const netPlatformContribution = grossPlatformContribution - pickupSubsidy;
 
     return {
       id: o.id,
@@ -246,14 +295,26 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
       grossPrice,
       discount,
       netPrice,
-      platformRevenue,
+      // `platformRevenue` adalah revenue NET yang benar-benar tersisa bagi
+      // platform setelah pickup subsidy. Gross dan subsidy tetap tersedia
+      // sebagai field eksplisit untuk audit/reconciliation.
+      platformRevenue: netPlatformContribution,
+      grossPlatformContribution,
+      pickupSubsidy,
+      netPlatformContribution,
       itemsSubtotal,
       deliveryFee,
       createdAt: o.createdAt,
     };
   });
 
-  const totalPlatformRevenue = formattedRevenues.reduce((acc, curr) => acc + curr.platformRevenue, 0);
+  const totalGrossPlatformContribution = formattedRevenues.reduce((acc, curr) => acc + curr.grossPlatformContribution, 0);
+  const totalPickupSubsidy = formattedRevenues.reduce((acc, curr) => acc + curr.pickupSubsidy, 0);
+  const totalNetPlatformContribution = formattedRevenues.reduce((acc, curr) => acc + curr.netPlatformContribution, 0);
+  // `totalPlatformRevenue` adalah NET revenue agar kartu Dashboard Utama,
+  // tabel rekap dan export memakai definisi accounting yang sama.
+  // Gross/subsidy tetap dilaporkan terpisah untuk audit.
+  const totalPlatformRevenue = totalNetPlatformContribution;
   const totalVolumeValue = formattedTransactions.reduce((acc, curr) => acc + curr.price, 0);
 
   // BARU: breakdown arus kas per metode pembayaran (CASH/WALLET/QRIS/TRANSFER/
@@ -313,6 +374,9 @@ export async function buildAdminRecap(timeframe: RecapTimeframe = 'daily') {
       totalTransactionsCount: formattedTransactions.length,
       totalVolumeValue,
       totalPlatformRevenue,
+      totalGrossPlatformContribution,
+      totalPickupSubsidy,
+      totalNetPlatformContribution,
       totalMerchantsCount: merchantSummary.total,
       activeMerchantsCount: merchantSummary.active,
       inactiveMerchantsCount: merchantSummary.inactive,

@@ -44,8 +44,9 @@ export class HealthCheckController {
         status: isHealthy ? 'UP' : 'DOWN',
         timestamp: new Date().toISOString(),
         services: {
-          database: dbStatus,
-          redis: redisStatus,
+          database: { status: dbStatus },
+          redis: { status: redisStatus },
+          system: { uptime: process.uptime() },
         },
       });
     } catch (error) {

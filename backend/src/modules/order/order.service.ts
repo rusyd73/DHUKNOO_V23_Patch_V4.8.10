@@ -1,4 +1,4 @@
-import { OrderStatus, Prisma } from '@prisma/client';
+import { OrderStatus, Prisma, ServiceType } from '@prisma/client';
 import { OrderRepository } from './order.repository';
 import { PromoService } from '../promo/promo.service';
 import { TariffEngineService } from '../tariff/tariff.service';
@@ -16,6 +16,7 @@ import { LedgerService } from '../ledger/ledger.service';
 import { getOrderNumber } from '../../core/utils/order-number';
 import { DriverPickupCompensationService } from '../driver/services/driver-pickup-compensation.service';
 import { WalletRepository } from '../wallet/wallet.repository';
+import { calculatePlatformContribution } from '../tariff/monetization.policy';
 
 interface CreateOrderInput {
   serviceType: 'BIKE' | 'CAR' | 'SEND' | 'MART';
@@ -311,20 +312,33 @@ export class OrderService {
       | undefined;
 
     let commissionRate: number;
-    const merchantFeeRate = 0;
+    let merchantFeeRate = 0;
 
     if (snapshot && typeof snapshot.commissionRate === 'number') {
       commissionRate = snapshot.commissionRate;
-      logger.info(`[LEDGER] Order ${orderId}: pakai rate snapshot dari PricingHistory (commissionRate=${commissionRate}, merchantFeeRate=0)`);
+      merchantFeeRate = order.serviceType === ServiceType.MART && typeof snapshot.merchantFeeRate === 'number'
+        ? snapshot.merchantFeeRate
+        : 0;
+      logger.info(`[LEDGER] Order ${orderId}: pakai rate snapshot dari PricingHistory (commissionRate=${commissionRate}, merchantFeeRate=${merchantFeeRate})`);
     } else {
       // Fallback -- order tidak punya PricingHistory (kasus langka/legacy).
       const resolved = await this.tariffEngine.resolveCommissionRate(deliveryFee);
       commissionRate = resolved.rate;
-      logger.warn(`[LEDGER] Order ${orderId}: TIDAK ADA PricingHistory, pakai config TERKINI sebagai fallback (commissionRate=${commissionRate}, merchantFeeRate=0) -- rate mungkin beda dari yang dikuotasikan ke customer saat checkout.`);
+      merchantFeeRate = order.serviceType === ServiceType.MART
+        ? await this.tariffEngine.getMerchantPlatformFeeRate()
+        : 0;
+      logger.warn(`[LEDGER] Order ${orderId}: TIDAK ADA PricingHistory, pakai config TERKINI sebagai fallback (commissionRate=${commissionRate}, merchantFeeRate=${merchantFeeRate}) -- rate mungkin beda dari yang dikuotasikan ke customer saat checkout.`);
     }
 
-    const merchantFee = 0;
-    const driverCommission = deliveryFee * commissionRate;
+    const merchantFee = order.serviceType === ServiceType.MART
+      ? itemsSubtotal * merchantFeeRate
+      : 0;
+    const driverContribution = calculatePlatformContribution(
+      order.serviceType,
+      Math.max(0, deliveryFee),
+      commissionRate,
+    );
+    const driverCommission = Math.min(Math.max(0, deliveryFee), driverContribution.contribution);
 
     // 🆕 GROSS, bukan net -- ledger yang memotong commission/fee-nya
     // lewat entri terpisah, satu kali saja.
@@ -333,7 +347,7 @@ export class OrderService {
 
     // 🆕 platformFee = uang yang BENAR-BENAR dipotong dari driver & merchant,
     // bukan rumus terpisah yang tidak terhubung ke rate sebenarnya.
-    const platformFee = driverCommission;
+    const platformFee = driverCommission + merchantFee;
 
     // FIX7: kompensasi driver menuju pickup adalah SUBSIDI/earning tambahan
     // platform yang di-snapshot saat order diterima. Nilai ini tidak pernah
@@ -797,11 +811,19 @@ export class OrderService {
       );
     }
 
-    // Kontrak MART: harga pokok produk 100% hak merchant. Platform hanya
-    // mengambil komisi dari ongkos layanan driver.
-    const merchantFeeRate = 0;
-    const merchantFeeAmount = 0;
+    // Monetization Architecture V1: merchant contribution dibaca dari
+    // PlatformConfig dan DI-SNAPSHOT saat order dibuat. Dengan begitu fase
+    // onboarding dapat memakai 0%, lalu standard 3%, tanpa settlement
+    // berubah retroaktif untuk order yang sudah dibuat.
+    const merchantFeeRate = await this.tariffEngine.getMerchantPlatformFeeRate();
+    const merchantFeeAmount = Math.round(itemsSubtotal * merchantFeeRate);
     const { rate: driverCommissionRateOnDelivery } = await this.tariffEngine.resolveCommissionRate(deliveryFee);
+    const driverContributionOnDelivery = calculatePlatformContribution(
+      ServiceType.MART,
+      deliveryFee,
+      driverCommissionRateOnDelivery,
+    );
+    const driverCommissionAmount = Math.min(deliveryFee, driverContributionOnDelivery.contribution);
 
     const customerWallet = await prisma.wallet.findUnique({ where: { userId } });
     if (!customerWallet) {
@@ -865,21 +887,21 @@ export class OrderService {
       promoDiscount: martTariff.promoDiscount,
       finalFare: totalPayable,
       commissionRate: driverCommissionRateOnDelivery,
-      commissionAmount: Math.round(deliveryFee * driverCommissionRateOnDelivery),
-      driverEarning: deliveryFee - Math.round(deliveryFee * driverCommissionRateOnDelivery),
+      commissionAmount: driverCommissionAmount,
+      driverEarning: deliveryFee - driverCommissionAmount,
       tariffVersionId: martTariff.tariffVersionId,
       zoneId: martTariff.zoneId,
       orderType: 'MART',
       itemsSubtotal,
       merchantFeeRate,
       merchantFeeAmount,
-      merchantEarning: itemsSubtotal,
+      merchantEarning: itemsSubtotal - merchantFeeAmount,
     });
 
     await AuditLogger.log(
       userId,
       'CREATE_MERCHANT_ORDER',
-      `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item, ongkir Rp${deliveryFee}, nilai produk 100% hak merchant)`
+      `Checkout dari toko "${merchant.name}" — order #${order.id} senilai Rp${totalPayable} (${orderItemsData.length} item, ongkir Rp${deliveryFee}, merchant fee ${(merchantFeeRate * 100).toFixed(2)}%)`
     );
 
     let dispatch;
@@ -1054,7 +1076,7 @@ export class OrderService {
       },
       options: {
         minimumDeposit,
-        maxDistanceKm: 5,
+        maxDistanceKm: 3, // MONETIZATION_V1: extended radius 3km
         maxDailyOrders: 20,
         checkLocationFreshness: false,
       },
@@ -1230,7 +1252,7 @@ export class OrderService {
       },
       options: {
         minimumDeposit,
-        maxDistanceKm: 5,
+        maxDistanceKm: 3, // MONETIZATION_V1: extended radius 3km
         maxDailyOrders: 20,
         checkLocationFreshness: false,
       },

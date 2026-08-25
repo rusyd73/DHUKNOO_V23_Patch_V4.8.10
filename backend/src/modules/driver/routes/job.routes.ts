@@ -172,7 +172,7 @@ router.post(
         },
         options: {
           minimumDeposit,
-          maxDistanceKm: 5,
+          maxDistanceKm: 3, // MONETIZATION_V1: extended radius 3km
           maxDailyOrders: 20,
           checkLocationFreshness: false,
         },

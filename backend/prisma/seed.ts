@@ -367,7 +367,7 @@ async function main() {
       { zoneId: zoneMalang.id, serviceType: ServiceType.BIKE, baseFare: 6000, pickupFee: 1500, perKmFee: 2200, perMinuteWaitFee: 250 },
     ],
   });
-  console.log('💲 Seeded PricingRule untuk BIKE/CAR/SEND/MART (fallback + zona Batu & Malang).');
+  console.log('💲 Seeded PricingRule untuk BIKE/CAR/SEND (fallback + zona Batu & Malang). MART delivery mengikuti pricing path checkout terpisah.');
 
   await prisma.regionalPolicy.create({
     data: {
@@ -404,6 +404,13 @@ async function main() {
     },
   });
   console.log('⚙️  Seeded PlatformConfig: MINIMUM_DRIVER_DEPOSIT = Rp20.000');
+
+  await prisma.platformConfig.upsert({
+    where: { key: 'MERCHANT_PLATFORM_FEE_RATE' },
+    create: { key: 'MERCHANT_PLATFORM_FEE_RATE', value: '0.03', description: 'Monetization Architecture V1: merchant contribution standard 3%; onboarding dapat dioverride 0%.' },
+    update: { value: '0.03', description: 'Monetization Architecture V1: merchant contribution standard 3%; onboarding dapat dioverride 0%.' },
+  });
+  console.log('⚙️  Seeded PlatformConfig: MERCHANT_PLATFORM_FEE_RATE = 3%');
 
   // ============================================================
   // ✅ SUMMARY DRIVERS

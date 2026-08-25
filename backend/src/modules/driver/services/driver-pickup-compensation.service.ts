@@ -2,6 +2,7 @@ import { ServiceType } from '@prisma/client';
 import { prisma } from '../../../config/prisma';
 import { logger } from '../../../config/logger';
 import { TariffRepository } from '../../tariff/tariff.repository';
+import { calculateSmartPickupCompensation, type PickupDispatchClass } from '../../tariff/monetization.policy';
 
 export interface DriverPickupCompensationSnapshot {
   customerBillableDistanceKm?: number;
@@ -14,6 +15,8 @@ export interface DriverPickupCompensationSnapshot {
   driverPickupCompensation: number;
   driverPickupCompensationCommissionable: false;
   driverPickupCompensationRateSource: string;
+  driverPickupCompensationPolicy: 'SMART_PICKUP_V1';
+  driverPickupDispatchClass: PickupDispatchClass;
   driverPickupSnapshotAt: string;
 }
 
@@ -93,12 +96,15 @@ export class DriverPickupCompensationService {
       && input.driverLng !== null && input.driverLng !== undefined
       && [driverLat, driverLng, pickupLat, pickupLng].every(Number.isFinite);
 
-    const { rate, source } = await this.resolveRatePerKm(input.serviceType);
+    // Rate legacy tetap di-resolve untuk kompatibilitas konfigurasi/audit,
+    // tetapi nominal V1 tidak lagi linear per-km.
+    const { source } = await this.resolveRatePerKm(input.serviceType);
     const rawDistance = hasDriverCoords
       ? this.haversineKm(driverLat, driverLng, pickupLat, pickupLng)
       : 0;
     const distanceKm = Math.round(Math.max(0, rawDistance) * 1000) / 1000;
-    const compensation = Math.max(0, Math.round(distanceKm * rate));
+    const smartPickup = calculateSmartPickupCompensation(distanceKm);
+    const compensation = smartPickup.compensation;
 
     return {
       ...(typeof input.customerBillableDistanceKm === 'number'
@@ -110,10 +116,12 @@ export class DriverPickupCompensationService {
       customerFareOrigin: 'CUSTOMER_PUBLISHED_PICKUP',
       driverPickupDistanceKm: distanceKm,
       driverAcceptanceDistanceKm: distanceKm,
-      driverPickupRatePerKm: rate,
+      driverPickupRatePerKm: smartPickup.effectiveRatePerKm,
       driverPickupCompensation: compensation,
       driverPickupCompensationCommissionable: false,
-      driverPickupCompensationRateSource: source,
+      driverPickupCompensationRateSource: `${source}:SMART_PICKUP_V1`,
+      driverPickupCompensationPolicy: 'SMART_PICKUP_V1',
+      driverPickupDispatchClass: smartPickup.dispatchClass,
       driverPickupSnapshotAt: new Date().toISOString(),
     };
   }
@@ -173,8 +181,8 @@ export class DriverPickupCompensationService {
 
     logger.info(
       `[PICKUP_COMP] Order ${orderId}: customerDistance=${Number(order.distanceKm).toFixed(3)}km tetap; `
-      + `driver->pickup=${snapshot.driverPickupDistanceKm.toFixed(3)}km x Rp${snapshot.driverPickupRatePerKm}/km `
-      + `= Rp${snapshot.driverPickupCompensation} (non-commissionable).`,
+      + `driver->pickup=${snapshot.driverPickupDistanceKm.toFixed(3)}km => Rp${snapshot.driverPickupCompensation} `
+      + `[${snapshot.driverPickupDispatchClass}, SMART_PICKUP_V1] (non-commissionable).`,
     );
 
     return snapshot;
